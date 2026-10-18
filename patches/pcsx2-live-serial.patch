@@ -1,0 +1,41 @@
+diff --git a/pcsx2/GSDumpReplayer.cpp b/pcsx2/GSDumpReplayer.cpp
+index 2de413bec..993ff730a 100644
+--- a/pcsx2/GSDumpReplayer.cpp
++++ b/pcsx2/GSDumpReplayer.cpp
+@@ -1,6 +1,7 @@
+ // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+ // SPDX-License-Identifier: GPL-3.0+
+ 
++#include <cstdlib>
+ #include "GS.h"
+ #include "GS/GSLzma.h"
+ #include "GS/GSDump.h"
+@@ -1143,20 +1144,24 @@ bool GSDumpReplayer::WriteLiveBootDump(const std::string& path, Error* error)
+ 	auto fp = FileSystem::OpenManagedCFile(path.c_str(), "wb", error);
+ 	if (!fp)
+ 		return false;
+-	static constexpr char serial[] = "SLUS-21126";
++	// The game's serial selects its GameIndex fixes (PS2X_LIVE_SERIAL, default NBA Street V3's)
++	const char* serial_env = std::getenv("PS2X_LIVE_SERIAL");
++	const std::string serial_str = (serial_env && *serial_env) ? serial_env : "SLUS-21126";
++	const char* serial = serial_str.c_str();
++	const u32 serial_len = static_cast<u32>(serial_str.size());
+ 	const u32 crc = 0xFFFFFFFFu;
+-	const u32 header_size = static_cast<u32>(sizeof(GSDumpHeader) + sizeof(serial) - 1);
++	const u32 header_size = static_cast<u32>(sizeof(GSDumpHeader) + serial_len);
+ 	GSDumpHeader header = {};
+ 	header.state_version = 9;
+ 	header.state_size = 0;
+ 	header.serial_offset = sizeof(GSDumpHeader);
+-	header.serial_size = sizeof(serial) - 1;
++	header.serial_size = serial_len;
+ 	header.screenshot_offset = header.serial_offset + header.serial_size;
+ 	std::vector<u8> regs(8192, 0);
+ 	bool ok = std::fwrite(&crc, 4, 1, fp.get()) == 1;
+ 	ok = ok && std::fwrite(&header_size, 4, 1, fp.get()) == 1;
+ 	ok = ok && std::fwrite(&header, sizeof(header), 1, fp.get()) == 1;
+-	ok = ok && std::fwrite(serial, sizeof(serial) - 1, 1, fp.get()) == 1;
++	ok = ok && std::fwrite(serial, serial_len, 1, fp.get()) == 1;
+ 	ok = ok && std::fwrite(regs.data(), regs.size(), 1, fp.get()) == 1;
+ 	if (!ok)
+ 		Error::SetString(error, "Failed to write the live boot dump.");

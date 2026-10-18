@@ -1,0 +1,18 @@
+# Never commit game files: ISOs, executables, extracted data, generated code, saves
+*.iso
+*.bin
+*.BIN
+*.elf
+SLUS_*
+iso/
+data/
+output/
+runner/
+mc0/
+*.combined
+*.wav
+*.png
+!docs/**/*.png
+node_modules/
+logs/
+__pycache__/

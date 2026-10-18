@@ -1,0 +1,26 @@
+{
+	admin off
+	auto_https off
+}
+:8091 {
+	# "Enviar diagnóstico": local receiver (~/NBAStreetRecomp/dbz/diag_server.py -> dbz/diags)
+	handle /diag {
+		reverse_proxy 127.0.0.1:8096
+	}
+	root * {$SITE}
+	header {
+		Cross-Origin-Opener-Policy same-origin
+		Cross-Origin-Embedder-Policy require-corp
+	}
+	# The game code (.wasm, ~370 MB) goes out Brotli-compressed and the browser keeps it:
+	# it asks again with its ETag and gets a 304 when nothing changed.
+	@code path *.wasm *.js *.html
+	header @code Cache-Control "no-cache"
+	log {
+		output file {$SITE}/../dbz/logs/caddy_access.log
+		format console
+	}
+	file_server {
+		precompressed br
+	}
+}

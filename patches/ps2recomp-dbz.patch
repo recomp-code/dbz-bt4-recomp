@@ -1,0 +1,791 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+index e0e61bd..600f4a8 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -25,7 +25,7 @@ namespace ps2x::iop::detail
+         static constexpr uint32_t Spu2End = 0x1FA00000u;
+         static constexpr uint32_t SifBase = 0x1D000000u;
+         static constexpr uint32_t SifEnd = 0x1D001000u;
+-        static constexpr uint32_t HeapBase = 0x00120000u;
++        static constexpr uint32_t HeapBase = 0x000A0000u; // DBZ: was 0x120000 (PS2RNA needs ~1 MB of IOP heap)
+         static constexpr uint32_t HeapLimit = 0x001F0000u;
+ 
+         struct Allocation
+diff --git a/ps2xIOP/src/emulator/imports/iop_sysmem.cpp b/ps2xIOP/src/emulator/imports/iop_sysmem.cpp
+index 83c801e..1235e5a 100644
+--- a/ps2xIOP/src/emulator/imports/iop_sysmem.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_sysmem.cpp
+@@ -1,3 +1,6 @@
++#include <cstdlib>
++#include <cstdio>
++#include <string>
+ #include "iop_sysmem.h"
+ 
+ #include "../core/iop_cpu.h"
+@@ -27,15 +30,27 @@ namespace ps2x::iop::detail
+         {
+         case 4: // AllocSysMemory
+         {
++            // The IOP kernel allocates in 256-byte blocks: every block starts 256-aligned and the
++            // size is rounded up. CRI's ADX driver (DBZ BT3) laid out its ring buffers assuming that;
++            // with 16-byte alignment the R channel ring's first 96 samples were never written (a click
++            // every 8192 samples). PS2X_IOP_SYSMEM_ALIGN16=1 restores the old 16-byte granularity.
++            static const bool s_align16 = [] { const char *e = std::getenv("PS2X_IOP_SYSMEM_ALIGN16"); return e && *e == '1'; }();
++            const uint32_t granule = s_align16 ? 16u : 256u;
++            const uint32_t size = (a1 + granule - 1u) & ~(granule - 1u);
+             const uint32_t address = a0 == 2u
+-                                         ? m_memory.allocate(a1, 16u, a2)
+-                                         : m_memory.allocate(a1, 16u);
++                                         ? m_memory.allocate(size, granule, a2)
++                                         : m_memory.allocate(size, granule);
+             if (address == 0u)
+             {
+                 m_host.log(LogLevel::Warning, "[IOP] AllocSysMemory failed: type=" + std::to_string(a0) +
+                                                   " size=" + std::to_string(a1) +
+                                                   " maxFree=" + std::to_string(m_memory.maxFreeMemory()));
+             }
++            if (std::getenv("PS2X_IOP_MEM_LOG"))
++                m_host.log(LogLevel::Info, "[IOP] AllocSysMemory type=" + std::to_string(a0) + " size=0x" +
++                                               [](uint32_t v) { char b[16]; std::snprintf(b, sizeof(b), "%x", v); return std::string(b); }(a1) +
++                                               " -> 0x" + [](uint32_t v) { char b[16]; std::snprintf(b, sizeof(b), "%x", v); return std::string(b); }(address) +
++                                               " ra=0x" + [](uint32_t v) { char b[16]; std::snprintf(b, sizeof(b), "%x", v); return std::string(b); }(cpu.gpr[31]));
+             setV0(address);
+             return true;
+         }
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+index ba1037b..c21b188 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ #include "iop_rpc.h"
+ 
+ #include "../core/iop_cpu.h"
+@@ -351,6 +352,19 @@ namespace ps2x::iop::detail
+             }
+         }
+ 
++        {
++            // [dbz] PS2X_IOP_RPC_DUMP=<sid hex>: every call to that server with its send words
++            static const uint32_t s_dumpSid = [] { const char *e = std::getenv("PS2X_IOP_RPC_DUMP"); return e ? static_cast<uint32_t>(std::strtoul(e, nullptr, 16)) : 0u; }();
++            static uint32_t s_dumped = 0;
++            if (s_dumpSid != 0u && request.sid == s_dumpSid && s_dumped < 4000u)
++            {
++                ++s_dumped;
++                uint32_t w[8] = {};
++                (void)m_memory.readRam(server.buffer, w, std::min<uint32_t>(32u, request.send.size));
++                std::fprintf(stderr, "[IOP rpcdump] fn=0x%x size=0x%x: %08x %08x %08x %08x %08x %08x %08x %08x\n", request.function,
++                             request.send.size, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
++            }
++        }
+         {
+             static uint32_t s_rpcLogs = 0;
+             if (s_rpcLogs < 32u)
+diff --git a/ps2xIOP/src/emulator/spu2/SPU2/spu2_glue.cpp b/ps2xIOP/src/emulator/spu2/SPU2/spu2_glue.cpp
+index 7c11cc7..2c7c52f 100644
+--- a/ps2xIOP/src/emulator/spu2/SPU2/spu2_glue.cpp
++++ b/ps2xIOP/src/emulator/spu2/SPU2/spu2_glue.cpp
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+ // SPDX-License-Identifier: GPL-3.0+
+ 
+@@ -367,6 +368,22 @@ namespace ps2x::spu2
+ 				core.AdmaInProgress ? 1 : 0, core.DMAICounter, core.ReadSize, core.MasterVol.Left.Value, core.MasterVol.Right.Value,
+ 				core.InpVol.Left, active, core.IRQEnable ? 1 : 0, core.IRQA, core.TSA, core.Regs.STATX);
+ 			text += line;
++			// [dbz] voice audibility: envelope and volume of the active voices, the core's voice mix gates
++			{
++				long long envSum = 0, volSum = 0;
++				int loud = 0;
++				for (const V_Voice& voice : core.Voices)
++				{
++					if (voice.ADSR.Phase == V_ADSR::PHASE_STOPPED) continue;
++					envSum += voice.ADSR.Value;
++					const int v = std::abs(voice.Volume.Left.Value) + std::abs(voice.Volume.Right.Value);
++					volSum += v;
++					loud += (voice.ADSR.Value > 0x400 && v > 0x400) ? 1 : 0;
++				}
++				std::snprintf(line, sizeof(line), " c%dvoices[env %lld vol %lld audible %d vmix %x/%x mmix %x]", c, envSum, volSum, loud,
++				              core.Regs.VMIXL, core.Regs.VMIXR, core.Regs.MMIX);
++				text += line;
++			}
+ 		}
+ 		std::snprintf(line, sizeof(line), " playmode=%x outpos=%x madr=%x/%x", PlayMode, OutPos, HW_DMA4_MADR, HW_DMA7_MADR);
+ 		text += line;
+diff --git a/ps2xRecomp/src/lib/vu_translation_helpers.cpp b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
+index 2693d77..bdf02da 100644
+--- a/ps2xRecomp/src/lib/vu_translation_helpers.cpp
++++ b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
+@@ -182,22 +182,26 @@ namespace ps2recomp
+             vis_reg_idx);
+     }
+ 
++    // [dbz] from z3xox/BT3-Recomp (GPL-3.0): VU0 macro R register / LQI-SQD fixes
++    // VU0 R register (VRNEXT/VRGET/VRINIT/VRXOR): hardware semantics (PCSX2 VUops.cpp _vuRNEXT etc).
++    // R is a 23-bit LFSR; every read yields 0x3F800000 | mantissa, i.e. a float in [1.0, 2.0). VRNEXT
++    // advances it (taps at bits 4 and 22) and writes the destination fields. The previous invented
++    // 4-lane generator never wrote vft at all (BT3's random-fraction helper returned stale garbage:
++    // Kaioken ray roll angles far outside [-pi, pi] -> exploding billboard quads -> white screen).
+     std::string CodeGenerator::translateVU_VRNEXT(const Instruction &inst)
+     {
+-        return fmt::format(
+-            "{{\n"
+-            "    uint32_t r_vals[4];\n"
+-            "    _mm_storeu_si128((__m128i*)r_vals, _mm_castps_si128(ctx->vu0_r));\n"
+-            "\n"
+-            "    // Simple LFSR-based random number generation (PS2-like behavior)\n"
+-            "    uint32_t feedback = r_vals[0] ^ (r_vals[0] << 13) ^ (r_vals[1] >> 19) ^ (r_vals[2] << 7);\n"
+-            "    r_vals[0] = r_vals[1];\n"
+-            "    r_vals[1] = r_vals[2];\n"
+-            "    r_vals[2] = r_vals[3];\n"
+-            "    r_vals[3] = feedback;\n"
+-            "\n"
+-            "    ctx->vu0_r = _mm_castsi128_ps(_mm_loadu_si128((__m128i*)r_vals));\n"
+-            "}}");
++        uint8_t dest_mask = inst.vectorInfo.vectorField;
++        uint8_t ft_reg = inst.rt;
++        std::string out =
++            "{ uint32_t r; std::memcpy(&r, &ctx->vu0_r, 4); "
++            "const uint32_t x = (r >> 4) & 1u, y = (r >> 22) & 1u; "
++            "r <<= 1; r ^= (x ^ y); r = (r & 0x7FFFFFu) | 0x3F800000u; "
++            "ctx->vu0_r = _mm_castsi128_ps(_mm_set1_epi32((int)r));";
++        if (ft_reg != 0)
++            out += fmt::format(" __m128i mask = _mm_set_epi32({}, {}, {}, {}); ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], ctx->vu0_r, _mm_castsi128_ps(mask));",
++                               (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
++                               (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0, ft_reg, ft_reg);
++        return out + " }";
+     }
+ 
+     std::string CodeGenerator::translateVU_VMADD_Field(const Instruction &inst)
+@@ -770,15 +774,19 @@ namespace ps2recomp
+                            inst.rt, inst.rt);
+     }
+ 
++    // [dbz] from z3xox/BT3-Recomp (GPL-3.0): VU0 macro R register / LQI-SQD fixes
+     std::string CodeGenerator::translateVU_VLQI(const Instruction &inst)
+     {
+         uint8_t vis = inst.rd;
+         uint8_t dest_mask = inst.vectorInfo.vectorField;
+-        return fmt::format("{{ uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
++        // VU0-macro LQ/SQ family addresses VU0 data memory (4KB at 0x11004000, 256 qwords),
++        // not raw EE RAM; vi regs are 16-bit. Loads take the vf in the ft slot / vi in the fs
++        // slot (rt/rd here); stores are the reverse: data vf in the fs slot, addr vi in ft.
++        return fmt::format("{{ uint32_t addr = 0x11004000u + (((uint32_t)(ctx->vi[{}] & 0xFFu)) << 4); "
+                            "__m128 res = _mm_castsi128_ps(READ128(addr)); "
+                            "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
+                            "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); "
+-                           "ctx->vi[{}] = (ctx->vi[{}] + 1) & 0x3FF; }}",
++                           "ctx->vi[{}] = (uint16_t)(ctx->vi[{}] + 1u); }}",
+                            vis,
+                            (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
+                            (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
+@@ -786,28 +794,31 @@ namespace ps2recomp
+                            vis, vis);
+     }
+ 
++    // [dbz] from z3xox/BT3-Recomp (GPL-3.0): VU0 macro R register / LQI-SQD fixes
+     std::string CodeGenerator::translateVU_VSQI(const Instruction &inst)
+     {
+-        uint8_t vis = inst.rd;
++        uint8_t vfs = inst.rd;  // data source vf (fs slot)
++        uint8_t vit = inst.rt;  // address vi (ft slot)
+         uint8_t dest_mask = inst.vectorInfo.vectorField;
+-        return fmt::format("{{ uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
++        return fmt::format("{{ uint32_t addr = 0x11004000u + (((uint32_t)(ctx->vi[{}] & 0xFFu)) << 4); "
+                            "__m128i old_val = READ128(addr); "
+                            "__m128 res = _mm_blendv_ps(_mm_castsi128_ps(old_val), ctx->vu0_vf[{}], _mm_castsi128_ps(_mm_set_epi32({}, {}, {}, {}))); "
+                            "WRITE128(addr, _mm_castps_si128(res)); "
+-                           "ctx->vi[{}] = (ctx->vi[{}] + 1) & 0x3FF; }}",
+-                           vis,
+-                           inst.rt,
++                           "ctx->vi[{}] = (uint16_t)(ctx->vi[{}] + 1u); }}",
++                           vit,
++                           vfs,
+                            (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
+                            (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
+-                           vis, vis);
++                           vit, vit);
+     }
+ 
++    // [dbz] from z3xox/BT3-Recomp (GPL-3.0): VU0 macro R register / LQI-SQD fixes
+     std::string CodeGenerator::translateVU_VLQD(const Instruction &inst)
+     {
+         uint8_t vis = inst.rd;
+         uint8_t dest_mask = inst.vectorInfo.vectorField;
+-        return fmt::format("{{ ctx->vi[{}] = (ctx->vi[{}] - 1) & 0x3FF; "
+-                           "uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
++        return fmt::format("{{ ctx->vi[{}] = (uint16_t)(ctx->vi[{}] - 1u); "
++                           "uint32_t addr = 0x11004000u + (((uint32_t)(ctx->vi[{}] & 0xFFu)) << 4); "
+                            "__m128 res = _mm_castsi128_ps(READ128(addr)); "
+                            "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
+                            "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
+@@ -818,73 +829,60 @@ namespace ps2recomp
+                            inst.rt, inst.rt);
+     }
+ 
++    // [dbz] from z3xox/BT3-Recomp (GPL-3.0): VU0 macro R register / LQI-SQD fixes
+     std::string CodeGenerator::translateVU_VSQD(const Instruction &inst)
+     {
+-        uint8_t vis = inst.rd;
++        uint8_t vfs = inst.rd;  // data source vf (fs slot)
++        uint8_t vit = inst.rt;  // address vi (ft slot)
+         uint8_t dest_mask = inst.vectorInfo.vectorField;
+-        return fmt::format("{{ ctx->vi[{}] = (ctx->vi[{}] - 1) & 0x3FF; "
+-                           "uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
++        return fmt::format("{{ ctx->vi[{}] = (uint16_t)(ctx->vi[{}] - 1u); "
++                           "uint32_t addr = 0x11004000u + (((uint32_t)(ctx->vi[{}] & 0xFFu)) << 4); "
+                            "__m128i old_val = READ128(addr); "
+                            "__m128 res = _mm_blendv_ps(_mm_castsi128_ps(old_val), ctx->vu0_vf[{}], _mm_castsi128_ps(_mm_set_epi32({}, {}, {}, {}))); "
+                            "WRITE128(addr, _mm_castps_si128(res)); }}",
+-                           vis, vis,
+-                           vis,
+-                           inst.rt,
++                           vit, vit,
++                           vit,
++                           vfs,
+                            (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
+                            (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0);
+     }
+ 
++    // [dbz] from z3xox/BT3-Recomp (GPL-3.0): VU0 macro R register / LQI-SQD fixes
+     std::string CodeGenerator::translateVU_VRGET(const Instruction &inst)
+     {
+         uint8_t dest_mask = inst.vectorInfo.vectorField;
+         uint8_t ft_reg = inst.rt;
+-        return fmt::format("{{ __m128 res = ctx->vu0_r; __m128i mask = _mm_set_epi32({}, {}, {}, {}); ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}", (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0, (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0, ft_reg, ft_reg);
++        std::string out =
++            "{ uint32_t r; std::memcpy(&r, &ctx->vu0_r, 4); r = 0x3F800000u | (r & 0x7FFFFFu); "
++            "ctx->vu0_r = _mm_castsi128_ps(_mm_set1_epi32((int)r));";
++        if (ft_reg != 0)
++            out += fmt::format(" __m128i mask = _mm_set_epi32({}, {}, {}, {}); ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], ctx->vu0_r, _mm_castsi128_ps(mask));",
++                               (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
++                               (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0, ft_reg, ft_reg);
++        return out + " }";
+     }
+ 
++    // [dbz] from z3xox/BT3-Recomp (GPL-3.0): VU0 macro R register / LQI-SQD fixes
+     std::string CodeGenerator::translateVU_VRINIT(const Instruction &inst)
+     {
+         uint8_t fs_reg = inst.rd;
+         uint8_t fsf = inst.vectorInfo.fsf;
+-
+         return fmt::format(
+-            "{{\n"
+-            "    float src = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{})));\n"
+-            "    uint32_t seed; std::memcpy(&seed, &src, sizeof(seed));\n"
+-            "\n"
+-            "    // PS2 uses a specific LFSR initialization pattern\n"
+-            "    if (seed == 0) seed = 1;\n"
+-            "\n"
+-            "    uint32_t r0 = seed;\n"
+-            "    uint32_t r1 = seed * 0x41C64E6D + 0x3039;\n"
+-            "    uint32_t r2 = r1 * 0x41C64E6D + 0x3039;\n"
+-            "    uint32_t r3 = r2 * 0x41C64E6D + 0x3039;\n"
+-            "\n"
+-            "    ctx->vu0_r = _mm_castsi128_ps(_mm_set_epi32(r3, r2, r1, r0));\n"
+-            "}}",
++            "{{ float src = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); "
++            "uint32_t s; std::memcpy(&s, &src, 4); s = 0x3F800000u | (s & 0x7FFFFFu); "
++            "ctx->vu0_r = _mm_castsi128_ps(_mm_set1_epi32((int)s)); }}",
+             fs_reg, fs_reg, fsf);
+     }
+ 
++    // [dbz] from z3xox/BT3-Recomp (GPL-3.0): VU0 macro R register / LQI-SQD fixes
+     std::string CodeGenerator::translateVU_VRXOR(const Instruction &inst)
+     {
+         uint8_t fs_reg = inst.rd;
+         uint8_t fsf = inst.vectorInfo.fsf;
+-
+         return fmt::format(
+-            "{{\n"
+-            "    float src = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{})));\n"
+-            "    uint32_t src_bits; std::memcpy(&src_bits, &src, sizeof(src_bits));\n"
+-            "    __m128i r_current = _mm_castps_si128(ctx->vu0_r);\n"
+-            "    __m128i fs_data = _mm_set1_epi32((int)src_bits);\n"
+-            "\n"
+-            "    // XOR the current random value with the data from the VU vector register\n"
+-            "    __m128i xored = _mm_xor_si128(r_current, fs_data);\n"
+-            "\n"
+-            "    // Apply a simple mixing function similar to PS2's LFSR\n"
+-            "    __m128i mixed = _mm_xor_si128(xored, _mm_slli_epi32(xored, 7));\n"
+-            "    mixed = _mm_xor_si128(mixed, _mm_srli_epi32(mixed, 9));\n"
+-            "\n"
+-            "    ctx->vu0_r = _mm_castsi128_ps(mixed);\n"
+-            "}}",
++            "{{ float src = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); "
++            "uint32_t s, r; std::memcpy(&s, &src, 4); std::memcpy(&r, &ctx->vu0_r, 4); r = 0x3F800000u | ((r ^ s) & 0x7FFFFFu); "
++            "ctx->vu0_r = _mm_castsi128_ps(_mm_set1_epi32((int)r)); }}",
+             fs_reg, fs_reg, fsf);
+     }
+ 
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 8989a24..55490dc 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -243,6 +243,9 @@ extern uint32_t g_ps2WriteWatch[4];
+ extern uint32_t g_ps2WriteWatchCount;
+ void ps2ReportWatchedWrite(uint32_t guestAddr, uint32_t size, uint64_t valueLo, const char *op, const R5900Context *ctx);
+ 
++#ifndef PS2X_WEB_WRITE_WATCH
++#define PS2X_WEB_WRITE_WATCH 1 // [dbz] watches on in the browser (Module._ps2xDbzWatch)
++#endif
+ inline void ps2TraceGuestWrite(uint8_t *rdram,
+                                uint32_t guestAddr,
+                                uint32_t size,
+@@ -253,7 +256,7 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
+ {
+     (void)rdram;
+     (void)valueHi;
+-#if defined(__EMSCRIPTEN__)
++#if defined(__EMSCRIPTEN__) && !defined(PS2X_WEB_WRITE_WATCH)
+     // Browser build: no write watches (a debugging aid), so no check on every guest store
+     (void)guestAddr; (void)size; (void)valueLo; (void)op; (void)ctx;
+     return;
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+index 4db3b52..b777f19 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+@@ -1,3 +1,6 @@
++#include <cstdio>
++#include <chrono>
++#include <map>
+ #include "Common.h"
+ #include "SIF.h"
+ #include "../Syscalls/RPC.h"
+@@ -374,14 +377,14 @@ namespace ps2_stubs
+     {
+         (void)rdram;
+         const uint32_t reqSize = getRegU32(ctx, 4);
+-        setReturnU32(ctx, runtime ? runtime->allocateIopMemory(reqSize, 64u) : 0u);
++        setReturnU32(ctx, runtime ? runtime->allocateIopMemory((reqSize + 255u) & ~255u, 256u) /* IOP sysmem: 256-byte blocks */ : 0u);
+     }
+ 
+     void sceSifAllocSysMemory(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         (void)rdram;
+         const uint32_t size = getRegU32(ctx, 5);
+-        setReturnU32(ctx, runtime ? runtime->allocateIopMemory(size, 64u) : 0u);
++        setReturnU32(ctx, runtime ? runtime->allocateIopMemory((size + 255u) & ~255u, 256u) : 0u);
+     }
+ 
+     void sceSifBindRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+@@ -775,8 +778,54 @@ namespace ps2_stubs
+             pending[pendingCount++] = xfer;
+         }
+ 
++        {
++            static const bool s_sifDmaStats = [] { const char *e = std::getenv("PS2X_SIF_DMA_STATS"); return e && *e == '1'; }();
++            static uint32_t s_logged = 0;
++            if (s_sifDmaStats && s_logged < 3000)
++            {
++                for (uint32_t i = 0; i < count; ++i)
++                {
++                    Ps2SifDmaTransfer x{};
++                    const uint8_t *e = getConstMemPtr(rdram, dmatAddr + i * 16u);
++                    if (!e) break;
++                    std::memcpy(&x, e, sizeof(x));
++                    const uint32_t d = static_cast<uint32_t>(x.dest);
++                    static std::map<uint64_t, uint32_t> s_seen;
++                    const uint64_t key = (static_cast<uint64_t>(d) << 32) | static_cast<uint32_t>(x.size);
++                    if (!ok || (s_seen[key]++ == 0) || (d >= 0x152000u && d < 0x156300u))
++                    {
++                        s_logged++;
++                        int16_t smp[4] = {};
++                        if (const uint8_t *sp = getConstMemPtr(rdram, static_cast<uint32_t>(x.src))) std::memcpy(smp, sp, 8);
++                        std::fprintf(stderr, "[sif:dma] %s i=%u/%u src %08x dst %06x size %d attr %x ra %08x first %d %d %d %d\n", ok ? "ok" : "REJECTED", i, count,
++                                     static_cast<uint32_t>(x.src), d, x.size, x.attr, getRegU32(ctx, 31), smp[0], smp[1], smp[2], smp[3]);
++                    }
++                }
++            }
++        }
+         if (ok)
+         {
++            // [dbz] PS2X_SIF_DMA_STATS=1: EE->IOP SIF DMA volume every 5 s, by destination (64 KB pages)
++            static const bool s_sifDmaStats = [] { const char *e = std::getenv("PS2X_SIF_DMA_STATS"); return e && *e == '1'; }();
++            if (s_sifDmaStats)
++            {
++                static std::map<uint32_t, std::pair<uint32_t, uint64_t>> s_byDest;
++                static auto s_last = std::chrono::steady_clock::now();
++                for (uint32_t i = 0; i < pendingCount; ++i)
++                {
++                    auto &slot = s_byDest[static_cast<uint32_t>(pending[i].dest) & ~0xFFFFu];
++                    slot.first++;
++                    slot.second += static_cast<uint32_t>(pending[i].size);
++                }
++                const auto now = std::chrono::steady_clock::now();
++                if (now - s_last > std::chrono::seconds(5))
++                {
++                    s_last = now;
++                    for (const auto &[dest, v] : s_byDest)
++                        std::fprintf(stderr, "[sif:dma] dest %06x: %u xfers, %llu bytes / 5 s\n", dest, v.first, (unsigned long long)v.second);
++                    s_byDest.clear();
++                }
++            }
+             for (uint32_t i = 0; i < pendingCount; ++i)
+             {
+                 const Ps2SifDmaTransfer &xfer = pending[i];
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+index 5110ee2..a2d3aab 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+@@ -112,7 +112,9 @@ namespace ps2_syscalls
+             const int priority = static_cast<int>(getRegU32(ctx, 5));
+             int oldPriority = 0;
+             const int result = ee.changePriority(id, priority, interruptSafe, oldPriority);
+-            setReturnS32(ctx, result);
++            // The kernel returns the previous priority on success (CRI ADXM's lock/unlock saves
++            // it and restores it; returning KE_OK left DBZ BT3's main thread at priority 1).
++            setReturnS32(ctx, result == KE_OK ? oldPriority : result);
+             ee.transferIfRequested(interruptSafe);
+         }
+ 
+diff --git a/ps2xRuntime/web/disc_files.inc b/ps2xRuntime/web/disc_files.inc
+index 96f355f..0f3c07e 100644
+--- a/ps2xRuntime/web/disc_files.inc
++++ b/ps2xRuntime/web/disc_files.inc
+@@ -1,3 +1,23 @@
+-// Disc files the game opens through cdrom0: (PS2X_VFS_LOG=1 run to a match), besides the ELF.
+-"SLUS_211.26",
+-"DEV9.IRX",
++// Disc files the game opens through cdrom0: (PS2X_VFS_LOG=1), besides the ELF. DBZ BT3 / BT4 mod.
++"SLUS_219.78",
++"SYSTEM.CNF",
++"BIN/DBZ4.BIN",
++"BIN/DBZP.BIN",
++"IRX/CDVDSTM.IRX",
++"IRX/CRI_ADXI.IRX",
++"IRX/DBCMAN.IRX",
++"IRX/DS2O_D.IRX",
++"IRX/DS2U_D.IRX",
++"IRX/IOPRP300.IMG",
++"IRX/LIBSD.IRX",
++"IRX/MCMAN.IRX",
++"IRX/MCSERV.IRX",
++"IRX/MODHSYN.IRX",
++"IRX/MODMIDI.IRX",
++"IRX/MODSEIN.IRX",
++"IRX/MODSESQ.IRX",
++"IRX/MODSESQ2.IRX",
++"IRX/SDRDRV.IRX",
++"IRX/SIO2D.IRX",
++"IRX/SIO2MAN.IRX",
++"IRX/SOUNDS.IRX",
+diff --git a/ps2xRuntime/web/play_gs_host.cpp b/ps2xRuntime/web/play_gs_host.cpp
+index 4ef766c..fdaacb6 100644
+--- a/ps2xRuntime/web/play_gs_host.cpp
++++ b/ps2xRuntime/web/play_gs_host.cpp
+@@ -131,7 +131,7 @@ namespace
+ 					if(!vertex && traceVertexRun > 8)
+ 						std::printf("[trace]   ... %u vertex writes\n", traceVertexRun - 8);
+ 					traceVertexRun = vertex ? traceVertexRun + 1 : 0;
+-					if(traceLines++ < 4000)
++					if(traceLines++ < 40000)
+ 						std::printf("[trace] %02x %016llx%s\n", reg, (unsigned long long)value, m_framebufferWriteBacks != traceWb ? " (after write-back)" : "");
+ 					traceWb = m_framebufferWriteBacks;
+ 				}
+@@ -256,6 +256,10 @@ namespace
+ 		return 0;
+ 	}
+ 
++	// [dbz] GS switches from the page URL (read on the page thread, see ps2xWebStartGsHost callers)
++	bool g_dbzOpt_zmask = true, g_dbzOpt_swsprites = false, g_dbzOpt_exactfbtex = true;
++	int g_dbzOpt_wbskip = 2;
++	bool g_dbzOpt_exactsmall = false;
+ 	bool g_debug = false; // <page>?debug: GS statistics every 2 s, F8/F9 dumps
+ 	int g_scale = 2;      // internal resolution (decided on the page thread, from the URL)
+ 	bool g_hd = true;     // HD texture pack (data/hd/): on unless <page>?hd=0 (start screen setting)
+@@ -530,6 +534,109 @@ namespace
+ 		return std::min(offset, memorySize);
+ 	}
+ 
++	// [dbz] ?vucap: Module._ps2xVuCapArm(tbpLo, tbpHi) arms a one-shot capture of the VU1 state at the
++	// next XGKICK whose packet sets TEX0 with TBP0 in [tbpLo, tbpHi]; Module._ps2xVuCap() returns the
++	// text (registers, kicked packet, micro memory disassembly) and VU data memory as hex.
++	std::atomic<uint32_t> g_vuCapLo{0}, g_vuCapHi{0};
++	std::atomic<int> g_vuCapState{0}; // 0 idle, 1 armed, 2 done
++	std::string g_vuCapText;
++
++	bool PacketSetsTex0In(const uint8_t* p, uint32_t len, uint32_t lo, uint32_t hi)
++	{
++		uint32_t off = 0;
++		while(off + 16 <= len)
++		{
++			uint64_t tag;
++			std::memcpy(&tag, p + off, 8);
++			uint64_t regsDesc;
++			std::memcpy(&regsDesc, p + off + 8, 8);
++			const uint32_t loops = static_cast<uint32_t>(tag & 0x7FFF);
++			const bool eop = ((tag >> 15) & 1) != 0;
++			const uint32_t flag = static_cast<uint32_t>((tag >> 58) & 3);
++			uint32_t nregs = static_cast<uint32_t>(tag >> 60);
++			if(nregs == 0) nregs = 16;
++			off += 16;
++			if(flag == 0)
++			{
++				for(uint32_t l = 0; l < loops; l++)
++					for(uint32_t r = 0; r < nregs; r++, off += 16)
++					{
++						if(off + 16 > len) return false;
++						const uint32_t reg = (regsDesc >> (r * 4)) & 0xF;
++						if(reg != 0xE) continue;
++						uint64_t data, addr;
++						std::memcpy(&data, p + off, 8);
++						std::memcpy(&addr, p + off + 8, 8);
++						const uint32_t a = addr & 0xFF;
++						if((a == 6 || a == 7))
++						{
++							const uint32_t tbp = data & 0x3FFF;
++							if(tbp >= lo && tbp <= hi) return true;
++						}
++					}
++			}
++			else if(flag == 1)
++				off += ((loops * nregs + 1) / 2) * 16;
++			else
++				off += loops * 16;
++			if(eop) break;
++		}
++		return false;
++	}
++
++	void VuCapture(Host& h, uint32_t start, const std::vector<uint8_t>& packet)
++	{
++		std::string t;
++		char line[256];
++		auto& st = h.vu1.m_State;
++		std::snprintf(line, sizeof(line), "kick start 0x%x len %zu pc 0x%x itop %u top %u\n", start, packet.size(), st.nPC, 0u, 0u);
++		t += line;
++		for(int i = 0; i < 32; i++)
++		{
++			std::snprintf(line, sizeof(line), "vf%02d %08x %08x %08x %08x  (%g %g %g %g)\n", i, st.nCOP2[i].nV0, st.nCOP2[i].nV1, st.nCOP2[i].nV2, st.nCOP2[i].nV3,
++			              *reinterpret_cast<const float*>(&st.nCOP2[i].nV0), *reinterpret_cast<const float*>(&st.nCOP2[i].nV1),
++			              *reinterpret_cast<const float*>(&st.nCOP2[i].nV2), *reinterpret_cast<const float*>(&st.nCOP2[i].nV3));
++			t += line;
++		}
++		for(int i = 0; i < 16; i++)
++		{
++			std::snprintf(line, sizeof(line), "vi%02d %04x\n", i, st.nCOP2VI[i] & 0xFFFF);
++			t += line;
++		}
++		t += "== packet\n";
++		for(size_t i = 0; i + 16 <= packet.size() && i < 4096; i += 16)
++		{
++			uint32_t w[4];
++			std::memcpy(w, packet.data() + i, 16);
++			std::snprintf(line, sizeof(line), "%04zx: %08x %08x %08x %08x\n", i, w[0], w[1], w[2], w[3]);
++			t += line;
++		}
++		t += "== micro\n";
++		for(uint32_t a = 0; a < PS2::MICROMEM1SIZE; a += 8)
++		{
++			uint32_t lower, upper;
++			std::memcpy(&lower, h.microMem1 + a, 4);
++			std::memcpy(&upper, h.microMem1 + a + 4, 4);
++			char um[32] = {}, uo[64] = {}, lm[32] = {}, lo[64] = {};
++			h.maVu1.GetInstructionMnemonic(&h.vu1, a + 4, upper, um, sizeof(um));
++			h.maVu1.GetInstructionOperands(&h.vu1, a + 4, upper, uo, sizeof(uo));
++			h.maVu1.GetInstructionMnemonic(&h.vu1, a, lower, lm, sizeof(lm));
++			h.maVu1.GetInstructionOperands(&h.vu1, a, lower, lo, sizeof(lo));
++			std::snprintf(line, sizeof(line), "%04x: %08x %08x  %-10s %-24s | %-10s %s\n", a, upper, lower, um, uo, lm, lo);
++			t += line;
++		}
++		t += "== data\n";
++		for(uint32_t a = 0; a < PS2::VUMEM1SIZE; a += 16)
++		{
++			uint32_t w[4];
++			std::memcpy(w, h.vuMem1 + a, 16);
++			std::snprintf(line, sizeof(line), "%04x: %08x %08x %08x %08x  (%g %g %g %g)\n", a / 16, w[0], w[1], w[2], w[3],
++			              *reinterpret_cast<float*>(&w[0]), *reinterpret_cast<float*>(&w[1]), *reinterpret_cast<float*>(&w[2]), *reinterpret_cast<float*>(&w[3]));
++			t += line;
++		}
++		g_vuCapText = std::move(t);
++	}
++
+ 	void GifKick(Host& h, uint32_t value)
+ 	{
+ 		const uint32_t start = (value & 0x3FF) * 16;
+@@ -541,6 +648,12 @@ namespace
+ 		const uint32_t first = std::min<uint32_t>(length, static_cast<uint32_t>(PS2::VUMEM1SIZE) - start);
+ 		std::memcpy(item.data.data(), h.vuMem1 + start, first);
+ 		std::memcpy(item.data.data() + first, h.vuMem1, length - first);
++		if(g_vuCapState.load(std::memory_order_relaxed) == 1 &&
++		   PacketSetsTex0In(item.data.data(), length, g_vuCapLo.load(), g_vuCapHi.load()))
++		{
++			VuCapture(h, start, item.data);
++			g_vuCapState.store(2);
++		}
+ 		GifEnqueue(h, std::move(item));
+ 	}
+ 
+@@ -567,18 +680,19 @@ namespace
+ 			break;
+ 		case kGifVSync:
+ 		{
+-			if(g_traceState == 2)
++			if(g_traceState >= 2 && g_traceState < 5)
++				g_traceState++; // [dbz] trace 4 vsync periods (deferred path packets land after the vsync item)
++			else if(g_traceState == 5)
+ 			{
+-				h.gsWeb->traceOn = false;
+ 				g_traceState = 0;
+-				std::printf("[trace] end\n");
++				auto* web = h.gsWeb;
++				h.gs->SendGSCall([web]() { web->traceOn = false; web->m_traceWriteBacks = false; std::printf("[trace] end\n"); });
+ 			}
+ 			else if(g_traceState == 1)
+ 			{
+ 				g_traceState = 2;
+-				h.gsWeb->traceOn = true;
+-				h.gsWeb->traceLines = 0;
+-				std::printf("[trace] begin\n");
++				auto* web = h.gsWeb;
++				h.gs->SendGSCall([web]() { web->traceOn = true; web->m_traceWriteBacks = true; web->traceLines = 0; std::printf("[trace] begin\n"); });
+ 			}
+ 			// Queues the frame's end and the flip for the GL thread. With two frames already
+ 			// queued (Play!'s MAX_INFLIGHT_FRAMES) this waits: the picture never lags far behind.
+@@ -1242,6 +1356,13 @@ namespace
+ 			            h.frames ? static_cast<double>(gs.m_dstCopies) / h.frames : 0.0, gs.m_shaderCompiles, gs.m_shaderCompileMs, gs.m_shadersPrecompiled,
+ 			            gs.m_framebufferWriteBacks, gs.m_writeBackMs, gs.m_textureUploads,
+ 			            gs.m_textureUploadsSkipped, gs.m_hdTexturesLoaded - h.hdLoadedBefore);
++			std::printf("[webgs] dbz: depth-mask passes %u, write-backs skipped (RAM newer) %u\n", gs.m_depthMaskPasses, gs.m_skippedWriteBacks);
++			gs.m_depthMaskPasses = 0;
++			for(const auto& [k, n] : gs.m_wbStats)
++				std::printf("[webgs] dbz: write-back fb %x psm %x for tex psm %x at %x: %u\n", (unsigned)(k >> 32), (unsigned)((k >> 24) & 0xFF),
++				            (unsigned)((k >> 16) & 0xFF), (unsigned)((k & 0xFFFF) << 13), n);
++			gs.m_wbStats.clear();
++			gs.m_skippedWriteBacks = 0;
+ 			if(auto added = gs.TakeNewShaderCaps(); !added.empty())
+ 			{
+ 				// Remembered for the next session (precompiled then)
+@@ -1252,6 +1373,7 @@ namespace
+ 					std::snprintf(hex, sizeof(hex), "%s%016llx", list.empty() ? "" : ",", static_cast<unsigned long long>(caps));
+ 					list += hex;
+ 				}
++				std::printf("[webgs] new shader caps: %s\n", list.c_str()); // [dbz] collected into known_shaders.inc
+ 				EM_ASM({
+ 					const added = UTF8ToString($0).split(',');
+ 					try
+@@ -1475,6 +1597,13 @@ namespace
+ 
+ 		h->gsWeb = new CGSH_Web(g_context);
+ 		h->gsWeb->debug = g_debug;
++		// [dbz] ?exactfbtex=0: exact framebuffers read as textures go through GS RAM (old path)
++		// [dbz] ?zmask=0: no native depth-mask pass (the PSMZ16 read goes to GS RAM as before)
++		h->gsWeb->m_depthMaskPass = g_dbzOpt_zmask;
++		h->gsWeb->m_skipTransferredWriteBacks = g_dbzOpt_wbskip;
++		h->gsWeb->m_softwareSpritesEnabled = g_dbzOpt_swsprites;
++		h->gsWeb->m_exactFbTextures = g_dbzOpt_exactfbtex;
++		h->gsWeb->m_exactSmallBuffers = g_dbzOpt_exactsmall;
+ 		h->gs = h->gsWeb;
+ 		h->gs->SetIntc(&h->intc);
+ 
+@@ -1567,6 +1696,13 @@ namespace
+ 			return value >= 1 && value <= 4 ? value : fallback;
+ 		});
+ 		g_debug = EM_ASM_INT({ return new URLSearchParams(location.search).has('debug') ? 1 : 0; }) != 0;
++		g_dbzOpt_zmask = EM_ASM_INT({ return new URLSearchParams(location.search).get('zmask') === '0' ? 0 : 1; }) != 0;
++		g_dbzOpt_wbskip = EM_ASM_INT({ const v = new URLSearchParams(location.search).get('wbskip'); return v === null ? 2 : (parseInt(v) || 0); });
++		g_dbzOpt_swsprites = EM_ASM_INT({ return new URLSearchParams(location.search).get('swsprites') === '1' ? 1 : 0; }) != 0;
++		g_dbzOpt_exactfbtex = EM_ASM_INT({ return new URLSearchParams(location.search).get('exactfbtex') === '0' ? 0 : 1; }) != 0;
++		g_dbzOpt_exactsmall = EM_ASM_INT({ return new URLSearchParams(location.search).get('exactsmall') === '1' ? 1 : 0; }) != 0;
++		std::printf("[webgs] dbz options: exactsmall %d ", g_dbzOpt_exactsmall);
++		std::printf("[webgs] dbz options: zmask %d wbskip %d swsprites %d exactfbtex %d\n", g_dbzOpt_zmask, g_dbzOpt_wbskip, g_dbzOpt_swsprites, g_dbzOpt_exactfbtex);
+ 		g_hd = EM_ASM_INT({ return new URLSearchParams(location.search).get('hd') === '0' ? 0 : 1; }) != 0;
+ 		g_fsr = EM_ASM_INT({ return new URLSearchParams(location.search).get('fsr') === '0' ? 0 : 1; }) != 0;
+ 		g_vuContextLocals = EM_ASM_INT({ return new URLSearchParams(location.search).get('vulocals') === '1' ? 1 : 0; }) != 0;
+@@ -1614,6 +1750,20 @@ bool ps2xWebStartGsHost(ps2live::RingHeader* header)
+ 	return true;
+ }
+ 
++extern "C" EMSCRIPTEN_KEEPALIVE void ps2xVuCapArm(uint32_t lo, uint32_t hi)
++{
++	g_vuCapLo = lo;
++	g_vuCapHi = hi;
++	g_vuCapState = 1;
++}
++
++extern "C" EMSCRIPTEN_KEEPALIVE const char* ps2xVuCap()
++{
++	static std::string copy;
++	copy = g_vuCapState.load() == 2 ? g_vuCapText : std::string("pending");
++	return copy.c_str();
++}
++
+ // ?vudump=1: [size (uint32)][blob] of the hottest VU1 blocks (see CGenericMipsExecutor::DumpHotBlocks)
+ extern "C" EMSCRIPTEN_KEEPALIVE uint8_t* ps2xVuDump()
+ {
+diff --git a/ps2xRuntime/web/site/index.html b/ps2xRuntime/web/site/index.html
+index 73d92b7..224d903 100644
+--- a/ps2xRuntime/web/site/index.html
++++ b/ps2xRuntime/web/site/index.html
+@@ -3,7 +3,7 @@
+ <head>
+ <meta charset="utf-8">
+ <meta name="viewport" content="width=device-width, initial-scale=1">
+-<title>NBA Street V3</title>
++<title>DBZ Budokai Tenkaichi 3</title>
+ <style>
+   :root { color-scheme: dark; --bg: #0b0b0d; --fg: #e8e6e3; --dim: #8b8a88; --accent: #e8792b; }
+   * { box-sizing: border-box; }
+diff --git a/ps2xRuntime/web/web_platform.cpp b/ps2xRuntime/web/web_platform.cpp
+index 5d7c3b0..81921b4 100644
+--- a/ps2xRuntime/web/web_platform.cpp
++++ b/ps2xRuntime/web/web_platform.cpp
+@@ -63,6 +63,9 @@ static void SeedSaveFile(const char* from, const char* to)
+ 
+ // web/disc_files.inc: the disc files the game opens through cdrom0: besides the raw ISO sectors
+ // (found with PS2X_VFS_LOG=1), served under data/iso/.
++// Game: DBZ Budokai Tenkaichi 3 (SLUS_219.78, "BT4 Beta 14 Rev2" mod) -- local DBZ worktree.
++#define PS2X_WEB_ISO "/game/DBZBT4.iso"
++#define PS2X_WEB_ELF "SLUS_219.78"
+ static const char* const kDiscFiles[] = {
+ #include "disc_files.inc"
+ };
+@@ -72,8 +75,8 @@ void ps2xWasmPlatformInit(int& argc, char**& argv)
+ 	backend_t data = wasmfs_create_fetch_backend("data", 1u << 20);
+ 	int rc = wasmfs_create_directory("/game", 0777, data);
+ 	std::printf("[web] mkdir /game -> %d\n", rc);
+-	rc = wasmfs_create_file("/game/NBAStreetV3.iso", 0444, data);
+-	std::printf("[web] create /game/NBAStreetV3.iso -> %d\n", rc);
++	rc = wasmfs_create_file(PS2X_WEB_ISO, 0444, data);
++	std::printf("[web] create " PS2X_WEB_ISO " -> %d\n", rc);
+ 	if(rc >= 0)
+ 		close(rc);
+ 	rc = mkdir("/game/iso", 0777); // a directory in the fetch backend: its files map to data/iso/
+@@ -82,13 +85,19 @@ void ps2xWasmPlatformInit(int& argc, char**& argv)
+ 	{
+ 		char path[256];
+ 		std::snprintf(path, sizeof(path), "/game/iso/%s", name);
++		if(const char* slash = std::strrchr(name, '/')) // a subdirectory of data/iso/ (IRX/, BIN/)
++		{
++			char dir[256];
++			std::snprintf(dir, sizeof(dir), "/game/iso/%.*s", static_cast<int>(slash - name), name);
++			mkdir(dir, 0777);
++		}
+ 		rc = wasmfs_create_file(path, 0444, data);
+ 		std::printf("[web] create %s -> %d\n", path, rc);
+ 		if(rc >= 0)
+ 			close(rc);
+ 	}
+-	ProbeFile("/game/iso/SLUS_211.26");
+-	ProbeFile("/game/NBAStreetV3.iso");
++	ProbeFile("/game/iso/" PS2X_WEB_ELF);
++	ProbeFile(PS2X_WEB_ISO);
+ 
+ 	backend_t opfs = wasmfs_create_opfs_backend();
+ 	wasmfs_create_directory("/saves", 0777, opfs);
+@@ -143,11 +152,11 @@ void ps2xWasmPlatformInit(int& argc, char**& argv)
+ 	}));
+ 	setenv("PS2X_NET_ID", netId, 1);
+ 	std::free(netId);
+-	setenv("PS2X_CD_IMAGE", "/game/NBAStreetV3.iso", 1);
++	setenv("PS2X_CD_IMAGE", PS2X_WEB_ISO, 1);
+ 	chdir("/game/iso");
+ 
+ 	static char arg0[] = "ps2EntryRunner";
+-	static char arg1[] = "/game/iso/SLUS_211.26";
++	static char arg1[] = "/game/iso/" PS2X_WEB_ELF;
+ 	static char* args[] = {arg0, arg1, nullptr};
+ 	argc = 2;
+ 	argv = args;

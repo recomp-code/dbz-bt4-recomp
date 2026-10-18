@@ -1,0 +1,319 @@
+diff -ruN play/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp dbz/play-dbz/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+--- play/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp	2026-10-15 21:10:35
++++ dbz/play-dbz/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp	2026-10-18 14:53:51
+@@ -1224,7 +1224,7 @@
+ 
+ 	glBindFramebuffer(GL_FRAMEBUFFER, framebuffer->m_framebuffer);
+ 
+-	glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depthbuffer->m_depthBuffer);
++	depthbuffer->Attach();
+ 	CHECKGLERROR();
+ 
+ 	assert(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
+@@ -1582,7 +1582,7 @@
+ 			//Small offscreen buffers are where games compose textures (often read back later in
+ 			//another format, sometimes only once): draw them exactly from the start
+ 			auto framebuffer = FindFramebuffer(frame);
+-			result = (framebuffer && framebuffer->m_exactColor) || (frame.GetWidth() <= 256);
++			result = (framebuffer && framebuffer->m_exactColor) || (m_exactSmallBuffers && (frame.GetWidth() <= 256));
+ 		}
+ 	}
+ 	m_emulatedFetchDirty = false;
+@@ -2144,7 +2144,7 @@
+ 	auto depthbuffer = FindDepthbuffer(zbufWrite, frame);
+ 	assert(depthbuffer);
+ 
+-	glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depthbuffer->m_depthBuffer);
++	depthbuffer->Attach();
+ 	CHECKGLERROR();
+ 
+ 	assert(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
+@@ -2313,6 +2313,16 @@
+ 
+ 		//Small offscreen buffers (texture compositions) are drawn exactly in GS RAM by the CPU:
+ 		//no GPU round trip when the game reads them back in another format
++		if(nDrawingKick && m_depthMaskPass)
++		{
++			if(m_primitiveType == PRIM_SPRITE && TryDepthMaskPass())
++			{
++				m_nVtxCount = 2;
++				return;
++			}
++			m_depthMaskDone = false;
++		}
++
+ 		if(nDrawingKick && (m_primitiveType == PRIM_SPRITE) && DrawSpriteInSoftware())
+ 		{
+ 			m_nVtxCount = 2;
+@@ -2929,25 +2939,41 @@
+     , m_psm(psm)
+ {
+ 	//Build depth attachment
+-	m_depthBuffer = Framework::OpenGl::CRenderbuffer::Create();
+-	glBindRenderbuffer(GL_RENDERBUFFER, m_depthBuffer);
+ 	if(multisampled)
+ 	{
++		m_depthBuffer = Framework::OpenGl::CRenderbuffer::Create();
++		glBindRenderbuffer(GL_RENDERBUFFER, m_depthBuffer);
+ 		glRenderbufferStorageMultisample(GL_RENDERBUFFER, NUM_SAMPLES, GL_DEPTH_COMPONENT32F, m_width * scale, m_height * scale);
+ 	}
+ 	else
+ 	{
+-		glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT32F, m_width * scale, m_height * scale);
++		m_depthTexture = Framework::OpenGl::CTexture::Create();
++		glBindTexture(GL_TEXTURE_2D, m_depthTexture);
++		glTexStorage2D(GL_TEXTURE_2D, 1, GL_DEPTH_COMPONENT32F, m_width * scale, m_height * scale);
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++		glBindTexture(GL_TEXTURE_2D, 0);
+ 	}
+ 	CHECKGLERROR();
+ }
+ 
++void CGSH_OpenGL::CDepthbuffer::Attach() const
++{
++	if((static_cast<GLuint>(m_depthTexture) == 0))
++		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, m_depthBuffer);
++	else
++		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, m_depthTexture, 0);
++}
++
+ /////////////////////////////////////////////////////////////
+ // Software sprites
+ /////////////////////////////////////////////////////////////
+ 
+ bool CGSH_OpenGL::DrawSpriteInSoftware()
+ {
++	if(!m_softwareSpritesEnabled) return false; //[dbz] ?swsprites=0
+ 	uint64 prim = m_PrimitiveMode;
+ 	const bool textured = (prim >> 4) & 1;
+ 	const bool fog = (prim >> 5) & 1;
+@@ -2998,6 +3024,7 @@
+ 	{
+ 		if(framebuffer->m_gpuDirty && (framebuffer->m_basePtr == fbp * 8192))
+ 		{
++			m_wbStats[(static_cast<uint64>(framebuffer->m_basePtr) << 32) | (static_cast<uint64>(framebuffer->m_psm) << 24) | (0xFFull << 16)]++;
+ 			WriteBackFramebuffer(framebuffer);
+ 		}
+ 	}
+@@ -3217,5 +3244,121 @@
+ 	{
+ 		framebuffer->m_cachedArea.Invalidate(start, size);
+ 	}
++	return true;
++}
++
++/////////////////////////////////////////////////////////////
++// [dbz] Depth mask pass (DBZ BT3 post chain), see GSH_OpenGL.h
++/////////////////////////////////////////////////////////////
++
++bool CGSH_OpenGL::TryDepthMaskPass()
++{
++	const uint64 primReg = m_PrimitiveMode;
++	auto prim = make_convertible<PRMODE>(primReg);
++	if(!prim.nTexture) return false;
++	const uint32 context = prim.nContext;
++	auto tex0 = make_convertible<TEX0>(m_nReg[GS_REG_TEX0_1 + context]);
++	auto frame = make_convertible<FRAME>(m_nReg[GS_REG_FRAME_1 + context]);
++	if((tex0.nPsm != PSMZ16) && (tex0.nPsm != PSMZ16S)) return false;
++	if((frame.nPsm != PSMCT16) && (frame.nPsm != PSMCT16S)) return false;
++	if(frame.nMask != 0x3FFF) return false;
++
++	//The Z buffer being read and the 32-bit frame the 16-bit view aliases
++	DepthbufferPtr depthbuffer;
++	for(const auto& candidate : m_depthbuffers)
++	{
++		if(candidate->m_basePtr == tex0.GetBufPtr() && (static_cast<GLuint>(candidate->m_depthTexture) != 0))
++		{
++			depthbuffer = candidate;
++			break;
++		}
++	}
++	if(!depthbuffer) return false;
++	FramebufferPtr framebuffer;
++	for(const auto& candidate : m_framebuffers)
++	{
++		if(candidate->m_basePtr == frame.GetBasePtr() && candidate->m_width == depthbuffer->m_width &&
++		   ((candidate->m_psm == PSMCT32) || (candidate->m_psm == PSMCT24)))
++		{
++			framebuffer = candidate;
++			break;
++		}
++	}
++	if(!framebuffer) return false;
++	if(m_depthMaskDone) return true; //rest of the strips of the same pass
++	m_depthMaskDone = true;
++	m_depthMaskPasses++;
++
++	FlushVertexBuffer();
++	if(m_depthMaskProgram == nullptr)
++	{
++		Framework::OpenGl::CShader vertexShader(GL_VERTEX_SHADER);
++		Framework::OpenGl::CShader pixelShader(GL_FRAGMENT_SHADER);
++		vertexShader.SetSource("#version 300 es\n"
++		                       "in vec2 a_position;\nin vec2 a_texCoord;\nout vec2 v_texCoord;\n"
++		                       "void main() { v_texCoord = a_texCoord; gl_Position = vec4(a_position, 0, 1); }\n");
++		vertexShader.Compile();
++		pixelShader.SetSource("#version 300 es\n"
++		                      "precision highp float;\nin vec2 v_texCoord;\nout vec4 fragColor;\n"
++		                      "uniform highp sampler2D g_texture;\nuniform float g_exact;\n"
++		                      "void main() {\n"
++		                      "  highp float d = texture(g_texture, v_texCoord).r;\n"
++		                      "  highp uint z = uint(d * 4294967296.0 + 0.5);\n"
++		                      "  float a = float((z >> 8u) & 255u) / 255.0;\n"
++		                      "  fragColor = vec4(0.0, 0.0, 0.0, g_exact > 0.5 ? a : clamp(a * 2.0, 0.0, 1.0));\n"
++		                      "}\n");
++		pixelShader.Compile();
++		m_depthMaskProgram = std::make_shared<Framework::OpenGl::CProgram>();
++		m_depthMaskProgram->AttachShader(vertexShader);
++		m_depthMaskProgram->AttachShader(pixelShader);
++		glBindAttribLocation(*m_depthMaskProgram, static_cast<GLuint>(PRIM_VERTEX_ATTRIB::POSITION), "a_position");
++		glBindAttribLocation(*m_depthMaskProgram, static_cast<GLuint>(PRIM_VERTEX_ATTRIB::TEXCOORD), "a_texCoord");
++		m_depthMaskProgram->Link();
++		glUseProgram(*m_depthMaskProgram);
++		glUniform1i(glGetUniformLocation(*m_depthMaskProgram, "g_texture"), 0);
++		m_depthMaskExactUniform = glGetUniformLocation(*m_depthMaskProgram, "g_exact");
++	}
++
++	//The depth texture can't stay attached to the framebuffer we draw into while it is read
++	glBindFramebuffer(GL_FRAMEBUFFER, framebuffer->m_framebuffer);
++	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, 0, 0);
++	glDisable(GL_BLEND);
++	glDisable(GL_DEPTH_TEST);
++	glDisable(GL_SCISSOR_TEST);
++	glDepthMask(GL_FALSE);
++	glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
++	glUseProgram(*m_depthMaskProgram);
++	glUniform1f(m_depthMaskExactUniform, framebuffer->m_exactColor ? 1.0f : 0.0f);
++	glActiveTexture(GL_TEXTURE0);
++	glBindTexture(GL_TEXTURE_2D, depthbuffer->m_depthTexture);
++	//Rows the pass covers: the 16-bit view's scissor, in 32-bit rows (two 16-bit rows each)
++	auto scissor = make_convertible<SCISSOR>(m_nReg[GS_REG_SCISSOR_1 + context]);
++	const uint32 rows = std::min<uint32>(framebuffer->m_height, (scissor.scay1 + 2) / 2);
++	glEnable(GL_SCISSOR_TEST);
++	glScissor(0, 0, framebuffer->m_width * m_fbScale, rows * m_fbScale);
++	glViewport(0, 0, framebuffer->m_width * m_fbScale, framebuffer->m_height * m_fbScale);
++	glBindBuffer(GL_ARRAY_BUFFER, m_copyToFbVertexBuffer);
++	glBindVertexArray(m_copyToFbVertexArray);
++	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
++	CHECKGLERROR();
++
++	framebuffer->m_resolveNeeded = true;
++	if(!framebuffer->m_gpuDirty)
++	{
++		framebuffer->m_gpuDirty = true;
++		framebuffer->m_gpuDirtyMinY = 0;
++		framebuffer->m_gpuDirtyMaxY = rows - 1;
++	}
++	else
++	{
++		framebuffer->m_gpuDirtyMinY = 0;
++		framebuffer->m_gpuDirtyMaxY = std::max(framebuffer->m_gpuDirtyMaxY, rows - 1);
++	}
++
++	//Everything above bypassed the cached GL state
++	m_validGlState = 0;
++	m_renderState.isValid = false;
++	m_renderState.isFramebufferStateValid = false;
++	m_renderState.isTextureStateValid = false;
+ 	return true;
+ }
+diff -ruN play/Source/gs/GSH_OpenGL/GSH_OpenGL.h dbz/play-dbz/Source/gs/GSH_OpenGL/GSH_OpenGL.h
+--- play/Source/gs/GSH_OpenGL/GSH_OpenGL.h	2026-10-15 21:10:35
++++ dbz/play-dbz/Source/gs/GSH_OpenGL/GSH_OpenGL.h	2026-10-18 15:06:42
+@@ -283,6 +283,9 @@
+ 		uint32 m_height;
+ 		uint32 m_psm;
+ 		Framework::OpenGl::CRenderbuffer m_depthBuffer;
++		//[dbz] non-multisampled depth lives in a texture, so passes can read it (depth as texture)
++		Framework::OpenGl::CTexture m_depthTexture;
++		void Attach() const;
+ 	};
+ 	typedef std::shared_ptr<CDepthbuffer> DepthbufferPtr;
+ 	typedef std::vector<DepthbufferPtr> DepthbufferList;
+@@ -555,6 +558,24 @@
+ 
+ public:
+ 	uint32 m_framebufferWriteBacks = 0;
++public:
++	bool m_exactFbTextures = true;
++	bool m_softwareSpritesEnabled = false;
++	bool m_exactSmallBuffers = false; // [dbz] frames <= 256 wide drawn with emulated fetch (?exactsmall=0 off) // [dbz] small offscreen sprites drawn on the CPU (DrawSpriteInSoftware)
++	int m_skipTransferredWriteBacks = 2; // [dbz] ?wbskip=0 off (WriteBackOverlappingFramebuffers)
++	uint32 m_skippedWriteBacks = 0;
++	std::map<uint64, uint32> m_wbStats; // [dbz] fb base<<32 | fb psm<<24 | tex psm<<16 | tex page
++	//[dbz] DBZ BT3 post chain: its "depth mask" pass reads the Z buffer as PSMZ16 through a CT16
++	//view of the frame (fbmsk 0x3fff) to do frame.A := Z24[15:8] (pinned by z3xox/BT3-Recomp,
++	//docs/SEAM-POSTCHAIN.md). The GPU's depth never reaches GS RAM, so that draw is done natively
++	//from the depth texture. ?zmask=0 turns it off.
++	bool m_depthMaskPass = true;
++	bool m_depthMaskDone = false;
++	uint32 m_depthMaskPasses = 0;
++	bool TryDepthMaskPass();
++	Framework::OpenGl::ProgramPtr m_depthMaskProgram;
++	GLint m_depthMaskExactUniform = -1; // [dbz] sample exact framebuffers on the GPU (SearchTextureFramebuffer)
++	bool m_traceWriteBacks = false; // [dbz] log each framebuffer write-back (set during an F9 trace)
+ 	uint32 m_softwareSprites = 0;
+ 
+ 	//HD texture packs in PCSX2's format (<hash>-<clut hash>-<bits>.png), read from baseUrl as
+diff -ruN play/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp dbz/play-dbz/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp
+--- play/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp	2026-10-14 18:10:12
++++ dbz/play-dbz/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp	2026-10-18 14:46:49
+@@ -113,8 +113,12 @@
+ 	for(const auto& candidateFramebuffer : m_framebuffers)
+ 	{
+ 		//Exact framebuffers are written back to GS RAM before any texture reads them (see
+-		//WriteBackOverlappingFramebuffers), and RAM may be newer (transfers): read RAM
+-		if(candidateFramebuffer->m_exactColor) continue;
++		//WriteBackOverlappingFramebuffers), and RAM may be newer (transfers): read RAM.
++		//[dbz] Unless the texture is exactly that framebuffer (same start, width, compatible
++		//format): its exact pixels are what RAM would hold, so the GPU copy is used directly
++		//(DBZ BT3's post-processing chain read each buffer back to the CPU every frame).
++		//m_exactFbTextures = false (?exactfbtex=0) restores the RAM path.
++		if(candidateFramebuffer->m_exactColor && !m_exactFbTextures) continue;
+ 
+ 		//Case: TEX0 points at the start of a frame buffer with the same width
+ 		if(candidateFramebuffer->m_basePtr == tex0.GetBufPtr() &&
+@@ -206,13 +210,39 @@
+ 		uint32 fbStart = framebuffer->m_basePtr + (framebuffer->m_gpuDirtyMinY / fbPageSize.second) * fbPagesX * CGsPixelFormats::PAGESIZE;
+ 		uint32 fbEnd = framebuffer->m_basePtr + ((framebuffer->m_gpuDirtyMaxY / fbPageSize.second) + 1) * fbPagesX * CGsPixelFormats::PAGESIZE;
+ 		if((fbStart >= texEnd) || (texStart >= fbEnd)) continue;
+-#ifdef _DEBUG
++		//[dbz] Pages the texture reads that were all rewritten by transfers since the drawing are
++		//newer in RAM than on the GPU (DBZ BT3 uploads glyphs over its downscale buffer every
++		//frame): nothing to bring back for this texture
++		if(m_skipTransferredWriteBacks)
+ 		{
++			const uint32 lo = std::max(texStart, fbStart), hi = std::min(texEnd, fbEnd);
++			uint32 pages = 0, newer = 0;
++			for(uint32 a = lo & ~(CGsPixelFormats::PAGESIZE - 1); a < hi; a += CGsPixelFormats::PAGESIZE)
++			{
++				pages++;
++				if(a >= framebuffer->m_basePtr && framebuffer->m_cachedArea.IsPageDirty((a - framebuffer->m_basePtr) / CGsPixelFormats::PAGESIZE))
++					newer++;
++			}
++			//Mode 2 (DBZ default): one re-uploaded page is enough -- the game uploads what it is
++			//about to read into scratch memory its post chain drew over
++			const bool indexed = (tex0.nPsm == PSMT8) || (tex0.nPsm == PSMT4);
++			const bool allNewer = (newer == pages) || ((m_skipTransferredWriteBacks >= 2) && indexed && (newer != 0));
++			if(allNewer)
++			{
++				m_skippedWriteBacks++;
++				continue;
++			}
++		}
++#if 1
++		if(m_traceWriteBacks)
++		{
+ 			printf("[gsh] write-back fb %x w %u psm %x rows %u-%u [%x,%x) for tex %x tbw %u psm %x %ux%u [%x,%x)\n",
+ 			       framebuffer->m_basePtr, framebuffer->m_width, framebuffer->m_psm, framebuffer->m_gpuDirtyMinY, framebuffer->m_gpuDirtyMaxY,
+ 			       fbStart, fbEnd, tex0.GetBufPtr(), tex0.GetBufWidth(), static_cast<uint32>(tex0.nPsm), tex0.GetWidth(), tex0.GetHeight(), texStart, texEnd);
+ 		}
+ #endif
++		m_wbStats[(static_cast<uint64>(framebuffer->m_basePtr) << 32) | (static_cast<uint64>(framebuffer->m_psm) << 24) |
++		          (static_cast<uint64>(tex0.nPsm) << 16) | (tex0.GetBufPtr() >> 13)]++;
+ 		WriteBackFramebuffer(framebuffer);
+ 		m_textureCache.InvalidateRange(fbStart, fbEnd - fbStart);
+ 		HdInvalidate(fbStart, fbEnd - fbStart);

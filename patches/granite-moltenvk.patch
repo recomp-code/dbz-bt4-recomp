@@ -1,0 +1,57 @@
+diff --git a/util/timer.cpp b/util/timer.cpp
+index a1408352..b9e63a81 100644
+--- a/util/timer.cpp
++++ b/util/timer.cpp
+@@ -138,6 +138,15 @@ void sleep_until_nsecs(int64_t timepoint)
+ 		_mm_pause();
+ #endif
+ 	}
++#elif defined(__APPLE__)
++	// [bt3mod macOS] no clock_nanosleep: relative nanosleep to the same monotonic timepoint.
++	int64_t d = timepoint - get_current_time_nsecs();
++	if (d <= 0)
++		return;
++	struct timespec ts = {};
++	ts.tv_sec = d / 1000000000ll;
++	ts.tv_nsec = d % 1000000000ll;
++	while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {}
+ #else
+ 	constexpr auto timebase = CLOCK_MONOTONIC;
+ 	struct timespec ts = {};
+diff --git a/vulkan/device.cpp b/vulkan/device.cpp
+index 4ee4f963..b545d229 100644
+--- a/vulkan/device.cpp
++++ b/vulkan/device.cpp
+@@ -22,6 +22,8 @@
+ 
+ #define NOMINMAX
+ #include "device.hpp"
++#include <cstdlib>
++#include <cstdio>
+ #ifdef GRANITE_VULKAN_FOSSILIZE
+ #include "device_fossilize.hpp"
+ #endif
+@@ -972,7 +974,22 @@ void Device::set_context(const Context &context)
+ 	init_workarounds();
+ 	init_pipeline_cache();
+ 	init_timeline_semaphores();
+-	init_frame_contexts(2); // By default, regular double buffer between CPU and GPU.
++	{   // [framectx] BT3-Recomp: the frame-context ring is FLUSH-depth, not frame-depth. paraLLEl-GS
++		// calls flush_submit ~7-8 times per frame at BT3's packet rate, and each advance blocks in
++		// Device::PerFrame::wait until the GPU retires the context it reuses. At the upstream depth
++		// of 2 that is a wait on work two flushes old -- a quarter of a frame -- which surfaced as
++		// 1-10 ms stalls inside gif_transfer on packets as small as 208 bytes, with the GPU only
++		// ~40% busy. Measured 2 -> 16: 1P vs COM 52.5 -> 59.8 fps, splitscreen ~42 -> 45.6, worst
++		// single gif_transfer call 10.66 -> 3.0 ms. Cost: PerFrame::begin() is also where deferred
++		// Vulkan destruction happens, so resources retire N advances later (~2 frames at depth 16).
++		// PS2X_PGS_FRAMECTX overrides; 2 restores upstream behaviour.
++		const char *v = getenv("PS2X_PGS_FRAMECTX");
++		unsigned n = (v && v[0]) ? unsigned(atoi(v)) : 16u;
++		if (n < 2u) n = 2u;
++		if (n > 32u) n = 32u;
++		fprintf(stderr, "[framectx] frame contexts = %u (PS2X_PGS_FRAMECTX, default 16)\n", n);
++		init_frame_contexts(n);
++	} // By default, regular double buffer between CPU and GPU.
+ 
+ 	managers.memory.init(this);
+ 	managers.semaphore.init(this);

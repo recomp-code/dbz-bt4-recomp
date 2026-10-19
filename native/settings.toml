@@ -1,0 +1,57 @@
+# Dragon Ball Z: Budokai Tenkaichi 3 - Recompiled
+# User settings - written by the front-end and the in-game overlay.
+# Delete this file to reset everything to defaults.
+
+[audio]
+master_volume = 1
+music_volume = 1
+sfx_volume = 1
+
+[video]
+renderer = "parallel-gs"
+glow = true
+glowfix = true
+ink_strength = 199
+ink_width = 100
+ink_color = "#000000"
+bilinear = true
+halftexel = true
+skippost = true
+skip_stale_vram = true
+render_scale = 2
+outline = true
+texture_pack = false
+shadows = true
+dof_blur = true
+dof_zfar = 200000
+fullscreen = true      # legacy mirror of window_mode == 2
+window_mode = 2         # 0 windowed (resizable, decorated), 1 borderless, 2 fullscreen
+monitor = 0             # 0-based display index; applied at startup (PS2X_MONITOR overrides)
+widescreen = false
+window_w = 1600
+window_h = 900
+force_bilinear = true
+fps60 = false
+
+[video.hud]
+layout = 0
+offset_left = 0
+offset_center = 0
+offset_right = 0
+
+[controllers]
+device = 0
+deadzone = 0.15
+overlay_enabled = true
+
+[controllers.hotkey]
+pad_btns = [13, 15]
+keys = [340, 258]
+
+[logging]
+log_level = 1
+dump_audio = true
+dump_video = true
+dump_controllers = true
+dump_runtime = true
+dump_gamepad = false

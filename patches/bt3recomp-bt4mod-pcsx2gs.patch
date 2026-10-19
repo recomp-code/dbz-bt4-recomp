@@ -1,0 +1,1106 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 90a0094..20bdb14 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -712,6 +712,7 @@ src/lib/ps2x_injected.cpp       # [injected] function registry for cloned guest
+     src/lib/ps2_seammesh.cpp    # [seam] Phases 1-3: importer, host transform, verify/skip
+     src/lib/ps2_fiber.cpp
+     src/lib/ps2_gif_arbiter.cpp
++    src/lib/ps2_gs_live.cpp      # [gslive] live GS stream to the PCSX2 GS host (PS2X_GS_LIVE=1)
+     src/lib/ps2_audio.cpp
+     src/lib/ps2_audio_vag.cpp
+     src/lib/ps2_host_audio.cpp   # [hostio] audio device: SDL2 mixer or raylib/miniaudio
+diff --git a/ps2xRuntime/include/runtime/ps2_gs_live.h b/ps2xRuntime/include/runtime/ps2_gs_live.h
+new file mode 100644
+index 0000000..0524a20
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ps2_gs_live.h
+@@ -0,0 +1,46 @@
++#pragma once
++// [gslive] PCSX2's GS as the renderer: the game's GS stream goes, live, to the PCSX2-based GS host window
++// ("pcsx2-gsrunner -live", Metal/Vulkan hardware renderer with upscaling) over a shared-memory ring
++// (ps2_live_ring.h). Ported from the PS2Recomp NBA Street V3 runtime (gs_dump_writer.cpp), without its remote-VU
++// mode: VIF1/VU1 stay local and the host receives finished GIF packets (PATH1/2/3), privileged-register
++// snapshots and one VSync per published frame.
++//
++// Enabled with PS2X_GS_LIVE=1 or settings.toml [video] renderer = "pcsx2". Then our own GS parse runs state-only
++// (PS2X_GS_NODRAW, nothing is drawn locally), paraLLEl-GS and the native renderer are off, the runtime's window
++// stays hidden (audio and pads keep running) and the pad comes from the host window (keyboard + gamepad there).
++//   PS2X_GSHOST       host executable (default ~/NBAStreetRecomp/gshost-dbz/pcsx2-gsrunner)
++//   PS2X_GSHOST_ARGS  extra host arguments (default "-ini dbz.ini", relative to the host's folder)
++//   PS2X_LIVE_SERIAL  game serial for PCSX2's GameIndex fixes (default SLUS-21978; exported to the host)
++//   PS2X_GS_DUMP=<f>  also/instead write the same stream as a PCSX2 .gs dump (PS2X_GS_DUMP_FRAMES limits it)
++#include <cstdint>
++
++struct GSRegisters;
++
++namespace ps2_gslive
++{
++    // PS2X_GS_LIVE=1 or the settings renderer asked for it (decided once, before the first packet).
++    bool requested();
++    // Live ring open and the host started.
++    bool liveActive();
++    // Anything recording (live or dump file).
++    bool active();
++    // Host window state, read by the pad code: active-high libpad buttons, lx|ly<<8|rx<<16|ry<<24.
++    bool remotePad(uint32_t &buttons, uint32_t &axes);
++    bool hostMenuOpen();
++    // path: 1, 2 or 3. Stream order is the caller's (GifArbiter::process on the GS thread).
++    void transfer(int path, const uint8_t *data, uint32_t sizeBytes);
++    // A register the runtime's HLE stubs write straight into its GS parse: sent as an A+D packet.
++    void writeRegister(uint8_t reg, uint64_t value);
++    // GS -> EE transfer of qwc quadwords.
++    void readFifo(uint32_t qwc);
++    // Stream-ordered DISPFB1 (the display flip as it passes through the GS thread).
++    void streamFlip(uint64_t dispfb1);
++    // Stream-ordered privileged display register ([s1fence] path).
++    void streamPriv(uint32_t regOff, uint64_t value);
++    // A published frame (GsGpuRenderer::swapFrame, stream order): register snapshot + VSync. The producer then waits
++    // while the host is more than PS2X_GSLIVE_MAXLAG (default 2) frames behind, so input latency stays bounded.
++    void vsync(const GSRegisters &regs);
++    // The live privileged register block (PS2Memory::gs_regs) and the per-frame hook that snapshots it.
++    void setRegs(GSRegisters *regs);
++    void onSwap();
++}
+diff --git a/ps2xRuntime/src/lib/ps2_gs_live.cpp b/ps2xRuntime/src/lib/ps2_gs_live.cpp
+new file mode 100644
+index 0000000..7cfc43e
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_gs_live.cpp
+@@ -0,0 +1,630 @@
++// [gslive] Live GS stream to the PCSX2 GS host (see include/runtime/ps2_gs_live.h).
++// Ported from PS2Recomp's ps2xRuntime/src/lib/gs/gs_dump_writer.cpp (NBA Street V3), POSIX only, local VU.
++#include "runtime/ps2_gs_live.h"
++#include "ps2_live_ring.h"
++
++#include "runtime/ps2_memory.h"
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <mutex>
++#include <string>
++#include <vector>
++
++#if defined(__APPLE__) || defined(__linux__)
++#include <cerrno>
++#include <fcntl.h>
++#include <signal.h>
++#include <spawn.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <sys/wait.h>
++#include <unistd.h>
++extern char **environ;
++#define PS2X_GS_LIVE_RING 1
++#endif
++
++namespace ps2_gslive
++{
++    namespace
++    {
++        // PCSX2 GSDumpTypes: packet ids and transfer paths.
++        constexpr uint8_t kTypeTransfer = 0u;
++        constexpr uint8_t kTypeVSync = 1u;
++        constexpr uint8_t kTypeReadFifo2 = 2u;
++        constexpr uint8_t kTypeRegisters = 3u;
++        constexpr uint8_t kPath2 = 1u;
++        constexpr uint8_t kPath3 = 2u;
++        constexpr uint8_t kPath1New = 3u;
++
++        constexpr uint32_t kPrivRegsSize = 8192u;
++        constexpr uint32_t kGsStateVersion = 9u; // GSState::STATE_VERSION in PCSX2 2.x
++
++#pragma pack(push, 4)
++        struct DumpHeader
++        {
++            uint32_t state_version;
++            uint32_t state_size;
++            uint32_t serial_offset;
++            uint32_t serial_size;
++            uint32_t crc;
++            uint32_t screenshot_width;
++            uint32_t screenshot_height;
++            uint32_t screenshot_offset;
++            uint32_t screenshot_size;
++        };
++#pragma pack(pop)
++
++        bool envOn(const char *name)
++        {
++            const char *v = std::getenv(name);
++            return v && v[0] && v[0] != '0';
++        }
++
++        std::string serial()
++        {
++            const char *v = std::getenv("PS2X_LIVE_SERIAL");
++            return (v && v[0]) ? std::string(v) : std::string("SLUS-21978");
++        }
++
++#if defined(PS2X_GS_LIVE_RING)
++        // shm_open mapping, events as shared words (ps2live::eventSet/eventWait), host started with posix_spawn.
++        struct LiveRing
++        {
++            int mappingFd = -1;
++            pid_t hostPid = 0;
++            int hostStatus = 0;
++            bool hostExited = false;
++            ps2live::RingHeader *header = nullptr;
++            ps2live::RingEvents *events = nullptr;
++            uint8_t *data = nullptr;
++            uint64_t capacity = 0;
++            std::string suffix = std::to_string(getpid()); // this instance's ring name
++            std::string mappingName = ps2live::objectName(ps2live::kPosixMappingName, suffix);
++            uint64_t waitNs = 0; // time the game blocked on a full ring ([gslive] stats)
++
++            ~LiveRing()
++            {
++                if (mappingFd >= 0)
++                    shm_unlink(mappingName.c_str());
++            }
++
++            bool open()
++            {
++                capacity = ps2live::kDefaultCapacity;
++                const uint64_t total = ps2live::mappingSize(capacity);
++                shm_unlink(mappingName.c_str()); // left over by a crashed instance with the same pid
++                mappingFd = shm_open(mappingName.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
++                if (mappingFd < 0)
++                    return false;
++                if (ftruncate(mappingFd, static_cast<off_t>(total)) != 0)
++                    return false;
++                void *view = mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_SHARED, mappingFd, 0);
++                if (view == MAP_FAILED)
++                    return false;
++                header = static_cast<ps2live::RingHeader *>(view);
++                std::memset(header, 0, sizeof(*header));
++                header->capacity = capacity;
++                header->padAxes = 0x80808080u;
++                header->version = ps2live::kVersion;
++                header->producerAlive = 1u;
++                header->producerFlags = 1u;
++                data = ps2live::ringData(header);
++                events = ps2live::ringEvents(header);
++                std::memset(events, 0, sizeof(*events));
++                __atomic_thread_fence(__ATOMIC_SEQ_CST);
++                header->magic = ps2live::kMagic;
++                return true;
++            }
++
++            bool launchHost()
++            {
++                std::string exe;
++                if (const char *custom = std::getenv("PS2X_GSHOST"); custom && custom[0])
++                    exe = custom;
++                else if (const char *home = std::getenv("HOME"))
++                    exe = std::string(home) + "/NBAStreetRecomp/gshost-dbz/pcsx2-gsrunner";
++                std::vector<std::string> args{exe, "-live", "-window", "-livering", suffix};
++                const char *extra = std::getenv("PS2X_GSHOST_ARGS");
++                std::string extraArgs = (extra && extra[0]) ? extra : "-ini dbz.ini"; // quality settings next to the host
++                size_t pos = 0;
++                while (pos < extraArgs.size())
++                {
++                    const size_t start = extraArgs.find_first_not_of(' ', pos);
++                    if (start == std::string::npos)
++                        break;
++                    const size_t end = extraArgs.find(' ', start);
++                    args.push_back(extraArgs.substr(start, end == std::string::npos ? std::string::npos : end - start));
++                    pos = end == std::string::npos ? extraArgs.size() : end;
++                }
++                std::vector<char *> argv;
++                for (std::string &arg : args)
++                    argv.push_back(arg.data());
++                argv.push_back(nullptr);
++
++                // The host reads PS2X_LIVE_SERIAL (its GameIndex fixes) and PS2X_LIVE_TITLE (window title).
++                setenv("PS2X_LIVE_SERIAL", serial().c_str(), 0);
++                setenv("PS2X_LIVE_TITLE", "Dragon Ball Z Budokai Tenkaichi 4", 0);
++
++                posix_spawn_file_actions_t actions;
++                posix_spawn_file_actions_init(&actions);
++                const std::string dir = std::filesystem::path(exe).parent_path().string();
++                posix_spawn_file_actions_addchdir_np(&actions, dir.c_str());
++                const int error = posix_spawn(&hostPid, exe.c_str(), &actions, nullptr, argv.data(), environ);
++                posix_spawn_file_actions_destroy(&actions);
++                if (error != 0)
++                {
++                    std::fprintf(stderr, "[gslive] cannot start GS host %s (%s)\n", exe.c_str(), std::strerror(error));
++                    hostPid = 0;
++                    return false;
++                }
++                std::fprintf(stderr, "[gslive] GS host %s pid %d, args:", exe.c_str(), (int)hostPid);
++                for (size_t i = 1; i < args.size(); ++i)
++                    std::fprintf(stderr, " %s", args[i].c_str());
++                std::fprintf(stderr, "\n");
++                return true;
++            }
++
++            bool hostGone()
++            {
++                if (header && header->consumerQuit)
++                    return true;
++                if (hostPid != 0 && !hostExited && waitpid(hostPid, &hostStatus, WNOHANG) == hostPid)
++                    hostExited = true;
++                return hostExited;
++            }
++
++            // Blocks while the ring is full (the host draws slower than the game produces).
++            bool write(const uint8_t *src, size_t size)
++            {
++                while (size != 0u)
++                {
++                    const int64_t w = header->writePos;
++                    const int64_t r = header->readPos;
++                    const uint64_t used = static_cast<uint64_t>(w - r);
++                    const uint64_t freeBytes = capacity - used;
++                    if (freeBytes == 0u)
++                    {
++                        if (hostGone())
++                            return false;
++                        ps2live::eventSet(&events->data);
++                        const auto t0 = std::chrono::steady_clock::now();
++                        header->producerWaiting = 1u;
++                        __atomic_thread_fence(__ATOMIC_SEQ_CST);
++                        if (header->readPos == r) // still full after announcing the wait
++                            ps2live::eventWait(&events->space, 20);
++                        header->producerWaiting = 0u;
++                        waitNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
++                        continue;
++                    }
++                    const uint64_t offset = static_cast<uint64_t>(w) % capacity;
++                    const size_t chunk = static_cast<size_t>(std::min<uint64_t>({size, freeBytes, capacity - offset}));
++                    std::memcpy(data + offset, src, chunk);
++                    __atomic_thread_fence(__ATOMIC_RELEASE);
++                    header->writePos = w + static_cast<int64_t>(chunk);
++                    src += chunk;
++                    size -= chunk;
++                }
++                return true;
++            }
++
++            // Only wake the host when it is actually blocked on the data event.
++            void signal()
++            {
++                __atomic_thread_fence(__ATOMIC_SEQ_CST); // writePos store before the consumerWaiting load
++                if (!header->consumerFlags || header->consumerWaiting)
++                    ps2live::eventSet(&events->data);
++            }
++        };
++#endif
++
++        struct Writer
++        {
++            std::mutex mutex;
++            FILE *file = nullptr;
++#if defined(PS2X_GS_LIVE_RING)
++            LiveRing live;
++#endif
++            bool liveActive = false;
++            bool headerWritten = false;
++            bool finished = false;
++            uint64_t bytes = 0;
++            uint64_t maxBytes = 0;
++            uint32_t frames = 0;
++            uint32_t maxFrames = 0;
++            std::vector<uint8_t> regs = std::vector<uint8_t>(kPrivRegsSize, 0u);
++            // stream-ordered display registers (flip hook / [s1fence] stamps); slot = offset >> 4
++            uint64_t streamLo[16] = {};
++            uint32_t streamHave = 0;
++            // stats
++            uint64_t statBytes = 0, statPackets = 0, statFrames = 0, lagWaitNs = 0;
++            GSRegisters *liveRegs = nullptr;
++            std::chrono::steady_clock::time_point statT0 = std::chrono::steady_clock::now();
++
++            bool enabled() const { return liveActive || file != nullptr; }
++
++            void write(const void *data, size_t size)
++            {
++                if (size == 0)
++                    return;
++#if defined(PS2X_GS_LIVE_RING)
++                if (liveActive)
++                {
++                    if (!live.write(static_cast<const uint8_t *>(data), size))
++                    {
++                        const bool exited = live.hostExited;
++                        const int status = live.hostStatus;
++                        std::fprintf(stderr, "[gslive] GS host closed (%s, %s %d), exiting\n",
++                                     exited ? "process ended" : "window closed",
++                                     exited && WIFSIGNALED(status) ? "signal" : "exit code",
++                                     !exited ? 0 : WIFSIGNALED(status) ? WTERMSIG(status) : WEXITSTATUS(status));
++                        std::fflush(stderr);
++                        std::_Exit(0);
++                    }
++                }
++#endif
++                if (file)
++                    std::fwrite(data, 1, size, file);
++                bytes += size;
++                statBytes += size;
++            }
++            void writeByte(uint8_t value) { write(&value, 1); }
++            void writeWord(uint32_t value) { write(&value, 4); }
++
++            void endPacket()
++            {
++                ++statPackets;
++#if defined(PS2X_GS_LIVE_RING)
++                if (liveActive)
++                    live.signal();
++#endif
++            }
++
++            void close()
++            {
++                if (file)
++                {
++                    std::fclose(file);
++                    file = nullptr;
++                }
++                if (!liveActive)
++                    finished = true;
++            }
++
++            // The header goes out with the first packet, carrying the privileged registers as they are at that moment.
++            // No saved GS state: the stream starts with the console's GS fresh (PCSX2's replayer accepts that).
++            void ensureHeader()
++            {
++                if (headerWritten || !enabled())
++                    return;
++                headerWritten = true;
++                const std::string ser = serial();
++                const uint32_t serialSize = static_cast<uint32_t>(ser.size());
++                writeWord(0xFFFFFFFFu);
++                writeWord(static_cast<uint32_t>(sizeof(DumpHeader)) + serialSize);
++                DumpHeader header{};
++                header.state_version = kGsStateVersion;
++                header.state_size = 0u;
++                header.serial_offset = sizeof(DumpHeader);
++                header.serial_size = serialSize;
++                header.crc = 0u;
++                header.screenshot_offset = header.serial_offset + serialSize;
++                write(&header, sizeof(header));
++                write(ser.data(), serialSize);
++                write(regs.data(), regs.size());
++            }
++
++            bool usable()
++            {
++                if (finished || !enabled())
++                    return false;
++                if (file && maxBytes != 0u && bytes >= maxBytes)
++                {
++                    std::fprintf(stderr, "[gsdump] size limit reached, closing dump\n");
++                    close();
++                    if (!enabled())
++                        return false;
++                }
++                ensureHeader();
++                return true;
++            }
++        };
++
++        Writer &writer()
++        {
++            static Writer w;
++            static const bool s_initialized = []
++            {
++                Writer &init = w;
++#if defined(PS2X_GS_LIVE_RING)
++                if (requested())
++                {
++                    if (init.live.open() && init.live.launchHost())
++                    {
++                        init.liveActive = true;
++                        std::fprintf(stderr, "[gslive] GS host started (PCSX2 renderer, serial %s)\n", serial().c_str());
++                    }
++                    else
++                        std::fprintf(stderr, "[gslive] live GS host unavailable (%s)\n", std::strerror(errno));
++                }
++#endif
++                const char *path = std::getenv("PS2X_GS_DUMP");
++                if (path && *path)
++                {
++                    init.file = std::fopen(path, "wb");
++                    if (init.file)
++                    {
++                        std::setvbuf(init.file, nullptr, _IOFBF, 8u << 20);
++                        std::fprintf(stderr, "[gsdump] writing %s\n", path);
++                    }
++                    else
++                        std::fprintf(stderr, "[gsdump] cannot open %s\n", path);
++                }
++                if (const char *frames = std::getenv("PS2X_GS_DUMP_FRAMES"))
++                    init.maxFrames = static_cast<uint32_t>(std::strtoul(frames, nullptr, 10));
++                const char *maxMb = std::getenv("PS2X_GS_DUMP_MAX_MB");
++                init.maxBytes = static_cast<uint64_t>(maxMb ? std::strtoull(maxMb, nullptr, 10) : 8192u) << 20u;
++                return true;
++            }();
++            (void)s_initialized;
++            return w;
++        }
++
++        void snapshotRegisters(Writer &w, const GSRegisters &r)
++        {
++            auto put = [&](uint32_t offset, uint64_t value) { std::memcpy(w.regs.data() + offset, &value, sizeof(value)); };
++            auto pick = [&](uint32_t off, uint64_t live) { const uint32_t slot = off >> 4; return (w.streamHave & (1u << slot)) ? w.streamLo[slot] : live; };
++            put(0x0000u, pick(0x00u, r.pmode));
++            put(0x0010u, r.smode1 ? r.smode1 : 0x0000000740814504ULL); // NTSC default when the CRTC was never programmed
++            put(0x0020u, pick(0x20u, r.smode2));
++            put(0x0030u, r.srfsh);
++            put(0x0040u, r.synch1);
++            put(0x0050u, r.synch2);
++            put(0x0060u, r.syncv);
++            put(0x0070u, pick(0x70u, r.dispfb1));
++            put(0x0080u, pick(0x80u, r.display1));
++            put(0x0090u, pick(0x90u, r.dispfb2));
++            put(0x00A0u, pick(0xA0u, r.display2));
++            put(0x00B0u, r.extbuf);
++            put(0x00C0u, r.extdata);
++            put(0x00D0u, r.extwrite);
++            put(0x00E0u, pick(0xE0u, r.bgcolor));
++            put(0x1000u, r.csr.load(std::memory_order_relaxed));
++            put(0x1010u, r.imr);
++            put(0x1040u, r.busdir);
++            put(0x1080u, r.siglblid);
++        }
++
++        void writeTransferLocked(Writer &w, int path, const uint8_t *data, uint32_t size)
++        {
++            w.writeByte(kTypeTransfer);
++            w.writeByte(path == 1 ? kPath1New : (path == 2 ? kPath2 : kPath3));
++            w.writeWord(size);
++            w.write(data, size);
++            w.endPacket();
++        }
++    }
++
++    bool requested()
++    {
++        // PS2X_GS_LIVE=1 in the environment, or exported by the settings loader for renderer = "pcsx2".
++        static const bool s_req = envOn("PS2X_GS_LIVE");
++        return s_req;
++    }
++
++    bool active()
++    {
++        static const bool s_any = requested() || [](){ const char *v = std::getenv("PS2X_GS_DUMP"); return v && v[0]; }();
++        if (!s_any)
++            return false;
++        Writer &w = writer();
++        return w.enabled() && !w.finished;
++    }
++
++    bool liveActive()
++    {
++        if (!requested())
++            return false;
++        return writer().liveActive;
++    }
++
++    bool hostMenuOpen()
++    {
++#if defined(PS2X_GS_LIVE_RING)
++        if (!requested())
++            return false;
++        Writer &w = writer();
++        return w.liveActive && w.live.header && w.live.header->hostMenuOpen != 0u;
++#else
++        return false;
++#endif
++    }
++
++    bool remotePad(uint32_t &buttons, uint32_t &axes)
++    {
++#if defined(PS2X_GS_LIVE_RING)
++        if (!requested())
++            return false;
++        Writer &w = writer();
++        if (!w.liveActive || !w.live.header)
++            return false;
++        buttons = w.live.header->padButtons;
++        axes = w.live.header->padAxes;
++        return true;
++#else
++        (void)buttons;
++        (void)axes;
++        return false;
++#endif
++    }
++
++    void transfer(int path, const uint8_t *data, uint32_t sizeBytes)
++    {
++        if (!data || sizeBytes < 16u || path < 1 || path > 3)
++            return;
++        Writer &w = writer();
++        std::lock_guard<std::mutex> lock(w.mutex);
++        if (!w.usable())
++            return;
++        writeTransferLocked(w, path, data, sizeBytes & ~15u);
++    }
++
++    void writeRegister(uint8_t reg, uint64_t value)
++    {
++        if (!active())
++            return;
++        // GIFtag: NLOOP=1, EOP=1, FLG=PACKED, NREG=1, REGS=A+D (0xE).
++        uint8_t packet[32] = {};
++        const uint64_t tagLo = 1ull | (1ull << 15) | (1ull << 60);
++        const uint64_t tagHi = 0xEull;
++        const uint64_t adHi = reg;
++        std::memcpy(packet + 0, &tagLo, 8);
++        std::memcpy(packet + 8, &tagHi, 8);
++        std::memcpy(packet + 16, &value, 8);
++        std::memcpy(packet + 24, &adHi, 8);
++        Writer &w = writer();
++        std::lock_guard<std::mutex> lock(w.mutex);
++        if (!w.usable())
++            return;
++        writeTransferLocked(w, 3, packet, sizeof(packet));
++    }
++
++    void readFifo(uint32_t qwc)
++    {
++        if (qwc == 0u || !active())
++            return;
++        Writer &w = writer();
++        std::lock_guard<std::mutex> lock(w.mutex);
++        if (!w.usable())
++            return;
++        w.writeByte(kTypeReadFifo2);
++        w.writeWord(qwc);
++        w.endPacket();
++    }
++
++    void streamFlip(uint64_t dispfb1)
++    {
++        if (!active())
++            return;
++        Writer &w = writer();
++        std::lock_guard<std::mutex> lock(w.mutex);
++        w.streamLo[7] = dispfb1;
++        w.streamHave |= 1u << 7;
++    }
++
++    void streamPriv(uint32_t regOff, uint64_t value)
++    {
++        if (!active())
++            return;
++        const uint32_t slot = regOff >> 4;
++        if (slot >= 16u)
++            return;
++        Writer &w = writer();
++        std::lock_guard<std::mutex> lock(w.mutex);
++        w.streamLo[slot] = value;
++        w.streamHave |= 1u << slot;
++    }
++
++    void vsync(const GSRegisters &regs)
++    {
++        if (!active())
++            return;
++        Writer &w = writer();
++        std::lock_guard<std::mutex> lock(w.mutex);
++        snapshotRegisters(w, regs);
++        if (!w.usable())
++            return;
++        w.writeByte(kTypeRegisters);
++        w.write(w.regs.data(), w.regs.size());
++        w.writeByte(kTypeVSync);
++        w.writeByte(static_cast<uint8_t>(w.frames & 1u));
++        w.endPacket();
++#if defined(PS2X_GS_LIVE_RING)
++        if (w.liveActive)
++        {   // bounded lag: wait until the host has read the stream up to the VSync `maxLag` frames back
++            static const uint32_t maxLag = [](){ const char *v = std::getenv("PS2X_GSLIVE_MAXLAG"); const long n = (v && v[0]) ? std::strtol(v, nullptr, 10) : 2L; return (uint32_t)(n < 0 ? 0 : n > 60 ? 60 : n); }();
++            constexpr uint32_t kHist = 64u;
++            static int64_t s_vsyncPos[kHist] = {};
++            s_vsyncPos[w.frames % kHist] = w.live.header->writePos;
++            if (maxLag != 0u && w.frames >= maxLag)
++            {
++                const int64_t target = s_vsyncPos[(w.frames - maxLag) % kHist];
++                const auto t0 = std::chrono::steady_clock::now();
++                while (w.live.header->readPos < target)
++                {
++                    if (w.live.hostGone())
++                        break;
++                    w.live.header->producerWaiting = 1u;
++                    __atomic_thread_fence(__ATOMIC_SEQ_CST);
++                    if (w.live.header->readPos < target)
++                        ps2live::eventWait(&w.live.events->space, 5);
++                    w.live.header->producerWaiting = 0u;
++                }
++                w.lagWaitNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
++            }
++        }
++#endif
++        if (w.file && w.frames % 600u == 0u)
++            std::fflush(w.file);
++        ++w.frames;
++        ++w.statFrames;
++        // PS2X_GS_DUMP_UNTIL=<file>: the dump is closed at the first frame after that file appears (test scripts cut a
++        // dump at a chosen moment; the live stream goes on).
++        static const char *s_until = std::getenv("PS2X_GS_DUMP_UNTIL");
++        if (w.file && s_until && s_until[0] && (w.frames % 15u) == 0u && std::filesystem::exists(s_until))
++        {
++            std::fprintf(stderr, "[gsdump] %s appeared: closing dump at frame %u (%.1f MB)\n", s_until, w.frames,
++                         static_cast<double>(w.bytes) / (1024.0 * 1024.0));
++            w.close();
++        }
++        if (w.file && w.maxFrames != 0u && w.frames >= w.maxFrames)
++        {
++            std::fprintf(stderr, "[gsdump] %u frames written, closing dump (%.1f MB)\n", w.frames,
++                         static_cast<double>(w.bytes) / (1024.0 * 1024.0));
++            w.close();
++        }
++        const auto now = std::chrono::steady_clock::now();
++        const double dt = std::chrono::duration<double>(now - w.statT0).count();
++        if (dt >= 5.0)
++        {
++            uint64_t waitNs = 0;
++#if defined(PS2X_GS_LIVE_RING)
++            waitNs = w.live.waitNs;
++            w.live.waitNs = 0;
++#endif
++            std::fprintf(stderr, "[gslive] %.1f frames/s, %.0f packets/s, %.1f MB/s, waited for the host %.1f ms/s (ring full %.1f)\n",
++                         w.statFrames / dt, w.statPackets / dt, w.statBytes / dt / (1024.0 * 1024.0), (waitNs + w.lagWaitNs) / 1e6 / dt, waitNs / 1e6 / dt);
++            w.lagWaitNs = 0;
++            w.statFrames = w.statPackets = w.statBytes = 0;
++            w.statT0 = now;
++        }
++    }
++
++    void setRegs(GSRegisters *regs)
++    {
++        if (!active())
++            return;
++        Writer &w = writer();
++        std::lock_guard<std::mutex> lock(w.mutex);
++        w.liveRegs = regs;
++    }
++
++    void onSwap()
++    {
++        if (!active())
++            return;
++        GSRegisters *regs = nullptr;
++        {
++            Writer &w = writer();
++            std::lock_guard<std::mutex> lock(w.mutex);
++            regs = w.liveRegs;
++        }
++        if (regs)
++            vsync(*regs);
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ps2_live_ring.h b/ps2xRuntime/src/lib/ps2_live_ring.h
+new file mode 100644
+index 0000000..7532552
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_live_ring.h
+@@ -0,0 +1,121 @@
++#pragma once
++
++// Shared-memory ring between the PS2Recomp runtime (producer) and the PCSX2-based GS host
++// (consumer, "pcsx2-gsrunner -live"). The byte stream is exactly a PCSX2 GS dump (.gs): the
++// file header, then Transfer / Registers / VSync / ReadFIFO2 packets. The consumer also
++// publishes the host window's keyboard state back, since that window has the focus.
++// Keep this file identical in both source trees.
++
++#include <cstdint>
++#include <string>
++
++#if defined(__APPLE__)
++#include <os/os_sync_wait_on_address.h>
++#elif defined(__linux__)
++#include <climits>
++#include <ctime>
++#include <linux/futex.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++#endif
++
++namespace ps2live
++{
++    constexpr uint32_t kMagic = 0x50324C52u; // "RL2P"
++    constexpr uint32_t kVersion = 1u;
++    constexpr uint64_t kDefaultCapacity = 256ull << 20;
++
++    constexpr const wchar_t *kMappingName = L"Local\\PS2RecompGsLiveRing";
++    constexpr const wchar_t *kDataEventName = L"Local\\PS2RecompGsLiveData";
++    constexpr const wchar_t *kSpaceEventName = L"Local\\PS2RecompGsLiveSpace";
++
++    // Pad buttons, active high, in the libpad bit order (bit 0 = SELECT ... bit 15 = SQUARE).
++    struct alignas(64) RingHeader
++    {
++        uint32_t magic;
++        uint32_t version;
++        uint64_t capacity; // bytes of the data area after the header
++        volatile int64_t writePos; // monotonic byte counters
++        alignas(64) volatile int64_t readPos;
++        alignas(64) volatile uint32_t producerAlive;
++        volatile uint32_t consumerAlive;
++        volatile uint32_t consumerQuit; // window closed: the game should exit
++        volatile uint32_t padButtons;
++        volatile uint32_t padAxes; // lx | ly << 8 | rx << 16 | ry << 24 (0x80 = centre)
++        volatile uint32_t padSequence;
++        volatile uint32_t hostMenuOpen; // the host's options menu is open: the game gets no pad input
++        // Wake-ups only when needed: each side sets its *Flags to 1 at start (it understands the
++        // *Waiting fields) and raises *Waiting while blocked on its event. The other side then
++        // signals only if that side is waiting (or is an older build with no flags).
++        volatile uint32_t consumerFlags;
++        volatile uint32_t consumerWaiting; // host blocked on the data event
++        volatile uint32_t producerFlags;
++        volatile uint32_t producerWaiting; // game blocked on the space event (ring full)
++    };
++
++    // Object names for one game instance: base name + "_" + suffix (the game's process id, passed
++    // to the host as "-livering <suffix>"), so several instances never share a ring.
++    inline std::wstring objectName(const wchar_t *base, const std::wstring &suffix)
++    {
++        return suffix.empty() ? std::wstring(base) : std::wstring(base) + L"_" + suffix;
++    }
++
++    inline uint8_t *ringData(RingHeader *header)
++    {
++        return reinterpret_cast<uint8_t *>(header) + sizeof(RingHeader);
++    }
++
++#if !defined(_WIN32)
++    // POSIX: the ring is a shm_open object and the two Windows auto-reset events are words in
++    // the same mapping, after the data area (macOS: os_sync_wait_on_address, Linux: futex).
++    // macOS limits shm names to 31 characters, so the base name is short.
++    constexpr const char *kPosixMappingName = "/ps2lr";
++
++    struct alignas(64) RingEvents
++    {
++        alignas(64) uint32_t data;  // set by the producer: new bytes in the ring
++        alignas(64) uint32_t space; // set by the consumer: ring space freed
++    };
++
++    inline std::string objectName(const char *base, const std::string &suffix)
++    {
++        return suffix.empty() ? std::string(base) : std::string(base) + "_" + suffix;
++    }
++
++    inline uint64_t mappingSize(uint64_t capacity)
++    {
++        return sizeof(RingHeader) + capacity + sizeof(RingEvents);
++    }
++
++    inline RingEvents *ringEvents(RingHeader *header)
++    {
++        return reinterpret_cast<RingEvents *>(ringData(header) + header->capacity);
++    }
++
++    // SetEvent on an auto-reset event.
++    inline void eventSet(uint32_t *word)
++    {
++        __atomic_store_n(word, 1u, __ATOMIC_SEQ_CST);
++#if defined(__APPLE__)
++        os_sync_wake_by_address_any(word, sizeof(*word), OS_SYNC_WAKE_BY_ADDRESS_SHARED);
++#elif defined(__linux__)
++        syscall(SYS_futex, word, FUTEX_WAKE, 1, nullptr, nullptr, 0);
++#endif
++    }
++
++    // WaitForSingleObject(event, timeoutMs) on an auto-reset event: true if it was signalled.
++    inline bool eventWait(uint32_t *word, uint32_t timeoutMs)
++    {
++        if (__atomic_exchange_n(word, 0u, __ATOMIC_ACQ_REL) != 0u)
++            return true;
++#if defined(__APPLE__)
++        os_sync_wait_on_address_with_timeout(word, 0u, sizeof(*word), OS_SYNC_WAIT_ON_ADDRESS_SHARED,
++                                             OS_CLOCK_MACH_ABSOLUTE_TIME, static_cast<uint64_t>(timeoutMs) * 1000000ull);
++#elif defined(__linux__)
++        const timespec timeout{static_cast<time_t>(timeoutMs / 1000u), static_cast<long>(timeoutMs % 1000u) * 1000000l};
++        syscall(SYS_futex, word, FUTEX_WAIT, 0, &timeout, nullptr, 0);
++#endif
++        return __atomic_exchange_n(word, 0u, __ATOMIC_ACQ_REL) != 0u;
++    }
++#endif
++}
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index d6c2174..132e704 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -579,6 +579,19 @@ int main(int argc, char *argv[])
+     // setenv(..., 0) never overwrites, so every PS2X_* override still works exactly
+     // as before (including =0 to disable a single flag).
+     // PS2X_NODEFAULTS=1 skips the whole block (bare engine, for debugging).
++    {   // [gslive] PS2X_GS_LIVE=1: PCSX2's GS (the pcsx2-gsrunner host window) renders. Our GS parse runs state-only
++        // and the other backends stay off, whatever settings.toml selects; this must precede the settings export.
++        const char *live = std::getenv("PS2X_GS_LIVE");
++        if (live && live[0] && live[0] != '0')
++        {
++            setenv("PS2X_PGS", "0", 1);
++            setenv("PS2X_SEAMVK", "0", 1);
++            setenv("PS2X_GS_NODRAW", "1", 0);
++            setenv("PS2X_ALTGL", "1", 0);
++            setenv("PS2X_LIVE_SERIAL", "SLUS-21978", 0);
++            std::fprintf(stderr, "[gslive] PS2X_GS_LIVE=1: renderer = PCSX2 GS host (local GS parse state-only)\n");
++        }
++    }
+     if (!std::getenv("PS2X_NODEFAULTS"))
+     {
+         // Track which vars WE defaulted (vs user-set): consumers that must respect an
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 8cc79f0..a3647be 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1,3 +1,4 @@
++#include "runtime/ps2_gs_live.h"   // [gslive]
+ #include "ps2_waitprof.h"   // [waitprof]
+ #include "runtime/ps2_guestprof.h"
+ #include "runtime/ps2_fiber.h"   // [fibers]
+@@ -1564,6 +1565,7 @@ bool PS2Runtime::initialize(const char *title)
+             if (winMode < 0) winMode = 0;
+             if (winMode > 2) winMode = 2;
+             if (winMonitor < 0) winMonitor = 0;
++            if (ps2_gslive::requested()) { winMode = 0; hostWinW = 640; hostWinH = 480; }   // [gslive] the PCSX2 host window shows the game; ours is hidden below
+             g_ps2xWinModeReq = winMode;
+             g_ps2xMonitorReq = winMonitor;
+             g_ps2xWinWReq = hostWinW; g_ps2xWinHReq = hostWinH;
+@@ -1579,6 +1581,12 @@ bool PS2Runtime::initialize(const char *title)
+         _mark("sdl hints");
+         bt3InitWindow(hostWinW, hostWinH, title);
+         _mark("init window");
++        if (ps2_gslive::requested())
++        {   // [gslive] PCSX2's GS host draws the game in its own window (it also takes the keyboard and the gamepad): this
++            // window only keeps the GL context, audio and pad polling alive, so it stays hidden. Start the host now.
++            bt3SetWindowState(FLAG_WINDOW_HIDDEN);
++            std::fprintf(stderr, "[gslive] runtime window hidden, PCSX2 GS host %s\n", ps2_gslive::liveActive() ? "running" : "NOT available");
++        }
+         {   // [winlog] what we asked for vs what the framework reports vs the REAL client area. The SDL
+             // platform sizes the window differently than GLFW did: on a DPI-scaled display the logical
+             // and physical sizes disagree, and the picture only lines up after a resize event.
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 52bdce5..bf7a3c5 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -3,6 +3,7 @@
+ #include "runtime/ps2_memory.h"
+ #include "runtime/ps2_statesync.h"   // [statesync]
+ #include "runtime/ps2_gs_pgs.h"   // [pgs]
++#include "runtime/ps2_gs_live.h"   // [gslive]
+ #include "runtime/ps2_seamvk.h"   // [standalone] the native renderer's display block
+ #if !defined(_WIN32)
+ #include <pthread.h>
+@@ -435,6 +436,7 @@ bool PS2Memory::initialize(size_t ramSize)
+         gs_regs.synch2 = 0x000000000033a4d8ULL;
+         gs_regs.syncv  = 0x00c7800601a01801ULL;
+         ps2x_pgs::setRegs(&gs_regs);   // [pgs] the backend reads this block at every swap
++        ps2_gslive::setRegs(&gs_regs); // [gslive] and the PCSX2 stream's per-frame snapshot
+         seamvk::setLiveRegs(&gs_regs);   // [standalone] so does the native renderer
+ 
+         // Allocate GS VRAM (4MB)
+@@ -1080,7 +1082,7 @@ static void ps2xPrivInStream(PS2Memory *mem, uint32_t regOff, uint64_t value)
+     if (!PS2Memory::stage1FenceEnabled()) return;
+     if (regOff != 0x00u && regOff != 0x20u && regOff != 0x70u && regOff != 0x80u && regOff != 0x90u && regOff != 0xA0u && regOff != 0xE0u) return;
+     PS2Memory::KickJob j; j.kind = PS2Memory::KickJob::GsApply;
+-    j.fn = [regOff, value]() { ps2x_pgs::streamPriv(regOff, value); seamvk::streamPriv(regOff, value); };
++    j.fn = [regOff, value]() { ps2x_pgs::streamPriv(regOff, value); seamvk::streamPriv(regOff, value); ps2_gslive::streamPriv(regOff, value); };
+     mem->enqueueKickJob(std::move(j));
+ }
+ 
+@@ -2507,7 +2509,7 @@ bool PS2Memory::stage1FenceEnabled()
+     // kick_drain 208 -> 1.5 ms/s, display registers identical, user saw nothing broken (fence1.txt). PS2X_S1FENCE=0 restores
+     // the full drain.
+     static const bool s_on = [](){ const char *v = std::getenv("PS2X_S1FENCE"); const bool want = !(v && v[0] == '0');
+-                                   const bool on = want && vu1PipeEnabled() && (ps2x_pgs::enabled() || seamvk::on());   // [standalone] any Vulkan backend
++                                   const bool on = want && vu1PipeEnabled() && (ps2x_pgs::enabled() || seamvk::on() || ps2_gslive::requested());   // [standalone] any Vulkan backend; [gslive] PCSX2's GS
+                                    std::fprintf(stderr, on   ? "[s1fence] stage-1 SyncPath fence ON: guest GIF + display regs in stream order, presenter on the stream block (PS2X_S1FENCE=0 restores the full drain)\n"
+                                                         : want ? "[s1fence] OFF: needs [vu1pipe] + paraLLEl-GS (full drain)\n"
+                                                                : "[s1fence] OFF (PS2X_S1FENCE=0): full two-stage drain at sceGsSyncPath\n");
+diff --git a/ps2xRuntime/src/lib/ps2_gif_arbiter.cpp b/ps2xRuntime/src/lib/ps2_gif_arbiter.cpp
+index 4dddd8a..2b05c8d 100644
+--- a/ps2xRuntime/src/lib/ps2_gif_arbiter.cpp
++++ b/ps2xRuntime/src/lib/ps2_gif_arbiter.cpp
+@@ -2,6 +2,7 @@
+ #include "runtime/ps2_seamprobe.h"   // [pktoracle]
+ #include "runtime/ps2_seamvk.h"   // [seamvk]
+ #include "runtime/ps2_gs_pgs.h"
++#include "runtime/ps2_gs_live.h"   // [gslive]
+ #include "runtime/ps2_wshud.h"   // [wshud] the HUD packet walker (shared, backend-neutral)   // [pgs]
+ #include <cstdlib>
+ extern "C" void ps2xGsRecordPacket(uint8_t path, const uint8_t *data, uint32_t sizeBytes);   // [recpgs] ps2_gs_gpu.cpp
+@@ -329,6 +330,10 @@ namespace
+ void GifArbiter::process(const GifArbiterPacket &pkt)
+ {
+     if (!m_processFn || !pkt.data || pkt.size == 0u) return;
++    // [gslive] PCSX2's GS gets the game's packet exactly as the GIF delivered it, in stream order, before any rewrite
++    // below (native post steps, HUD squeeze, ink edits) -- those only make sense for our own renderers.
++    if (pkt.pathId != GifPathId::HostDraw && ps2_gslive::active())
++        ps2_gslive::transfer(static_cast<int>(pkt.pathId), pkt.data, pkt.size);
+     if (!g_pktOracles.empty() && pkt.pathId == GifPathId::Path2)
+         for (PktOracle &o : g_pktOracles)
+         {   // (before the native intercept: a natively replaced step is bracketed the same way, so its output is verified)
+diff --git a/ps2xRuntime/src/lib/ps2_gs_gpu.cpp b/ps2xRuntime/src/lib/ps2_gs_gpu.cpp
+index 2f07426..de525cb 100644
+--- a/ps2xRuntime/src/lib/ps2_gs_gpu.cpp
++++ b/ps2xRuntime/src/lib/ps2_gs_gpu.cpp
+@@ -2,6 +2,7 @@
+ #include "runtime/ps2_guestprof.h"
+ #include "runtime/ps2_gs_gpu.h"
+ #include "runtime/ps2_gs_pgs.h"   // [pgs]
++#include "runtime/ps2_gs_live.h"   // [gslive]
+ #include "runtime/ps2_seamvk.h"   // [standalone]
+ #include "runtime/ps2_gs_common.h"
+ #include "runtime/ps2_gs_psmct16.h"
+@@ -5492,6 +5493,7 @@ std::atomic<unsigned long> g_ps2xDispFlipHookCalls{0}, g_ps2xDispPrivCalls{0};
+ extern "C" void ps2xGsDisplayFlipHook(unsigned long long dispfb)
+ {
+     ps2x_pgs::streamFlip((uint64_t)dispfb);   // [pgs] stream-ordered flip for the backend's scanout
++    ps2_gslive::streamFlip((uint64_t)dispfb); // [gslive] and for PCSX2's
+     seamvk::streamFlip((uint64_t)dispfb);     // [standalone] and for the native renderer's
+     g_ps2xDispFlipHookCalls.fetch_add(1u, std::memory_order_relaxed);
+     if (GsGpuRenderer::enabled())
+diff --git a/ps2xRuntime/src/lib/ps2_gs_gpu_renderer.cpp b/ps2xRuntime/src/lib/ps2_gs_gpu_renderer.cpp
+index 465bf16..3e65273 100644
+--- a/ps2xRuntime/src/lib/ps2_gs_gpu_renderer.cpp
++++ b/ps2xRuntime/src/lib/ps2_gs_gpu_renderer.cpp
+@@ -9,6 +9,7 @@
+ 
+ #include "runtime/ps2_gs_gpu_renderer.h"
+ #include "runtime/ps2_gs_pgs.h"   // [pgs]
++#include "runtime/ps2_gs_live.h"   // [gslive]
+ #include "runtime/ps2_seamvk.h"   // [standalone] seamvk::onSwap
+ #include "runtime/ps2x_perf_status.h"   // [perf] the shared fps / frame-time / GPU-busy readout
+ #include "runtime/ps2x_dueldump.h"   // [dueldump] texture-sample capture (PS2X_DUELDUMP=1)
+@@ -7092,6 +7093,7 @@ void GsGpuRenderer::swapFrame()
+         static const bool s_ref = [](){ const char *v = std::getenv("PS2X_SEAMVK_REF"); return v && v[0] && v[0] != '0'; }();
+         if (seamvk::on() && !s_ref) seamvk::onSwap();
+         else ps2x_pgs::onSwap();   // [pgs] flush + scanout + readback of the paraLLEl-GS frame (no-op when off)
++        ps2_gslive::onSwap();      // [gslive] PCSX2's GS: register snapshot + VSync, in stream order (no-op when off)
+     }
+     flushStage();   // [recstage]
+     g_gsGuestSwapCount.fetch_add(1, std::memory_order_relaxed);
+diff --git a/ps2xRuntime/src/lib/pad_config.cpp b/ps2xRuntime/src/lib/pad_config.cpp
+index 2058e69..65db527 100644
+--- a/ps2xRuntime/src/lib/pad_config.cpp
++++ b/ps2xRuntime/src/lib/pad_config.cpp
+@@ -1,3 +1,4 @@
++#include "runtime/ps2_gs_live.h"   // [gslive]
+ #include "runtime/pad_config.h"
+ #include "runtime/ps2_host_pad.h"
+ #include "ps2_host_backend.h"   // raylib: keyboard (IsKeyDown), IsWindowReady, the KEY_*/GAMEPAD_* enums
+@@ -615,9 +616,39 @@ namespace ps2_stubs
+         return gamepadSlotToIndex(glfwSlot);
+     }
+ 
++    // [gslive] With PCSX2's GS host drawing the game, its window has the focus: player 1 also gets that window's
++    // keyboard + gamepad (published in the live ring), merged with whatever the runtime itself reads. While the host's
++    // options menu (F1) is open the game gets no input at all.
++    static void mergeLivePad(PadPacket &pkt, size_t player)
++    {
++        if (player != 0u || !ps2_gslive::liveActive())
++            return;
++        if (ps2_gslive::hostMenuOpen())
++        {
++            pkt = PadPacket{};
++            return;
++        }
++        uint32_t buttons = 0, axes = 0x80808080u;
++        if (!ps2_gslive::remotePad(buttons, axes))
++            return;
++        {   // PS2X_GSLIVE_PADLOG=1: every change of the host window's pad state
++            static const bool s_log = [](){ const char *v = std::getenv("PS2X_GSLIVE_PADLOG"); return v && v[0] == '1'; }();
++            static uint32_t s_last = 0;
++            if (s_log && buttons != s_last) { std::fprintf(stderr, "[gslive] host pad %04x axes %08x\n", buttons, axes); s_last = buttons; }
++        }
++        pkt.buttons = static_cast<uint16_t>(pkt.buttons & ~(buttons & 0xFFFFu));   // active-high -> active-low
++        auto axis = [](uint8_t &dst, uint32_t v) { if (v < 0x60u || v > 0xA0u) dst = static_cast<uint8_t>(v); };
++        axis(pkt.lx, axes & 0xFFu);
++        axis(pkt.ly, (axes >> 8) & 0xFFu);
++        axis(pkt.rx, (axes >> 16) & 0xFFu);
++        axis(pkt.ry, (axes >> 24) & 0xFFu);
++    }
++
+     PadPacket padPollPlayer(size_t player)
+     {
+-        return PadConfig::instance().poll(player);
++        PadPacket pkt = PadConfig::instance().poll(player);
++        mergeLivePad(pkt, player);
++        return pkt;
+     }
+ 
+     void padRumblePlayer(int player, uint16_t low, uint16_t high, uint32_t ms)
+@@ -638,7 +669,8 @@ namespace ps2_stubs
+ 
+     uint16_t ps2xLivePadButtons(int player, uint8_t &lx, uint8_t &ly, uint8_t &rx, uint8_t &ry)
+     {
+-        const PadPacket pkt = PadConfig::instance().poll(static_cast<size_t>(player));
++        PadPacket pkt = PadConfig::instance().poll(static_cast<size_t>(player));
++        mergeLivePad(pkt, static_cast<size_t>(player));
+         lx = pkt.lx;
+         ly = pkt.ly;
+         rx = pkt.rx;
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+index 85b0320..fc0e5a0 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+@@ -5,6 +5,7 @@
+ #include <cstddef>
+ #include "Common.h"
+ #include "GS.h"
++#include "runtime/ps2_gs_live.h"   // [gslive]
+ #include "ps2_log.h"
+ #include "runtime/ps2_gs_common.h"
+ #include "runtime/ps2_gs_psmct16.h"
+@@ -137,6 +138,11 @@ namespace ps2_stubs
+                 runtime->gs().writeRegister(static_cast<uint8_t>(c.xyz2a.reg & 0xFFu), c.xyz2a.value);
+                 runtime->gs().writeRegister(static_cast<uint8_t>(c.xyz2b.reg & 0xFFu), c.xyz2b.value);
+                 runtime->gs().writeRegister(static_cast<uint8_t>(c.testb.reg & 0xFFu), c.testb.value);
++                if (ps2_gslive::active())
++                {   // [gslive] the HLE'd clear never travels the GIF: send the same registers to PCSX2's GS
++                    for (const auto *r : {&c.testa, &c.prim, &c.rgbaq, &c.xyz2a, &c.xyz2b, &c.testb})
++                        ps2_gslive::writeRegister(static_cast<uint8_t>(r->reg & 0xFFu), r->value);
++                }
+             });
+         }
+ 
+@@ -922,6 +928,7 @@ namespace ps2_stubs
+         // then re-uploads that garbage later -> persistent VRAM texture corruption).
+         fenceAsyncKickForGsAccess(runtime, WP_FENCE_STOREIMG);
+         runtime->gs().consumeLocalToHostBytes(dst, totalImageBytes);
++        ps2_gslive::readFifo(totalImageBytes / 16u);   // [gslive] PCSX2's GS finishes the same local->host transfer
+         ps2TraceGuestRangeWrite(rdram, dstAddr, totalImageBytes, "storeimg", nullptr);
+         {   // [storeimg] every VRAM->RAM download: the un-hooked guest-RAM writer class (found 2026-09-01)
+             static const bool s_si = [](){ const char *v = std::getenv("PS2X_STOREIMG"); return v && v[0] && v[0] != '0'; }();
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+index 40bc60a..ded5faa 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+@@ -1,5 +1,6 @@
+ #include "ps2_waitprof.h"   // [waitprof]
+ #include "runtime/ps2_gs_pgs.h"   // [s1fence] streamPriv
++#include "runtime/ps2_gs_live.h"   // [gslive]
+ #include <algorithm>
+ #include <vector>
+ #include <functional>
+@@ -2339,6 +2340,9 @@ namespace
+                 ps2x_pgs::streamPriv(0x70u, e.dispfb);  ps2x_pgs::streamPriv(0x80u, e.display);
+                 ps2x_pgs::streamPriv(0x90u, e.dispfb);  ps2x_pgs::streamPriv(0xA0u, e.display);
+                 ps2x_pgs::streamPriv(0xE0u, e.bgcolor);
++                for (const auto &rv : {std::pair<uint32_t, uint64_t>{0x00u, e.pmode}, {0x20u, e.smode2}, {0x70u, e.dispfb}, {0x80u, e.display},
++                                       {0x90u, e.dispfb}, {0xA0u, e.display}, {0xE0u, e.bgcolor}})
++                    ps2_gslive::streamPriv(rv.first, rv.second);   // [gslive]
+                 ps2xGsDisplayFlipHook(e.dispfb);   // [displatch]
+             };
+             runtime->memory().enqueueKickJob(std::move(j));
+@@ -2413,7 +2417,10 @@ namespace
+         applyGsOnStream(runtime, [runtime, copy = std::move(copy)]()
+         {
+             for (const GsRegPairMem &p : copy)
++            {
+                 runtime->gs().writeRegister(static_cast<uint8_t>(p.reg & 0xFFu), p.value);
++                ps2_gslive::writeRegister(static_cast<uint8_t>(p.reg & 0xFFu), p.value);   // [gslive] (no-op when off)
++            }
+         });
+     }
+ 

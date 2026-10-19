@@ -3,7 +3,7 @@
 Static recompilation of *Dragon Ball Z: Budokai Tenkaichi 4* (the Team BT4 fan mod of BT3, disc `SLUS-219.78`,
 "Beta 14 Rev2") with [PS2Recomp](https://github.com/ran-j/PS2Recomp). It runs on two targets:
 
-- **Native macOS (recommended, playable)**: [z3xox/BT3-Recomp](https://github.com/z3xox/BT3-Recomp) adapted to the mod. The game is drawn by paraLLEl-GS (Vulkan) on Metal through MoltenVK, with 2x supersampling, at 30 fps in fights. Sound is correct. See `native/` and `patches/bt3recomp-bt4mod.patch`.
+- **Native macOS (recommended, playable)**: [z3xox/BT3-Recomp](https://github.com/z3xox/BT3-Recomp) adapted to the mod. By default the game is drawn by PCSX2's GS (`pcsx2-gsrunner`, Metal hardware renderer, 6x upscaling, Team BT4 hardware fixes) in its own window, at 30 fps in fights. The older route, paraLLEl-GS on MoltenVK with 2x supersampling, is still available (`DBZ_RENDERER=pgs`). Sound is correct. See `native/`, `patches/bt3recomp-bt4mod.patch` and `patches/bt3recomp-bt4mod-pcsx2gs.patch`.
 - Native macOS, our own recompilation with PCSX2's GS (`pcsx2-gsrunner`): experimental.
 - **Browser** (WebAssembly): the web runtime from [street-recomp-v3](https://github.com/recomp-code/street-recomp-v3) with Play!'s GS on WebGL2.
 
@@ -44,6 +44,22 @@ What the patch does:
 - **Apple Silicon fixes:** sse2neon guards; ucontext `fpregs`, `link.h` and `dl_iterate_phdr` guarded to Linux; ImGui 1.93 tab color names; no-op seam markers when the native Vulkan seam renderer is off.
 - **MoltenVK:** `PS2X_PGS_SSAA` overrides the render-scale-derived supersampling. 4x/8x drop fights to about 20 fps on an M2 Pro; 2x holds 30 fps.
 
+### PCSX2 GS renderer (default)
+
+`patches/bt3recomp-bt4mod-pcsx2gs.patch` (on top of the mod patch) adds a live GS stream to the runtime: with `PS2X_GS_LIVE=1`, every GIF packet (PATH1/2/3, exactly as the game sent it, before any of BT3-Recomp's renderer rewrites), the registers the libgs stubs write directly, local-to-host reads, and one register snapshot + VSync per published frame go over a shared-memory ring to `pcsx2-gsrunner -live` (the host from the NBA Street V3 port, `patches/pcsx2-gsrunner-live-dbz.patch`). The runtime's own GS parse runs state-only (`PS2X_GS_NODRAW`), paraLLEl-GS is off, and its window stays hidden. Keyboard and gamepad come from the PCSX2 window.
+
+```sh
+cmake -S . -B build-live -G Ninja -DCMAKE_BUILD_TYPE=Release -DPS2X_DISABLE_PGS=OFF && cmake --build build-live --target ps2EntryRunner
+mkdir -p build-live/ps2xRuntime/savedata && cp ../dbz-bt4-recomp/native/settings-live.toml build-live/ps2xRuntime/savedata/settings.toml
+# PCSX2 (the NBA port's tree) + patches/pcsx2-gsrunner-live-dbz.patch: cmake --build build-mac --target pcsx2-gsrunner,
+# then copy pcsx2-gsrunner, its resources/ (with Team BT4's GameIndex.yaml) and gshost/dbz.ini into ~/NBAStreetRecomp/gshost-dbz
+../dbz-bt4-recomp/native/jugar_dbz.sh            # DBZ_WINDOW=1 windowed, DBZ_RENDERER=pgs for paraLLEl-GS
+```
+
+`gshost/dbz.ini`: 6x internal resolution, bilinear (PS2) filtering, 16x anisotropic, no FXAA/CAS, merge post-processing sprites, CPU CLUT render (the GameIndex fix for SLUS-21978) and texture offsets 500/500. That offset value was measured on this PCSX2 build: Team BT4's 4K values (425/410) leave a doubled cel outline on horizontal edges. On an M2 Pro, fights run at 30 fps with the GPU at 21-25 ms per frame, fullscreen at 3456x1944. F1 in the PCSX2 window opens its options menu. Changes are saved back to `dbz.ini`, and keys the menu does not show are kept.
+
+Test helpers (`native/`): `lrun.sh` (run live), `lshot.sh` (the host saves its own frame), `lqshot.sh` (story-fight shots + fps), `ldump.sh`/`lreplay.sh`/`lcrop.py` (record the live stream as a `.gs` dump, then replay one identical frame with several `.ini` variants to compare settings).
+
 ## Layout
 
 | Path | What |
@@ -52,7 +68,9 @@ What the patch does:
 | `overrides/dbz_bt3_overrides.cpp` | Game-specific runtime code: libpad2, `sceCdSearchFile`, heap fixes, diagnostics. |
 | `patches/ps2recomp-dbz.patch` | Engine changes on top of street-recomp-v3's patched PS2Recomp. These are generic fixes to be upstreamed there: VU0 macro LQI/SQI/LQD/SQD and VR* random-number ops, `ChangeThreadPriority`, IOP heap/sysmem alignment, SIF, and web options. |
 | `patches/play-dbz.patch` | Play! GS (WebGL2) changes: exact framebuffers sampled on the GPU, a depth-mask pass, and write-back skipping. |
-| `patches/pcsx2-live-serial.patch` | `pcsx2-gsrunner` live mode takes the game serial from `PS2X_LIVE_SERIAL`, so PCSX2's per-game GS fixes apply. |
+| `patches/pcsx2-live-serial.patch` | `pcsx2-gsrunner` live mode takes the game serial from `PS2X_LIVE_SERIAL`, so PCSX2's per-game GS fixes apply (superseded by `pcsx2-gsrunner-live-dbz.patch`, which includes it). |
+| `patches/pcsx2-gsrunner-live-dbz.patch` | The serial change, plus: window title from `PS2X_LIVE_TITLE`, on-demand host screenshots (`PS2X_SHOT_DIR/host.req`), the options menu keeps unmanaged `.ini` keys, game flips counted as PCSX2 internal FPS, GPU time in the `PS2X_FPS_LOG` line, `PS2X_DUMP_FRAMES` for `-dumpdir`. |
+| `patches/bt3recomp-bt4mod-pcsx2gs.patch` | BT3-Recomp runtime: the live GS stream to `pcsx2-gsrunner` (`PS2X_GS_LIVE=1`), `.gs` dumps (`PS2X_GS_DUMP`). |
 | `gshost/dbz.ini` | PCSX2 GS settings, based on the Team BT4 1080p profile: 3x, merge PP sprites, TC offsets, 16:9. The `GameIndex.yaml` with the SLUS-21978 fixes comes from the Team BT4 PCSX2 extras. |
 | `tools/` | Map and recompile helpers (`mkcombined.py`, `fixcsv.py`, `gaps.py`, `recomp.sh`, `build.sh`), `play_native.sh`, analysis tools (`adxdec.py`, `gstrace.py`, `mdis.py`, `xref.py`), headless tests (`tools/test`), and the local web server and diagnostics receiver (`tools/web`). |
 

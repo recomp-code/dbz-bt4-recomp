@@ -1,0 +1,236 @@
+diff --git a/pcsx2-gsrunner/Main.cpp b/pcsx2-gsrunner/Main.cpp
+index 00647296f..7fc08d14d 100644
+--- a/pcsx2-gsrunner/Main.cpp
++++ b/pcsx2-gsrunner/Main.cpp
+@@ -287,7 +287,19 @@ void Host::ReleaseRenderWindow()
+ 
+ void Host::BeginPresentFrame()
+ {
+-	if (s_loop_number == 0 && !s_output_prefix.empty())
++	// PS2X_DUMP_FRAMES=<first>-<last>: with -dumpdir, only save those frames (comparing settings on a long dump).
++	static const std::pair<u64, u64> s_frame_range = [] {
++		std::pair<u64, u64> r{0, ~0ull};
++		if (const char* v = std::getenv("PS2X_DUMP_FRAMES"))
++		{
++			unsigned long long a = 0, b = 0;
++			if (std::sscanf(v, "%llu-%llu", &a, &b) == 2)
++				r = {a, b};
++		}
++		return r;
++	}();
++	if (s_loop_number == 0 && !s_output_prefix.empty() &&
++		static_cast<u64>(s_dump_frame_number) >= s_frame_range.first && static_cast<u64>(s_dump_frame_number) <= s_frame_range.second)
+ 	{
+ 		// when we wrap around, don't race other files
+ 		GSJoinSnapshotThreads();
+@@ -1107,6 +1119,43 @@ static void LiveMenuPollGamepad();
+ // PS2X_SHOT_TIMES="98,104.5,110" (seconds since the host started) + PS2X_SHOT_DIR=<dir>: the host
+ // saves its own rendered frame as <dir>\shot_<n>.png at those times. Used by automated tests
+ // instead of desktop captures (no window focus, nothing else on screen gets captured).
++// Live window title: PS2X_LIVE_TITLE (set by the game runtime), default NBA Street V3.
++static std::string LiveWindowTitle()
++{
++	const char* title = std::getenv("PS2X_LIVE_TITLE");
++	return (title && *title) ? std::string(title) : std::string("NBA Street V3");
++}
++
++// PS2X_SHOT_DIR=<dir>: writing a file name (e.g. "live_a.png") into <dir>/host.req makes the host save its own
++// rendered frame as <dir>/<name> (the request file is removed). On-demand screenshots for test scripts, without
++// desktop captures.
++static void LiveRequestedSnapshot()
++{
++	static const std::string dir = [] {
++		const char* value = std::getenv("PS2X_SHOT_DIR");
++		return std::string(value && *value ? value : "");
++	}();
++	if (dir.empty())
++		return;
++	static u32 s_poll = 0;
++	if ((s_poll++ % 8u) != 0u) // a stat() every 8 vsyncs is plenty
++		return;
++	const std::string req = Path::Combine(dir, "host.req");
++	std::FILE* fp = std::fopen(req.c_str(), "rb");
++	if (!fp)
++		return;
++	char name[256] = {};
++	const size_t n = std::fread(name, 1, sizeof(name) - 1, fp);
++	std::fclose(fp);
++	std::remove(req.c_str());
++	std::string file(name, n);
++	while (!file.empty() && (file.back() == '\n' || file.back() == '\r' || file.back() == ' '))
++		file.pop_back();
++	if (file.empty() || file.find('/') != std::string::npos)
++		file = "host_shot.png";
++	GSQueueSnapshot(Path::Combine(dir, file));
++}
++
+ static void LiveTimedSnapshots()
+ {
+ 	// PS2X_TEST_T0 (Unix ms) shares the time base with the game's PS2X_PAD_SCRIPT.
+@@ -1145,6 +1194,7 @@ void Host::PumpMessagesOnCPUThread()
+ 	{
+ 		LiveMenuPollGamepad();
+ 		LiveTimedSnapshots();
++		LiveRequestedSnapshot();
+ 	}
+ #endif
+ 	// update GS thread copy of frame number
+@@ -1406,9 +1456,44 @@ static void LiveMenuPublish()
+ 
+ static void LiveMenuSave()
+ {
++	// Lines of the current file whose keys the menu does not write (per-game hacks: UserHacks_*, pcrtc_*, VsyncEnable...)
++	// are kept, so changing an option never drops them. The first comment line is kept as the file's title.
++	static constexpr const char* kManaged[] = {"Renderer", "upscale_multiplier", "MaxAnisotropy", "filter", "fxaa", "CASMode",
++		"CASSharpness", "NbaUpscaler", "NbaUpscalerSharpness", "ScreenshotSize", "AspectRatio", "OsdShowFPS",
++		"LoadTextureReplacements", "LoadTextureReplacementsAsync", "DumpReplaceableTextures"};
++	std::vector<std::string> kept;
++	std::string title = "; Opciones graficas de " + LiveWindowTitle() + " (menu F1 / Back+Start / mantener START). Se reescribe al cambiar.";
++	if (std::FILE* in = std::fopen(s_live_ini_path.c_str(), "r"))
++	{
++		char line[1024];
++		bool first = true;
++		while (std::fgets(line, sizeof(line), in))
++		{
++			std::string l(line);
++			while (!l.empty() && (l.back() == '\n' || l.back() == '\r'))
++				l.pop_back();
++			if (first && !l.empty() && l[0] == ';')
++				title = l;
++			first = false;
++			if (l.empty() || l[0] == ';' || l[0] == '[')
++				continue;
++			const size_t eq = l.find('=');
++			if (eq == std::string::npos)
++				continue;
++			std::string key = l.substr(0, eq);
++			while (!key.empty() && key.back() == ' ')
++				key.pop_back();
++			bool managed = false;
++			for (const char* m : kManaged)
++				managed = managed || key == m;
++			if (!managed)
++				kept.push_back(l);
++		}
++		std::fclose(in);
++	}
+ 	if (std::FILE* fp = std::fopen(s_live_ini_path.c_str(), "w"))
+ 	{
+-		std::fprintf(fp, "; Opciones graficas de NBA Street V3 (menu F1 / Back+Start / mantener START). Se reescribe al cambiar.\n[EmuCore/GS]\n");
++		std::fprintf(fp, "%s\n[EmuCore/GS]\n", title.c_str());
+ 		std::fprintf(fp, "Renderer = %d\n", s_menu_pending_renderer >= 0 ? s_menu_pending_renderer :
+ 			s_settings_interface.GetIntValue("EmuCore/GS", "Renderer", static_cast<int>(kMenuDefaultRenderer)));
+ 		std::fprintf(fp, "upscale_multiplier = %g\n", s_settings_interface.GetFloatValue("EmuCore/GS", "upscale_multiplier", 1.0f));
+@@ -1427,6 +1512,8 @@ static void LiveMenuSave()
+ 		std::fprintf(fp, "LoadTextureReplacements = %s\n", s_settings_interface.GetBoolValue("EmuCore/GS", "LoadTextureReplacements", false) ? "true" : "false");
+ 		std::fprintf(fp, "LoadTextureReplacementsAsync = true\n");
+ 		std::fprintf(fp, "DumpReplaceableTextures = %s\n", s_settings_interface.GetBoolValue("EmuCore/GS", "DumpReplaceableTextures", false) ? "true" : "false");
++		for (const std::string& l : kept)
++			std::fprintf(fp, "%s\n", l.c_str());
+ 		std::fclose(fp);
+ 	}
+ }
+@@ -1664,7 +1751,7 @@ bool GSRunner::CreatePlatformWindow()
+ 			live_rect = {0, 0, w, h};
+ 	}
+ 	AdjustWindowRectEx(&live_rect, WS_OVERLAPPEDWINDOW, FALSE, 0);
+-	s_hwnd = CreateWindowExW(s_live ? 0 : WS_EX_CLIENTEDGE, WINDOW_CLASS_NAME, s_live ? L"NBA Street V3" : L"PCSX2 GS Runner",
++	s_hwnd = CreateWindowExW(s_live ? 0 : WS_EX_CLIENTEDGE, WINDOW_CLASS_NAME, s_live ? StringUtil::UTF8StringToWideString(LiveWindowTitle()).c_str() : L"PCSX2 GS Runner",
+ 		WS_OVERLAPPEDWINDOW | WS_CAPTION | WS_MINIMIZEBOX | WS_SYSMENU | WS_SIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT,
+ 		s_live ? (live_rect.right - live_rect.left) : WINDOW_WIDTH, s_live ? (live_rect.bottom - live_rect.top) : WINDOW_HEIGHT,
+ 		nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+@@ -1992,7 +2079,7 @@ bool GSRunner::CreatePlatformWindow()
+ 			}
+ 		}
+ 	}
+-	s_window = CocoaTools::CreateWindow(s_live ? "NBA Street V3" : "PCSX2 GS Runner", width, height);
++	s_window = CocoaTools::CreateWindow(s_live ? LiveWindowTitle().c_str() : "PCSX2 GS Runner", width, height);
+ 	CocoaTools::GetWindowInfoFromWindow(&s_wi, s_window);
+ 	if (s_live)
+ 	{
+diff --git a/pcsx2/GSDumpReplayer.cpp b/pcsx2/GSDumpReplayer.cpp
+index 2de413bec..ef5ce009f 100644
+--- a/pcsx2/GSDumpReplayer.cpp
++++ b/pcsx2/GSDumpReplayer.cpp
+@@ -1,6 +1,7 @@
+ // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+ // SPDX-License-Identifier: GPL-3.0+
+ 
++#include <cstdlib>
+ #include "GS.h"
+ #include "GS/GSLzma.h"
+ #include "GS/GSDump.h"
+@@ -629,15 +630,19 @@ static void GSDumpReplayerLiveStep()
+ 			if (!LiveReadValue(&field))
+ 				return;
+ 			s_dump_frame_number++;
++			bool live_flip = false; // the displayed framebuffer changed: counts as a game frame (PCSX2's internal FPS)
+ 			{
+ 				// Game frame rate = how often the displayed framebuffer changes (PS2X_FPS_LOG=1).
+ 				static const bool s_fps_log = [] { const char* e = std::getenv("PS2X_FPS_LOG"); return e && e[0] == '1'; }();
+-				static u64 s_last_dispfb = 0;
++				static u64 s_last_dispfb1 = 0, s_last_dispfb2 = 0;
+ 				static u32 s_flips = 0, s_vsyncs = 0;
+-				const u64 dispfb = *reinterpret_cast<const u64*>(PS2MEM_GS + 0x70) ^ *reinterpret_cast<const u64*>(PS2MEM_GS + 0x90);
+-				if (dispfb != s_last_dispfb)
++				const u64 dispfb1 = *reinterpret_cast<const u64*>(PS2MEM_GS + 0x70);
++				const u64 dispfb2 = *reinterpret_cast<const u64*>(PS2MEM_GS + 0x90);
++				live_flip = dispfb1 != s_last_dispfb1 || dispfb2 != s_last_dispfb2;
++				if (live_flip)
+ 				{
+-					s_last_dispfb = dispfb;
++					s_last_dispfb1 = dispfb1;
++					s_last_dispfb2 = dispfb2;
+ 					s_flips++;
+ 				}
+ 				if (s_fps_log)
+@@ -672,16 +677,17 @@ static void GSDumpReplayerLiveStep()
+ 					s_live_wait_ticks = 0;
+ 					if (++s_vsyncs >= 60)
+ 					{
+-						Console.WriteLn("(PS2Recomp) internal fps %.1f, vsync fps %.1f, flips %u/%u, hitches>25ms %u, worst %.1f ms (wait %.1f), host busy %.0f%%",
++						Console.WriteLn("(PS2Recomp) internal fps %.1f, vsync fps %.1f, flips %u/%u, hitches>25ms %u, worst %.1f ms (wait %.1f), host busy %.0f%%, GPU %.1f ms/frame (%.0f%%, OsdShowGPU)",
+ 							PerformanceMetrics::GetInternalFPS(), PerformanceMetrics::GetFPS(), s_flips, s_vsyncs, s_hitches,
+-							s_max_ms, s_max_wait_ms, 100.0 * s_busy_ms / (1000.0 * s_vsyncs / 60.0));
++							s_max_ms, s_max_wait_ms, 100.0 * s_busy_ms / (1000.0 * s_vsyncs / 60.0),
++							PerformanceMetrics::GetGPUAverageTime(), PerformanceMetrics::GetGPUUsage());
+ 						s_flips = s_vsyncs = s_hitches = 0;
+ 						s_max_ms = s_max_wait_ms = s_busy_ms = 0;
+ 					}
+ 				}
+ 			}
+ 			// The game paces itself; no frame limiter here.
+-			MTGS::PostVsyncStart(false);
++			MTGS::PostVsyncStart(live_flip);
+ 			VMManager::Internal::VSyncOnCPUThread();
+ 			if (VMManager::Internal::IsExecutionInterrupted())
+ 				GSDumpReplayerExitExecution();
+@@ -1143,20 +1149,24 @@ bool GSDumpReplayer::WriteLiveBootDump(const std::string& path, Error* error)
+ 	auto fp = FileSystem::OpenManagedCFile(path.c_str(), "wb", error);
+ 	if (!fp)
+ 		return false;
+-	static constexpr char serial[] = "SLUS-21126";
++	// The game's serial selects its GameIndex fixes (PS2X_LIVE_SERIAL, default NBA Street V3's)
++	const char* serial_env = std::getenv("PS2X_LIVE_SERIAL");
++	const std::string serial_str = (serial_env && *serial_env) ? serial_env : "SLUS-21126";
++	const char* serial = serial_str.c_str();
++	const u32 serial_len = static_cast<u32>(serial_str.size());
+ 	const u32 crc = 0xFFFFFFFFu;
+-	const u32 header_size = static_cast<u32>(sizeof(GSDumpHeader) + sizeof(serial) - 1);
++	const u32 header_size = static_cast<u32>(sizeof(GSDumpHeader) + serial_len);
+ 	GSDumpHeader header = {};
+ 	header.state_version = 9;
+ 	header.state_size = 0;
+ 	header.serial_offset = sizeof(GSDumpHeader);
+-	header.serial_size = sizeof(serial) - 1;
++	header.serial_size = serial_len;
+ 	header.screenshot_offset = header.serial_offset + header.serial_size;
+ 	std::vector<u8> regs(8192, 0);
+ 	bool ok = std::fwrite(&crc, 4, 1, fp.get()) == 1;
+ 	ok = ok && std::fwrite(&header_size, 4, 1, fp.get()) == 1;
+ 	ok = ok && std::fwrite(&header, sizeof(header), 1, fp.get()) == 1;
+-	ok = ok && std::fwrite(serial, sizeof(serial) - 1, 1, fp.get()) == 1;
++	ok = ok && std::fwrite(serial, serial_len, 1, fp.get()) == 1;
+ 	ok = ok && std::fwrite(regs.data(), regs.size(), 1, fp.get()) == 1;
+ 	if (!ok)
+ 		Error::SetString(error, "Failed to write the live boot dump.");

@@ -1,5 +1,5 @@
 diff --git a/pcsx2-gsrunner/Main.cpp b/pcsx2-gsrunner/Main.cpp
-index 00647296f..fcb447513 100644
+index 00647296f..5df73271f 100644
 --- a/pcsx2-gsrunner/Main.cpp
 +++ b/pcsx2-gsrunner/Main.cpp
 @@ -125,6 +125,36 @@ static u32 s_total_drawn_frames = 0;
@@ -60,7 +60,28 @@ index 00647296f..fcb447513 100644
  	{
  		// when we wrap around, don't race other files
  		GSJoinSnapshotThreads();
-@@ -785,6 +827,7 @@ bool GSRunner::ParseCommandLineArgs(int argc, char* argv[], VMBootParameters& pa
+@@ -362,7 +404,19 @@ void Host::OnGameChanged(const std::string& title, const std::string& elf_overri
+ 
+ void Host::OnPerformanceMetricsUpdated()
+ {
+-	if (s_perf_enable)
++	// PS2X_PERF_FRAMES=<first>-<last>: only average the perf stats over those dump frames (e.g. the fight part).
++	static const std::pair<u64, u64> s_perf_range = [] {
++		std::pair<u64, u64> r{0, ~0ull};
++		if (const char* v = std::getenv("PS2X_PERF_FRAMES"))
++		{
++			unsigned long long a = 0, b = 0;
++			if (std::sscanf(v, "%llu-%llu", &a, &b) == 2)
++				r = {a, b};
++		}
++		return r;
++	}();
++	if (s_perf_enable && static_cast<u64>(s_dump_frame_number) >= s_perf_range.first &&
++		static_cast<u64>(s_dump_frame_number) <= s_perf_range.second)
+ 	{
+ 		s_perf_updates += 1.0f;
+ 		s_perf_sum_fps += PerformanceMetrics::GetFPS();
+@@ -785,6 +839,7 @@ bool GSRunner::ParseCommandLineArgs(int argc, char* argv[], VMBootParameters& pa
  				for (const auto& [key, value] : si_ini.GetKeyValueList("EmuCore/GS"))
  					s_settings_interface.SetStringValue("EmuCore/GS", key.c_str(), value.c_str());
  				s_live_ini_path = path; // the options menu saves back to this file
@@ -68,7 +89,7 @@ index 00647296f..fcb447513 100644
  
  				continue;
  			}
-@@ -799,6 +842,7 @@ bool GSRunner::ParseCommandLineArgs(int argc, char* argv[], VMBootParameters& pa
+@@ -799,6 +854,7 @@ bool GSRunner::ParseCommandLineArgs(int argc, char* argv[], VMBootParameters& pa
  
  				Console.WriteLn(fmt::format("Setting upscale multiplier to {}", upscale));
  				s_settings_interface.SetFloatValue("EmuCore/GS", "upscale_multiplier", upscale);
@@ -76,7 +97,7 @@ index 00647296f..fcb447513 100644
  				continue;
  			}
  			else if (CHECK_ARG_PARAM("-logfile"))
-@@ -1107,6 +1151,43 @@ static void LiveMenuPollGamepad();
+@@ -1107,6 +1163,43 @@ static void LiveMenuPollGamepad();
  // PS2X_SHOT_TIMES="98,104.5,110" (seconds since the host started) + PS2X_SHOT_DIR=<dir>: the host
  // saves its own rendered frame as <dir>\shot_<n>.png at those times. Used by automated tests
  // instead of desktop captures (no window focus, nothing else on screen gets captured).
@@ -120,7 +141,7 @@ index 00647296f..fcb447513 100644
  static void LiveTimedSnapshots()
  {
  	// PS2X_TEST_T0 (Unix ms) shares the time base with the game's PS2X_PAD_SCRIPT.
-@@ -1145,6 +1226,7 @@ void Host::PumpMessagesOnCPUThread()
+@@ -1145,6 +1238,7 @@ void Host::PumpMessagesOnCPUThread()
  	{
  		LiveMenuPollGamepad();
  		LiveTimedSnapshots();
@@ -128,7 +149,7 @@ index 00647296f..fcb447513 100644
  	}
  #endif
  	// update GS thread copy of frame number
-@@ -1406,9 +1488,44 @@ static void LiveMenuPublish()
+@@ -1406,9 +1500,44 @@ static void LiveMenuPublish()
  
  static void LiveMenuSave()
  {
@@ -174,7 +195,7 @@ index 00647296f..fcb447513 100644
  		std::fprintf(fp, "Renderer = %d\n", s_menu_pending_renderer >= 0 ? s_menu_pending_renderer :
  			s_settings_interface.GetIntValue("EmuCore/GS", "Renderer", static_cast<int>(kMenuDefaultRenderer)));
  		std::fprintf(fp, "upscale_multiplier = %g\n", s_settings_interface.GetFloatValue("EmuCore/GS", "upscale_multiplier", 1.0f));
-@@ -1427,6 +1544,8 @@ static void LiveMenuSave()
+@@ -1427,6 +1556,8 @@ static void LiveMenuSave()
  		std::fprintf(fp, "LoadTextureReplacements = %s\n", s_settings_interface.GetBoolValue("EmuCore/GS", "LoadTextureReplacements", false) ? "true" : "false");
  		std::fprintf(fp, "LoadTextureReplacementsAsync = true\n");
  		std::fprintf(fp, "DumpReplaceableTextures = %s\n", s_settings_interface.GetBoolValue("EmuCore/GS", "DumpReplaceableTextures", false) ? "true" : "false");
@@ -183,7 +204,7 @@ index 00647296f..fcb447513 100644
  		std::fclose(fp);
  	}
  }
-@@ -1447,6 +1566,7 @@ static void LiveMenuApply(int item)
+@@ -1447,6 +1578,7 @@ static void LiveMenuApply(int item)
  			break;
  		case MENU_RES:
  			s_settings_interface.SetFloatValue("EmuCore/GS", "upscale_multiplier", kMenuUpscale[index]);
@@ -191,7 +212,7 @@ index 00647296f..fcb447513 100644
  			break;
  		case MENU_ANISO:
  			s_settings_interface.SetIntValue("EmuCore/GS", "MaxAnisotropy", kMenuAniso[index]);
-@@ -1664,7 +1784,7 @@ bool GSRunner::CreatePlatformWindow()
+@@ -1664,7 +1796,7 @@ bool GSRunner::CreatePlatformWindow()
  			live_rect = {0, 0, w, h};
  	}
  	AdjustWindowRectEx(&live_rect, WS_OVERLAPPEDWINDOW, FALSE, 0);
@@ -200,7 +221,7 @@ index 00647296f..fcb447513 100644
  		WS_OVERLAPPEDWINDOW | WS_CAPTION | WS_MINIMIZEBOX | WS_SYSMENU | WS_SIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT,
  		s_live ? (live_rect.right - live_rect.left) : WINDOW_WIDTH, s_live ? (live_rect.bottom - live_rect.top) : WINDOW_HEIGHT,
  		nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
-@@ -1992,7 +2112,7 @@ bool GSRunner::CreatePlatformWindow()
+@@ -1992,7 +2124,7 @@ bool GSRunner::CreatePlatformWindow()
  			}
  		}
  	}

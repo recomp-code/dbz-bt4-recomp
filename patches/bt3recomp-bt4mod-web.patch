@@ -1,0 +1,3688 @@
+diff -ruN a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt	2026-10-19 04:58:17
++++ b/CMakeLists.txt	2026-10-19 03:48:35
+@@ -16,7 +16,7 @@
+ # and then dies at link with ~20 undefined `_glBindTexture`-style symbols, which reads as a missing
+ # OpenGL library rather than as the wrong architecture. Stop at configure and name the real cause.
+ # (It also shrinks DrawCmd from 352 to 320 bytes, tripping a guard in the GPU renderer first.)
+-if(CMAKE_SIZEOF_VOID_P AND NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
++if(CMAKE_SIZEOF_VOID_P AND NOT CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT EMSCRIPTEN)
+     message(FATAL_ERROR
+         "PS2RetroX requires a 64-bit toolchain; this one targets ${CMAKE_SIZEOF_VOID_P}-byte pointers.\n"
+         "  Windows: configure from the \"x64 Native Tools Command Prompt for VS\" (not the plain\n"
+@@ -55,6 +55,13 @@
+ # Windows build log becomes unreadable (dozens of notes per file). Same code, same semantics -- silence it.
+ if(WIN32)
+     add_compile_definitions(_CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
++endif()
++
++# [web] WebAssembly build (Emscripten): pthreads, wasm SIMD with the SSE4.2 headers, wasm exceptions.
++# The browser build is described in ps2xRuntime/web/web.cmake.
++if(EMSCRIPTEN)
++    add_compile_options(-msimd128 -msse4.2 -pthread -fwasm-exceptions)
++    add_link_options(-pthread -fwasm-exceptions)
+ endif()
+ 
+ option(PS2X_BUILD_RECOMP "Build ps2xRecomp" ON)
+diff -ruN a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+--- a/ps2xRuntime/CMakeLists.txt	2026-10-19 04:58:17
++++ b/ps2xRuntime/CMakeLists.txt	2026-10-19 03:48:35
+@@ -52,6 +52,12 @@
+ 
+ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/ReleaseMode.cmake")
+ 
++# [web] The browser build (Emscripten) has its own target description: no window, GL, SDL2 or Vulkan.
++if(EMSCRIPTEN)
++    include("${CMAKE_CURRENT_SOURCE_DIR}/web/web.cmake")
++    return()
++endif()
++
+ set(PS2X_IS_VITA OFF)
+ 
+ if((CMAKE_C_COMPILER MATCHES "arm-vita-eabi") OR
+diff -ruN a/ps2xRuntime/include/runtime/ps2_gs_gpu_renderer.h b/ps2xRuntime/include/runtime/ps2_gs_gpu_renderer.h
+--- a/ps2xRuntime/include/runtime/ps2_gs_gpu_renderer.h	2026-10-19 04:58:17
++++ b/ps2xRuntime/include/runtime/ps2_gs_gpu_renderer.h	2026-10-19 04:03:25
+@@ -413,6 +413,9 @@
+     // thread, an internal blit, an alias pass), so the retained state is no longer the batch head's.
+     uint64_t batchSeq() const { return m_batchSeq; }
+     void swapFrame();      // frame boundary (FUN_00100ab8): publish command list
++#if defined(__EMSCRIPTEN__)
++    void webDrain();       // [web] no GL in the browser build: drop published lists/uploads, answer barrier requests
++#endif
+     void onVramUpload(uint32_t dbpBlock, uint32_t sizeBlocks); // stamp the written VRAM pages
+     bool hasPendingFrame();   // [pubbreak] a published list is waiting for its present
+     void onVramWriteback(uint32_t dbpBlock, uint32_t sizeBlocks); // content-only stamp
+diff -ruN a/ps2xRuntime/include/runtime/ps2_gs_memory.h b/ps2xRuntime/include/runtime/ps2_gs_memory.h
+--- a/ps2xRuntime/include/runtime/ps2_gs_memory.h	2026-10-19 04:58:17
++++ b/ps2xRuntime/include/runtime/ps2_gs_memory.h	2026-10-19 03:54:30
+@@ -11,6 +11,9 @@
+ namespace GSMem
+ {
+ 	constexpr usz MEMORY_SIZE = 4_mb;
++#if defined(PAGE_SIZE)   // [web] Emscripten's <limits.h> defines PAGE_SIZE (65536)
++#undef PAGE_SIZE
++#endif
+ 	constexpr usz PAGE_SIZE = 8_kb;
+ 
+ 	// these are all the same regardless of storage mode
+diff -ruN a/ps2xRuntime/src/lib/ps2_fiber.cpp b/ps2xRuntime/src/lib/ps2_fiber.cpp
+--- a/ps2xRuntime/src/lib/ps2_fiber.cpp	2026-10-19 04:58:17
++++ b/ps2xRuntime/src/lib/ps2_fiber.cpp	2026-10-19 03:53:16
+@@ -11,7 +11,7 @@
+ #  define WIN32_LEAN_AND_MEAN
+ #  include <windows.h>
+ #  define PS2X_FIBER_WIN 1
+-#elif defined(__APPLE__) || defined(__linux__) || defined(__unix__)
++#elif (defined(__APPLE__) || defined(__linux__) || defined(__unix__)) && !defined(__EMSCRIPTEN__)   // [web] no ucontext in wasm
+ // ucontext is deprecated on macOS but still present and functional; silence the deprecation there
+ // rather than carrying a third backend.
+ #  ifdef __APPLE__
+diff -ruN a/ps2xRuntime/src/lib/ps2_gs_gpu_renderer.cpp b/ps2xRuntime/src/lib/ps2_gs_gpu_renderer.cpp
+--- a/ps2xRuntime/src/lib/ps2_gs_gpu_renderer.cpp	2026-10-19 04:58:17
++++ b/ps2xRuntime/src/lib/ps2_gs_gpu_renderer.cpp	2026-10-19 04:03:32
+@@ -3229,6 +3229,38 @@
+ // [barblock] GL thread: serve queued blocking barriers. Drains any published-but-unrendered
+ // lists first (so m_segFrom keeps indexing the current list), then renders the in-progress
+ // list up to the request point and flushes the page straight into VRAM.
++#if defined(__EMSCRIPTEN__)
++// [web] The browser build has no GL: the page draws the live GS stream. Whatever the guest side publishes for the
++// present thread is dropped here, and barrier requests are answered at once (the parse records no draws there, so
++// there is nothing to render first).
++void GsGpuRenderer::webDrain()
++{
++    {
++        std::lock_guard<std::mutex> lk(m_mtx);
++        for (auto &l : m_pending)
++            if (m_vecPool.size() < 4) { l.clear(); m_vecPool.push_back(std::move(l)); }
++        m_pending.clear();
++        m_pendingGen.clear();
++        m_upQueue.clear();
++    }
++    unsigned served = 0, decodes = 0;
++    {
++        std::lock_guard<std::mutex> lk(g_bbMx);
++        while (!g_bbQueue.empty())
++        {
++            if (g_bbQueue.front().dec) ++decodes; else { ++g_bbServed; ++served; }
++            g_bbQueue.pop_front();
++        }
++    }
++    if (served || decodes)
++    {
++        g_bbCv.notify_all();
++        static unsigned s_n = 0;
++        if (s_n++ < 8) std::fprintf(stderr, "[web] answered %u GS barrier request(s) without a render (%u decode requests dropped)\n", served, decodes);
++    }
++}
++#endif
++
+ bool GsGpuRenderer::serviceBlockingBarriers()
+ {
+     if (!m_glInit || !ps2xOnGlThread()) return false;
+@@ -5433,9 +5465,11 @@
+     // of undefined _glBindTexture-style symbols that says nothing about the real cause. Say it
+     // plainly instead; the recompiler's 128-bit guest registers and pointer-width assumptions make
+     // x86 unsupportable anyway.
++#if !defined(__EMSCRIPTEN__)   // [web] wasm32: this renderer does not run in the browser build
+     static_assert(sizeof(void *) == 8,
+                   "BT3-Recomp requires a 64-bit build. Configure from the x64 Native Tools "
+                   "command prompt (a 32-bit build also shrinks DrawCmd from 352 to 320).");
++#endif
+     // Developer guard: adding a field to DrawCmd must prompt a re-read of the list below, or the
+     // head command's value is silently reused for a whole batch. The size is whatever the
+     // reference toolchain produces, so only assert it there.
+diff -ruN a/ps2xRuntime/src/lib/ps2_gs_live.cpp b/ps2xRuntime/src/lib/ps2_gs_live.cpp
+--- a/ps2xRuntime/src/lib/ps2_gs_live.cpp	2026-10-19 04:58:17
++++ b/ps2xRuntime/src/lib/ps2_gs_live.cpp	2026-10-19 03:57:22
+@@ -16,8 +16,17 @@
+ #include <string>
+ #include <vector>
+ 
+-#if defined(__APPLE__) || defined(__linux__)
++#if defined(__EMSCRIPTEN__)
++// [web] The GS host is the page itself (web/play_gs_host.cpp, Play!'s GS on WebGL2, on the browser's main thread):
++// the ring is plain memory of this module, shared with it. Same protocol as the POSIX ring.
+ #include <cerrno>
++#include <emscripten.h>
++#include <sys/wait.h>
++bool ps2xWebStartGsHost(ps2live::RingHeader *header);
++#define PS2X_GS_LIVE_RING 1
++#define PS2X_GS_LIVE_WEB 1
++#elif defined(__APPLE__) || defined(__linux__)
++#include <cerrno>
+ #include <fcntl.h>
+ #include <signal.h>
+ #include <spawn.h>
+@@ -72,7 +81,76 @@
+             return (v && v[0]) ? std::string(v) : std::string("SLUS-21978");
+         }
+ 
+-#if defined(PS2X_GS_LIVE_RING)
++#if defined(PS2X_GS_LIVE_WEB)
++        struct LiveRing
++        {
++            int hostStatus = 0;
++            bool hostExited = false;
++            ps2live::RingHeader *header = nullptr;
++            ps2live::RingEvents *events = nullptr;
++            uint8_t *data = nullptr;
++            uint64_t capacity = 0;
++            uint64_t waitNs = 0; // time the game blocked on a full ring ([gslive] stats)
++
++            bool open()
++            {
++                capacity = 64ull << 20; // the browser build keeps memory small
++                void *block = std::aligned_alloc(64, static_cast<size_t>(ps2live::mappingSize(capacity)));
++                if (!block)
++                    return false;
++                header = static_cast<ps2live::RingHeader *>(block);
++                std::memset(header, 0, sizeof(*header));
++                header->capacity = capacity;
++                header->padAxes = 0x80808080u;
++                header->version = ps2live::kVersion;
++                header->producerAlive = 1u;
++                header->producerFlags = 1u;
++                data = ps2live::ringData(header);
++                events = ps2live::ringEvents(header);
++                std::memset(events, 0, sizeof(*events));
++                __atomic_thread_fence(__ATOMIC_SEQ_CST);
++                header->magic = ps2live::kMagic;
++                return true;
++            }
++
++            bool launchHost() { return ps2xWebStartGsHost(header); }
++
++            bool hostGone() { return header && header->consumerQuit; }
++
++            // Blocks while the ring is full. The page never blocks: it reads whole packets once per browser frame.
++            bool write(const uint8_t *src, size_t size)
++            {
++                while (size != 0u)
++                {
++                    const int64_t w = header->writePos;
++                    const int64_t r = __atomic_load_n(&header->readPos, __ATOMIC_ACQUIRE);
++                    const uint64_t freeBytes = capacity - static_cast<uint64_t>(w - r);
++                    if (freeBytes == 0u)
++                    {
++                        if (hostGone())
++                            return false;
++                        const auto t0 = std::chrono::steady_clock::now();
++                        header->producerWaiting = 1u;
++                        __atomic_thread_fence(__ATOMIC_SEQ_CST);
++                        if (header->readPos == r)
++                            ps2live::eventWait(&events->space, 20);
++                        header->producerWaiting = 0u;
++                        waitNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
++                        continue;
++                    }
++                    const uint64_t offset = static_cast<uint64_t>(w) % capacity;
++                    const size_t chunk = static_cast<size_t>(std::min<uint64_t>({size, freeBytes, capacity - offset}));
++                    std::memcpy(data + offset, src, chunk);
++                    __atomic_store_n(&header->writePos, w + static_cast<int64_t>(chunk), __ATOMIC_RELEASE);
++                    src += chunk;
++                    size -= chunk;
++                }
++                return true;
++            }
++
++            void signal() {} // the page polls once per browser frame
++        };
++#elif defined(PS2X_GS_LIVE_RING)
+         // shm_open mapping, events as shared words (ps2live::eventSet/eventWait), host started with posix_spawn.
+         struct LiveRing
+         {
+diff -ruN a/ps2xRuntime/src/lib/ps2_live_ring.h b/ps2xRuntime/src/lib/ps2_live_ring.h
+--- a/ps2xRuntime/src/lib/ps2_live_ring.h	2026-10-19 04:58:17
++++ b/ps2xRuntime/src/lib/ps2_live_ring.h	2026-10-19 03:51:13
+@@ -11,6 +11,8 @@
+ 
+ #if defined(__APPLE__)
+ #include <os/os_sync_wait_on_address.h>
++#elif defined(__EMSCRIPTEN__)
++#include <emscripten/threading.h>
+ #elif defined(__linux__)
+ #include <climits>
+ #include <ctime>
+@@ -98,6 +100,8 @@
+         __atomic_store_n(word, 1u, __ATOMIC_SEQ_CST);
+ #if defined(__APPLE__)
+         os_sync_wake_by_address_any(word, sizeof(*word), OS_SYNC_WAKE_BY_ADDRESS_SHARED);
++#elif defined(__EMSCRIPTEN__)
++        emscripten_futex_wake(word, 1);
+ #elif defined(__linux__)
+         syscall(SYS_futex, word, FUTEX_WAKE, 1, nullptr, nullptr, 0);
+ #endif
+@@ -111,6 +115,8 @@
+ #if defined(__APPLE__)
+         os_sync_wait_on_address_with_timeout(word, 0u, sizeof(*word), OS_SYNC_WAIT_ON_ADDRESS_SHARED,
+                                              OS_CLOCK_MACH_ABSOLUTE_TIME, static_cast<uint64_t>(timeoutMs) * 1000000ull);
++#elif defined(__EMSCRIPTEN__)
++        emscripten_futex_wait(word, 0u, static_cast<double>(timeoutMs)); // never on the browser's main thread
+ #elif defined(__linux__)
+         const timespec timeout{static_cast<time_t>(timeoutMs / 1000u), static_cast<long>(timeoutMs % 1000u) * 1000000l};
+         syscall(SYS_futex, word, FUTEX_WAIT, 0, &timeout, nullptr, 0);
+diff -ruN a/ps2xRuntime/src/lib/ps2_netplay.cpp b/ps2xRuntime/src/lib/ps2_netplay.cpp
+--- a/ps2xRuntime/src/lib/ps2_netplay.cpp	2026-10-19 04:58:17
++++ b/ps2xRuntime/src/lib/ps2_netplay.cpp	2026-10-19 03:55:15
+@@ -44,6 +44,7 @@
+ #  include <netdb.h>
+ #  include <netinet/in.h>
+ #  include <sys/socket.h>
++#  include <sys/time.h>
+ #  include <unistd.h>
+    typedef int SOCKET;
+ #  define INVALID_SOCKET (-1)
+diff -ruN a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp	2026-10-19 04:58:17
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp	2026-10-19 04:06:07
+@@ -2396,7 +2396,12 @@
+ // those accesses land somewhere valid instead of faulting (register semantics come later).
+ static uint8_t *iopGuestSpace(size_t &sizeOut)
+ {
+-#if !defined(_WIN32)
++#if defined(__EMSCRIPTEN__)
++    // [web] wasm32 has no sparse mappings: the modules (a few MB from 0) plus the reach of the fast-path RAM mask.
++    static std::vector<uint8_t> s(static_cast<size_t>(PS2_RAM_SIZE) + (32u << 20), 0u);
++    sizeOut = s.size();
++    return s.data();
++#elif !defined(_WIN32)
+     static uint8_t *s = []() -> uint8_t * {
+         const size_t n = 0xC0000000ull;
+         void *p = ::mmap(nullptr, n, PROT_READ | PROT_WRITE,
+@@ -8211,6 +8216,15 @@
+         // GPU mode: render the recorded GS command list into the FBO and present that
+         // (its texture is bottom-up, so flip Y). Software mode: upload guest VRAM.
+         const bool gpuMode = GsGpuRenderer::enabled();
++#if defined(__EMSCRIPTEN__)
++        // [web] Nothing is presented here: the page draws the live GS stream (web/play_gs_host.cpp). The renderer's
++        // published lists and texture uploads are dropped (there is no GL), the pad layer is polled and the loop is paced
++        // to 60 Hz by the headless raylib (web/bt3gl_headless.cpp).
++        if (gpuMode) ps2GpuRenderer().webDrain();
++        ps2x_pad::update();
++        bt3BeginDrawing();
++        bt3EndDrawing();
++#else
+         {   // [perf] Declare what the GPU column is going to MEASURE, before anything reports a
+             // number. This is the whole point of the field: the three backends cannot measure the
+             // same thing, and a percentage with no source is a number nobody can act on.
+@@ -9113,6 +9127,7 @@
+                 }
+             }
+         }
++#endif   // [web] !__EMSCRIPTEN__ (present)
+ 
+         // Drain any streaming PCM into the audio device. Must run on the render thread --
+         // raylib's bt3AudioStream calls are not safe to make from the guest threads that
+@@ -9412,9 +9427,14 @@
+                       << " host=" << (uint32_t)(s_fpsFrames / dt)
+                       << " rss_mb=" << ps2xRssMB()   // [memstat] resident size: a leak shows as a line that only climbs
+                       << " gl_free_mb=" << [&]{   // [memstat] GPU free memory as GL sees it (NVIDIA only: GL_NVX_gpu_memory_info; 0 elsewhere)
++#if defined(_WIN32) || defined(PS2X_HAVE_SDL2)   // [web] no GL context in the browser build's runtime
+                              ps2xgl::GLint kb = 0; ps2xgl::glGetIntegerv(0x9049 /* GL_GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX */, &kb);
+                              while (ps2xgl::glGetError() != ps2xgl::GL_NO_ERROR) {}   // clear the INVALID_ENUM on other vendors
+-                             return kb > 0 ? (unsigned)(kb / 1024) : 0u; }()
++                             return kb > 0 ? (unsigned)(kb / 1024) : 0u;
++#else
++                             return 0u;
++#endif
++                             }()
+                       << " prims/sec=" << (uint64_t)((prims - s_lastPrims) / dt)
+                       << " glhoist/sec=" << [&]{ extern std::atomic<unsigned long> g_glHoistCmds, g_glHoistTris;   // [glhoist]
+                              static unsigned long s_lc = 0, s_lt = 0;
+diff -ruN a/ps2xRuntime/src/lib/ui_sdl.cpp b/ps2xRuntime/src/lib/ui_sdl.cpp
+--- a/ps2xRuntime/src/lib/ui_sdl.cpp	2026-10-19 04:58:17
++++ b/ps2xRuntime/src/lib/ui_sdl.cpp	2026-10-19 03:55:26
+@@ -26,11 +26,13 @@
+ 
+     // Watch, never consume: raylib polls SDL itself and must keep receiving everything. A watch runs for
+     // every event while it is being pumped and does not remove it from the queue.
++#if defined(PS2X_HAVE_SDL2)   // [web] the browser build has no SDL2
+     int UiSdlEventWatch(void *, SDL_Event *e)
+     {
+         ImGui_ImplSDL2_ProcessEvent(e);
+         return 0;
+     }
++#endif
+ }
+ 
+ bool UiSdlInit(void *sdlWindow, void *glContext)
+diff -ruN a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+--- a/ps2xRuntime/src/main.cpp	2026-10-19 04:58:17
++++ b/ps2xRuntime/src/main.cpp	2026-10-19 04:17:21
+@@ -553,8 +553,14 @@
+     static const std::string s_dir = getExecutableDirectory().string();
+     return s_dir.c_str();
+ }
++#if defined(__EMSCRIPTEN__)
++void ps2xWasmPlatformInit(int &argc, char **&argv);   // [web] web/web_platform.cpp: files, settings, arguments
++#endif
+ int main(int argc, char *argv[])
+ {
++#if defined(__EMSCRIPTEN__)
++    ps2xWasmPlatformInit(argc, argv);
++#endif
+     // [boot] process/main start: the runtime logs start -> first frame on its first present.
+     extern std::chrono::steady_clock::time_point g_ps2xBootT0;
+     g_ps2xBootT0 = std::chrono::steady_clock::now();
+@@ -722,6 +728,7 @@
+                 if (std::freopen(lf, "w", stderr))
+                     std::fprintf(stderr, "[logfile] stderr -> %s\n", lf);
+             }
++#if !defined(__EMSCRIPTEN__)   // [web] stderr is the page's log
+             else if (lvl > 0)
+             {
+                 // [logfile-gui] A double-clicked runner has no console AND nothing is capturing it,
+@@ -762,7 +769,9 @@
+                     }
+                 }
+             }
++#endif
+         }
++#if !defined(__EMSCRIPTEN__)   // [web] no overlay in the browser (it would need GL); its settings are still loaded above
+         runtime.setDebugUiCallbacks(
+             [](PS2Runtime &rt, void *userData)
+             {
+@@ -779,6 +788,7 @@
+                 static_cast<PS2SettingsOverlay *>(userData)->shutdown();
+             },
+             &settingsOverlay);
++#endif
+ #endif
+         if (!runtime.initialize(windowTitle.c_str()))
+         {
+diff -ruN a/ps2xRuntime/web/bt3gl_headless.cpp b/ps2xRuntime/web/bt3gl_headless.cpp
+--- a/ps2xRuntime/web/bt3gl_headless.cpp	1969-12-31 18:00:00
++++ b/ps2xRuntime/web/bt3gl_headless.cpp	2026-10-19 04:08:07
+@@ -0,0 +1,503 @@
++// [web] The raylib API the runtime calls, for the browser build (web/web.cmake), where it has no window of its own:
++// the page draws the live GS stream with Play!'s GS (web/play_gs_host.cpp) and reads the keyboard and gamepads.
++//
++//   window, drawing, textures, shaders, rlgl   accepted and ignored (EndDrawing paces the present loop to the target
++//                                               frame rate, as raylib's frame cap does)
++//   input                                      nothing pressed (the page publishes the pad through the live ring)
++//   audio streams and sounds                   mixed here to 48 kHz stereo into a ring in the wasm memory, which an
++//                                               AudioWorklet on the page plays (the memory is a SharedArrayBuffer)
++
++#include "raylib.h"
++#include "rlgl.h"
++
++#include <emscripten.h>
++#include <emscripten/threading.h>
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <deque>
++#include <mutex>
++#include <thread>
++#include <vector>
++
++namespace
++{
++    using Clock = std::chrono::steady_clock;
++    const Clock::time_point g_t0 = Clock::now();
++    int g_winW = 640, g_winH = 480;
++    bool g_winReady = false;
++    int g_targetFps = 0;
++    Clock::time_point g_nextFrame = Clock::now();
++    std::atomic<unsigned> g_nextId{1};
++    int g_defaultLocs[32] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
++                             -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
++
++    int bytesPerPixel(int format)
++    {
++        switch (format)
++        {
++        case PIXELFORMAT_UNCOMPRESSED_GRAYSCALE: return 1;
++        case PIXELFORMAT_UNCOMPRESSED_GRAY_ALPHA:
++        case PIXELFORMAT_UNCOMPRESSED_R5G6B5:
++        case PIXELFORMAT_UNCOMPRESSED_R5G5B5A1:
++        case PIXELFORMAT_UNCOMPRESSED_R4G4B4A4: return 2;
++        case PIXELFORMAT_UNCOMPRESSED_R8G8B8: return 3;
++        case PIXELFORMAT_UNCOMPRESSED_R32: return 4;
++        case PIXELFORMAT_UNCOMPRESSED_R32G32B32: return 12;
++        case PIXELFORMAT_UNCOMPRESSED_R32G32B32A32: return 16;
++        default: return 4;
++        }
++    }
++
++    // ---- audio ------------------------------------------------------------------------------------------------
++    constexpr uint32_t kOutRate = 48000;
++    constexpr uint32_t kRingFrames = 32768; // ~680 ms
++    alignas(16) int16_t g_ring[kRingFrames * 2];
++    alignas(8) std::atomic<uint32_t> g_ringIndex[2]; // [0] written (here), [1] read (by the worklet)
++
++    struct Voice
++    {
++        bool sound = false;          // a one-shot Sound (mono PCM kept whole) rather than a stream
++        bool playing = false;
++        uint32_t rate = kOutRate;
++        uint32_t channels = 2;
++        uint32_t subFrames = 4096;   // raylib's sub-buffer size: a stream is "processed" when one is free
++        std::deque<int16_t> fifo;    // stream: queued stereo frames (L, R)
++        std::vector<int16_t> pcm;    // sound: mono samples
++        double pos = 0.0;            // read position in source frames (fraction for the resampler)
++        float volume = 1.0f, pitch = 1.0f;
++    };
++    std::mutex g_audioMx;
++    std::vector<Voice *> g_voices;
++    std::atomic<bool> g_audioUp{false};
++    int g_defaultSub = 4096;
++    uint64_t g_streamUnderruns = 0;
++
++    Voice *voiceOf(const AudioStream &s) { return reinterpret_cast<Voice *>(s.buffer); }
++
++    void mixFrames(float *out, uint32_t frames)
++    {
++        std::memset(out, 0, sizeof(float) * frames * 2u);
++        std::lock_guard<std::mutex> lk(g_audioMx);
++        for (Voice *v : g_voices)
++        {
++            if (!v->playing)
++                continue;
++            const double step = static_cast<double>(v->rate) * v->pitch / kOutRate;
++            if (v->sound)
++            {
++                const size_t n = v->pcm.size();
++                for (uint32_t i = 0; i < frames; ++i)
++                {
++                    const size_t k = static_cast<size_t>(v->pos);
++                    if (k + 1 >= n) { v->playing = false; break; }
++                    const double f = v->pos - k;
++                    const float s = static_cast<float>((v->pcm[k] + (v->pcm[k + 1] - v->pcm[k]) * f) * v->volume);
++                    out[i * 2] += s;
++                    out[i * 2 + 1] += s;
++                    v->pos += step;
++                }
++                continue;
++            }
++            // stream: frame k of the fifo is (fifo[2k], fifo[2k+1]); consumed frames are popped as pos passes them
++            for (uint32_t i = 0; i < frames; ++i)
++            {
++                const size_t avail = v->fifo.size() / 2u;
++                const size_t k = static_cast<size_t>(v->pos);
++                if (k + 1 >= avail) { ++g_streamUnderruns; break; }
++                const double f = v->pos - k;
++                const float l0 = v->fifo[k * 2], r0 = v->fifo[k * 2 + 1];
++                const float l1 = v->fifo[k * 2 + 2], r1 = v->fifo[k * 2 + 3];
++                out[i * 2] += static_cast<float>((l0 + (l1 - l0) * f) * v->volume);
++                out[i * 2 + 1] += static_cast<float>((r0 + (r1 - r0) * f) * v->volume);
++                v->pos += step;
++            }
++            const size_t used = static_cast<size_t>(v->pos);
++            if (used > 0)
++            {
++                const size_t drop = std::min(used, v->fifo.size() / 2u);
++                v->fifo.erase(v->fifo.begin(), v->fifo.begin() + static_cast<std::ptrdiff_t>(drop * 2u));
++                v->pos -= static_cast<double>(drop);
++            }
++        }
++    }
++
++    // Produces 48 kHz by the wall clock; the worklet follows the game's rate within +-3% (index.html).
++    void mixerLoop()
++    {
++        constexpr uint32_t kBlock = 256;
++        float mix[kBlock * 2];
++        uint64_t produced = 0;
++        const Clock::time_point start = Clock::now();
++        for (;;)
++        {
++            const double elapsed = std::chrono::duration<double>(Clock::now() - start).count();
++            const uint64_t due = static_cast<uint64_t>(elapsed * kOutRate);
++            if (produced + kBlock > due)
++            {
++                std::this_thread::sleep_for(std::chrono::milliseconds(2));
++                continue;
++            }
++            if (due > produced + kOutRate / 4u) // stalled (tab in background): do not try to catch up
++                produced = due - kBlock;
++            mixFrames(mix, kBlock);
++            produced += kBlock;
++            uint32_t w = g_ringIndex[0].load(std::memory_order_relaxed);
++            const uint32_t queued = w - g_ringIndex[1].load(std::memory_order_acquire);
++            if (queued + kBlock > kRingFrames - 256u)
++                continue; // the page is not playing (no click yet) or fell far behind: drop
++            for (uint32_t i = 0; i < kBlock; ++i, ++w)
++            {
++                const uint32_t slot = (w % kRingFrames) * 2u;
++                g_ring[slot] = static_cast<int16_t>(std::clamp(mix[i * 2], -32768.0f, 32767.0f));
++                g_ring[slot + 1] = static_cast<int16_t>(std::clamp(mix[i * 2 + 1], -32768.0f, 32767.0f));
++            }
++            g_ringIndex[0].store(w, std::memory_order_release);
++        }
++    }
++}
++
++extern "C"
++{
++// ---- window / timing ------------------------------------------------------------------------------------------
++void InitWindow(int width, int height, const char *title)
++{
++    (void)title;
++    g_winW = width > 0 ? width : 640;
++    g_winH = height > 0 ? height : 480;
++    g_winReady = true;
++    std::printf("[web] headless raylib: window %dx%d (the page draws the game)\n", g_winW, g_winH);
++}
++void CloseWindow(void) { g_winReady = false; }
++bool IsWindowReady(void) { return g_winReady; }
++bool WindowShouldClose(void) { return false; }
++void SetConfigFlags(unsigned int flags) { (void)flags; }
++void SetWindowState(unsigned int flags) { (void)flags; }
++void SetWindowSize(int width, int height) { if (width > 0) g_winW = width; if (height > 0) g_winH = height; }
++void SetWindowMonitor(int monitor) { (void)monitor; }
++void ClearWindowState(unsigned int flags) { (void)flags; }
++void ToggleFullscreen(void) {}
++bool IsWindowFullscreen(void) { return false; }
++void SetWindowIcon(Image image) { (void)image; }
++void *GetWindowHandle(void) { return nullptr; }
++int GetScreenWidth(void) { return g_winW; }
++int GetScreenHeight(void) { return g_winH; }
++int GetRenderWidth(void) { return g_winW; }
++int GetRenderHeight(void) { return g_winH; }
++int GetMonitorCount(void) { return 1; }
++int GetCurrentMonitor(void) { return 0; }
++int GetMonitorWidth(int monitor) { (void)monitor; return 1920; }
++int GetMonitorHeight(int monitor) { (void)monitor; return 1080; }
++int GetMonitorRefreshRate(int monitor) { (void)monitor; return 60; }
++const char *GetMonitorName(int monitor) { (void)monitor; return "browser"; }
++double GetTime(void) { return std::chrono::duration<double>(Clock::now() - g_t0).count(); }
++void SetTargetFPS(int fps) { g_targetFps = fps > 0 ? fps : 0; }
++
++void BeginDrawing(void) {}
++void EndDrawing(void)
++{
++    if (g_targetFps <= 0)
++        return;
++    const auto period = std::chrono::nanoseconds(1000000000ll / g_targetFps);
++    const auto now = Clock::now();
++    if (g_nextFrame + std::chrono::milliseconds(100) < now)
++        g_nextFrame = now; // fell far behind: do not race to catch up
++    g_nextFrame += period;
++    if (g_nextFrame > now)
++        std::this_thread::sleep_until(g_nextFrame);
++}
++void ClearBackground(Color color) { (void)color; }
++void BeginBlendMode(int mode) { (void)mode; }
++void EndBlendMode(void) {}
++void BeginShaderMode(Shader shader) { (void)shader; }
++void EndShaderMode(void) {}
++void DrawRectangle(int posX, int posY, int width, int height, Color color) { (void)posX; (void)posY; (void)width; (void)height; (void)color; }
++void DrawTexturePro(Texture2D texture, Rectangle source, Rectangle dest, Vector2 origin, float rotation, Color tint)
++{
++    (void)texture; (void)source; (void)dest; (void)origin; (void)rotation; (void)tint;
++}
++
++// ---- images / textures / shaders --------------------------------------------------------------------------------
++int GetPixelDataSize(int width, int height, int format) { return width * height * bytesPerPixel(format); }
++Image GenImageColor(int width, int height, Color color)
++{
++    Image img{};
++    if (width <= 0 || height <= 0)
++        return img;
++    auto *px = static_cast<Color *>(std::malloc(static_cast<size_t>(width) * height * sizeof(Color)));
++    if (!px)
++        return img;
++    for (int i = 0; i < width * height; ++i)
++        px[i] = color;
++    img.data = px;
++    img.width = width;
++    img.height = height;
++    img.mipmaps = 1;
++    img.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
++    return img;
++}
++Image ImageCopy(Image image)
++{
++    Image out = image;
++    out.data = nullptr;
++    if (image.data && image.width > 0 && image.height > 0)
++    {
++        const size_t n = static_cast<size_t>(GetPixelDataSize(image.width, image.height, image.format));
++        out.data = std::malloc(n);
++        if (out.data)
++            std::memcpy(out.data, image.data, n);
++    }
++    return out;
++}
++void UnloadImage(Image image) { std::free(image.data); }
++Image LoadImage(const char *fileName) { (void)fileName; return Image{}; }
++Image LoadImageFromScreen(void) { return Image{}; }
++bool ExportImage(Image image, const char *fileName) { (void)image; (void)fileName; return false; }
++void ImageFlipVertical(Image *image)
++{
++    if (!image || !image->data || image->height <= 1)
++        return;
++    const size_t row = static_cast<size_t>(image->width) * bytesPerPixel(image->format);
++    std::vector<uint8_t> tmp(row);
++    auto *p = static_cast<uint8_t *>(image->data);
++    for (int y = 0; y < image->height / 2; ++y)
++    {
++        uint8_t *a = p + row * y, *b = p + row * (image->height - 1 - y);
++        std::memcpy(tmp.data(), a, row);
++        std::memcpy(a, b, row);
++        std::memcpy(b, tmp.data(), row);
++    }
++}
++void ImageFormat(Image *image, int newFormat) { (void)image; (void)newFormat; }
++void ImageResize(Image *image, int newWidth, int newHeight) { (void)image; (void)newWidth; (void)newHeight; }
++Texture2D LoadTextureFromImage(Image image)
++{
++    Texture2D t{};
++    t.id = g_nextId++;
++    t.width = image.width;
++    t.height = image.height;
++    t.mipmaps = 1;
++    t.format = image.format;
++    return t;
++}
++void UnloadTexture(Texture2D texture) { (void)texture; }
++void UpdateTexture(Texture2D texture, const void *pixels) { (void)texture; (void)pixels; }
++void SetTextureFilter(Texture2D texture, int filter) { (void)texture; (void)filter; }
++void SetTextureWrap(Texture2D texture, int wrap) { (void)texture; (void)wrap; }
++Shader LoadShaderFromMemory(const char *vsCode, const char *fsCode)
++{
++    (void)vsCode; (void)fsCode;
++    Shader s{};
++    s.id = g_nextId++;
++    s.locs = g_defaultLocs;
++    return s;
++}
++int GetShaderLocation(Shader shader, const char *uniformName) { (void)shader; (void)uniformName; return -1; }
++void SetShaderValue(Shader shader, int locIndex, const void *value, int uniformType) { (void)shader; (void)locIndex; (void)value; (void)uniformType; }
++
++// ---- input (the page publishes keyboard and gamepad through the live ring) ------------------------------------------
++bool IsKeyDown(int key) { (void)key; return false; }
++bool IsKeyPressed(int key) { (void)key; return false; }
++int GetKeyPressed(void) { return 0; }
++int GetCharPressed(void) { return 0; }
++bool IsMouseButtonDown(int button) { (void)button; return false; }
++Vector2 GetMousePosition(void) { return Vector2{0.0f, 0.0f}; }
++Vector2 GetMouseWheelMoveV(void) { return Vector2{0.0f, 0.0f}; }
++bool IsGamepadAvailable(int gamepad) { (void)gamepad; return false; }
++bool IsGamepadButtonDown(int gamepad, int button) { (void)gamepad; (void)button; return false; }
++int GetGamepadAxisCount(int gamepad) { (void)gamepad; return 0; }
++float GetGamepadAxisMovement(int gamepad, int axis) { (void)gamepad; (void)axis; return 0.0f; }
++const char *GetGamepadName(int gamepad) { (void)gamepad; return ""; }
++int SetGamepadMappings(const char *mappings) { (void)mappings; return 0; }
++
++// ---- audio ---------------------------------------------------------------------------------------------------------
++void InitAudioDevice(void)
++{
++    if (g_audioUp.exchange(true))
++        return;
++    std::thread(mixerLoop).detach();
++    // The page owns the AudioContext (it may only start after a click or a key press).
++    MAIN_THREAD_ASYNC_EM_ASM(
++        {
++            if (typeof ps2xStartAudio == 'function')
++                ps2xStartAudio(HEAP16.buffer, $0, $1, $2);
++        },
++        g_ring, kRingFrames, g_ringIndex);
++    std::printf("[web] audio: streams mixed to 48 kHz stereo for the page's AudioWorklet\n");
++}
++void CloseAudioDevice(void) {}
++bool IsAudioDeviceReady(void) { return g_audioUp.load(); }
++void SetAudioStreamBufferSizeDefault(int size) { if (size > 0) g_defaultSub = size; }
++AudioStream LoadAudioStream(unsigned int sampleRate, unsigned int sampleSize, unsigned int channels)
++{
++    AudioStream s{};
++    auto *v = new Voice();
++    v->rate = sampleRate ? sampleRate : kOutRate;
++    v->channels = channels == 1 ? 1 : 2;
++    v->subFrames = static_cast<uint32_t>(g_defaultSub);
++    {
++        std::lock_guard<std::mutex> lk(g_audioMx);
++        g_voices.push_back(v);
++    }
++    s.buffer = reinterpret_cast<rAudioBuffer *>(v);
++    s.sampleRate = v->rate;
++    s.sampleSize = sampleSize;
++    s.channels = v->channels;
++    return s;
++}
++void UnloadAudioStream(AudioStream stream)
++{
++    Voice *v = voiceOf(stream);
++    if (!v)
++        return;
++    std::lock_guard<std::mutex> lk(g_audioMx);
++    g_voices.erase(std::remove(g_voices.begin(), g_voices.end(), v), g_voices.end());
++    delete v;
++}
++void PlayAudioStream(AudioStream stream) { if (Voice *v = voiceOf(stream)) { std::lock_guard<std::mutex> lk(g_audioMx); v->playing = true; } }
++void StopAudioStream(AudioStream stream)
++{
++    if (Voice *v = voiceOf(stream))
++    {
++        std::lock_guard<std::mutex> lk(g_audioMx);
++        v->playing = false;
++        v->fifo.clear();
++        v->pos = 0.0;
++    }
++}
++bool IsAudioStreamProcessed(AudioStream stream)
++{
++    Voice *v = voiceOf(stream);
++    if (!v)
++        return false;
++    std::lock_guard<std::mutex> lk(g_audioMx);
++    return v->fifo.size() / 2u <= v->subFrames; // at most one of raylib's two sub-buffers still queued
++}
++void UpdateAudioStream(AudioStream stream, const void *data, int frameCount)
++{
++    Voice *v = voiceOf(stream);
++    if (!v || !data || frameCount <= 0)
++        return;
++    const auto *in = static_cast<const int16_t *>(data);
++    std::lock_guard<std::mutex> lk(g_audioMx);
++    for (int i = 0; i < frameCount; ++i)
++    {
++        const int16_t l = in[v->channels == 1 ? i : i * 2];
++        const int16_t r = in[v->channels == 1 ? i : i * 2 + 1];
++        v->fifo.push_back(l);
++        v->fifo.push_back(r);
++    }
++}
++Sound LoadSoundFromWave(Wave wave)
++{
++    Sound snd{};
++    if (!wave.data || wave.frameCount == 0 || wave.sampleSize != 16)
++        return snd;
++    auto *v = new Voice();
++    v->sound = true;
++    v->rate = wave.sampleRate ? wave.sampleRate : kOutRate;
++    const auto *in = static_cast<const int16_t *>(wave.data);
++    v->pcm.resize(wave.frameCount);
++    for (unsigned i = 0; i < wave.frameCount; ++i)
++        v->pcm[i] = wave.channels == 2 ? static_cast<int16_t>((in[i * 2] + in[i * 2 + 1]) / 2) : in[i];
++    {
++        std::lock_guard<std::mutex> lk(g_audioMx);
++        g_voices.push_back(v);
++    }
++    snd.stream.buffer = reinterpret_cast<rAudioBuffer *>(v);
++    snd.stream.sampleRate = v->rate;
++    snd.stream.sampleSize = 16;
++    snd.stream.channels = 1;
++    snd.frameCount = wave.frameCount;
++    return snd;
++}
++void UnloadSound(Sound sound) { UnloadAudioStream(sound.stream); }
++void PlaySound(Sound sound) { if (Voice *v = voiceOf(sound.stream)) { std::lock_guard<std::mutex> lk(g_audioMx); v->pos = 0.0; v->playing = true; } }
++void StopSound(Sound sound) { if (Voice *v = voiceOf(sound.stream)) { std::lock_guard<std::mutex> lk(g_audioMx); v->playing = false; } }
++bool IsSoundPlaying(Sound sound) { Voice *v = voiceOf(sound.stream); if (!v) return false; std::lock_guard<std::mutex> lk(g_audioMx); return v->playing; }
++void SetSoundPitch(Sound sound, float pitch) { if (Voice *v = voiceOf(sound.stream)) { std::lock_guard<std::mutex> lk(g_audioMx); v->pitch = pitch > 0.0f ? pitch : 1.0f; } }
++void SetSoundVolume(Sound sound, float volume) { if (Voice *v = voiceOf(sound.stream)) { std::lock_guard<std::mutex> lk(g_audioMx); v->volume = volume; } }
++
++// ---- rlgl -----------------------------------------------------------------------------------------------------------
++void rlActiveDrawBuffers(int count) { (void)count; }
++void rlActiveTextureSlot(int slot) { (void)slot; }
++void rlBegin(int mode) { (void)mode; }
++bool rlCheckRenderBatchLimit(int vCount) { (void)vCount; return false; }
++void rlClearColor(unsigned char r, unsigned char g, unsigned char b, unsigned char a) { (void)r; (void)g; (void)b; (void)a; }
++void rlClearScreenBuffers(void) {}
++void rlColor4ub(unsigned char r, unsigned char g, unsigned char b, unsigned char a) { (void)r; (void)g; (void)b; (void)a; }
++void rlColorMask(bool r, bool g, bool b, bool a) { (void)r; (void)g; (void)b; (void)a; }
++void rlDisableBackfaceCulling(void) {}
++void rlDisableColorBlend(void) {}
++void rlDisableDepthMask(void) {}
++void rlDisableDepthTest(void) {}
++void rlDisableFramebuffer(void) {}
++void rlDisableScissorTest(void) {}
++void rlDisableShader(void) {}
++void rlDisableTexture(void) {}
++void rlDrawRenderBatchActive(void) {}
++void rlEnableBackfaceCulling(void) {}
++void rlEnableColorBlend(void) {}
++void rlEnableDepthMask(void) {}
++void rlEnableDepthTest(void) {}
++void rlEnableFramebuffer(unsigned int id) { (void)id; }
++void rlEnableScissorTest(void) {}
++void rlEnd(void) {}
++void rlFramebufferAttach(unsigned int fboId, unsigned int texId, int attachType, int texType, int mipLevel)
++{
++    (void)fboId; (void)texId; (void)attachType; (void)texType; (void)mipLevel;
++}
++bool rlFramebufferComplete(unsigned int id) { (void)id; return true; }
++unsigned int rlGetShaderIdDefault(void) { return 1; }
++int *rlGetShaderLocsDefault(void) { return g_defaultLocs; }
++unsigned int rlLoadFramebuffer(void) { return g_nextId++; }
++void rlLoadIdentity(void) {}
++unsigned int rlLoadTexture(const void *data, int width, int height, int format, int mipmapCount)
++{
++    (void)data; (void)width; (void)height; (void)format; (void)mipmapCount;
++    return g_nextId++;
++}
++void rlMatrixMode(int mode) { (void)mode; }
++void rlNormal3f(float x, float y, float z) { (void)x; (void)y; (void)z; }
++void rlOrtho(double left, double right, double bottom, double top, double znear, double zfar)
++{
++    (void)left; (void)right; (void)bottom; (void)top; (void)znear; (void)zfar;
++}
++void *rlReadTexturePixels(unsigned int id, int width, int height, int format)
++{
++    (void)id;
++    if (width <= 0 || height <= 0)
++        return nullptr;
++    return std::calloc(static_cast<size_t>(GetPixelDataSize(width, height, format)), 1);
++}
++void rlScalef(float x, float y, float z) { (void)x; (void)y; (void)z; }
++void rlScissor(int x, int y, int width, int height) { (void)x; (void)y; (void)width; (void)height; }
++void rlSetBlendFactors(int glSrcFactor, int glDstFactor, int glEquation) { (void)glSrcFactor; (void)glDstFactor; (void)glEquation; }
++void rlSetBlendFactorsSeparate(int glSrcRGB, int glDstRGB, int glSrcAlpha, int glDstAlpha, int glEqRGB, int glEqAlpha)
++{
++    (void)glSrcRGB; (void)glDstRGB; (void)glSrcAlpha; (void)glDstAlpha; (void)glEqRGB; (void)glEqAlpha;
++}
++void rlSetBlendMode(int mode) { (void)mode; }
++void rlSetFramebufferHeight(int height) { (void)height; }
++void rlSetFramebufferWidth(int width) { (void)width; }
++void rlSetShader(unsigned int id, int *locs) { (void)id; (void)locs; }
++void rlSetTexture(unsigned int id) { (void)id; }
++void rlTexCoord2f(float x, float y) { (void)x; (void)y; }
++void rlTextureParameters(unsigned int id, int param, int value) { (void)id; (void)param; (void)value; }
++void rlTranslatef(float x, float y, float z) { (void)x; (void)y; (void)z; }
++void rlVertex2f(float x, float y) { (void)x; (void)y; }
++void rlVertex3f(float x, float y, float z) { (void)x; (void)y; (void)z; }
++void rlViewport(int x, int y, int width, int height) { (void)x; (void)y; (void)width; (void)height; }
++
++// The vendored rlgl's statistics, read by the runtime's [fps] line.
++unsigned long long g_rlglDrawCalls = 0, g_rlglBatchFlushes = 0;
++double g_rlglFlushNs = 0.0;
++unsigned long long g_rlglVbRingWaits = 0, g_rlglVbRingWraps = 0, g_rlglVbRingBytes = 0, g_rlglVbRingMvpSkips = 0;
++int g_rlglVbRingOn = 0;
++}
+diff -ruN a/ps2xRuntime/web/glad_null.cpp b/ps2xRuntime/web/glad_null.cpp
+--- a/ps2xRuntime/web/glad_null.cpp	1969-12-31 18:00:00
++++ b/ps2xRuntime/web/glad_null.cpp	2026-10-19 04:08:26
+@@ -0,0 +1,121 @@
++/* [web] The browser build has no desktop GL: the GL loader symbols the (never executed) GL renderer code
++   references are null. Generated from the runtime's undefined symbols. */
++extern "C" {
++// Desktop GL entry points WebGL 2 does not have, called directly by the (never executed) GL renderer code.
++void glGetTexImage(unsigned target, int level, unsigned format, unsigned type, void *pixels) { (void)target; (void)level; (void)format; (void)type; (void)pixels; }
++void glDrawBuffer(unsigned mode) { (void)mode; }
++// Emscripten's libc has no pthread_setname_np (thread names are cosmetic here).
++int pthread_setname_np(void *thread, const char *name) { (void)thread; (void)name; return 0; }
++void glGetTexLevelParameteriv(unsigned target, int level, unsigned pname, int *params) { (void)target; (void)level; (void)pname; if (params) *params = 0; }
++int gladLoadGL(void *load) { (void)load; return 0; }
++int GLAD_GL_ARB_ES3_compatibility = 0;
++int GLAD_GL_EXT_texture_compression_s3tc = 0;
++int GLAD_GL_KHR_texture_compression_astc_hdr = 0;
++int GLAD_GL_KHR_texture_compression_astc_ldr = 0;
++void *glad_glActiveTexture = 0;
++void *glad_glAttachShader = 0;
++void *glad_glBindAttribLocation = 0;
++void *glad_glBindBuffer = 0;
++void *glad_glBindFramebuffer = 0;
++void *glad_glBindRenderbuffer = 0;
++void *glad_glBindTexture = 0;
++void *glad_glBindVertexArray = 0;
++void *glad_glBlendEquation = 0;
++void *glad_glBlendEquationSeparate = 0;
++void *glad_glBlendFunc = 0;
++void *glad_glBlendFuncSeparate = 0;
++void *glad_glBlitFramebuffer = 0;
++void *glad_glBufferData = 0;
++void *glad_glBufferStorage = 0;
++void *glad_glBufferSubData = 0;
++void *glad_glCheckFramebufferStatus = 0;
++void *glad_glClear = 0;
++void *glad_glClearColor = 0;
++void *glad_glClearDepth = 0;
++void *glad_glClientWaitSync = 0;
++void *glad_glColorMask = 0;
++void *glad_glCompileShader = 0;
++void *glad_glCompressedTexImage2D = 0;
++void *glad_glCreateProgram = 0;
++void *glad_glCreateShader = 0;
++void *glad_glCullFace = 0;
++void *glad_glDeleteBuffers = 0;
++void *glad_glDeleteFramebuffers = 0;
++void *glad_glDeleteProgram = 0;
++void *glad_glDeleteRenderbuffers = 0;
++void *glad_glDeleteShader = 0;
++void *glad_glDeleteSync = 0;
++void *glad_glDeleteTextures = 0;
++void *glad_glDeleteVertexArrays = 0;
++void *glad_glDepthFunc = 0;
++void *glad_glDepthMask = 0;
++void *glad_glDetachShader = 0;
++void *glad_glDisable = 0;
++void *glad_glDisableVertexAttribArray = 0;
++void *glad_glDrawArrays = 0;
++void *glad_glDrawArraysInstanced = 0;
++void *glad_glDrawBuffers = 0;
++void *glad_glDrawElements = 0;
++void *glad_glDrawElementsInstanced = 0;
++void *glad_glEnable = 0;
++void *glad_glEnableVertexAttribArray = 0;
++void *glad_glFenceSync = 0;
++void *glad_glFramebufferRenderbuffer = 0;
++void *glad_glFramebufferTexture2D = 0;
++void *glad_glFrontFace = 0;
++void *glad_glGenBuffers = 0;
++void *glad_glGenerateMipmap = 0;
++void *glad_glGenFramebuffers = 0;
++void *glad_glGenRenderbuffers = 0;
++void *glad_glGenTextures = 0;
++void *glad_glGenVertexArrays = 0;
++void *glad_glGetAttribLocation = 0;
++void *glad_glGetError = 0;
++void *glad_glGetFloatv = 0;
++void *glad_glGetFramebufferAttachmentParameteriv = 0;
++void *glad_glGetIntegerv = 0;
++void *glad_glGetProgramInfoLog = 0;
++void *glad_glGetProgramiv = 0;
++void *glad_glGetShaderInfoLog = 0;
++void *glad_glGetShaderiv = 0;
++void *glad_glGetTexImage = 0;
++void *glad_glGetUniformLocation = 0;
++void *glad_glLineWidth = 0;
++void *glad_glLinkProgram = 0;
++void *glad_glMapBufferRange = 0;
++void *glad_glPixelStorei = 0;
++void *glad_glPolygonMode = 0;
++void *glad_glReadPixels = 0;
++void *glad_glRenderbufferStorage = 0;
++void *glad_glScissor = 0;
++void *glad_glShaderSource = 0;
++void *glad_glTexImage2D = 0;
++void *glad_glTexParameterf = 0;
++void *glad_glTexParameteri = 0;
++void *glad_glTexParameteriv = 0;
++void *glad_glTexSubImage2D = 0;
++void *glad_glUniform1fv = 0;
++void *glad_glUniform1i = 0;
++void *glad_glUniform1iv = 0;
++void *glad_glUniform1uiv = 0;
++void *glad_glUniform2fv = 0;
++void *glad_glUniform2iv = 0;
++void *glad_glUniform2uiv = 0;
++void *glad_glUniform3fv = 0;
++void *glad_glUniform3iv = 0;
++void *glad_glUniform3uiv = 0;
++void *glad_glUniform4f = 0;
++void *glad_glUniform4fv = 0;
++void *glad_glUniform4iv = 0;
++void *glad_glUniform4uiv = 0;
++void *glad_glUniformMatrix4fv = 0;
++void *glad_glUnmapBuffer = 0;
++void *glad_glUseProgram = 0;
++void *glad_glVertexAttrib1fv = 0;
++void *glad_glVertexAttrib2fv = 0;
++void *glad_glVertexAttrib3fv = 0;
++void *glad_glVertexAttrib4fv = 0;
++void *glad_glVertexAttribDivisor = 0;
++void *glad_glVertexAttribPointer = 0;
++void *glad_glViewport = 0;
++}
+diff -ruN a/ps2xRuntime/web/include/execinfo.h b/ps2xRuntime/web/include/execinfo.h
+--- a/ps2xRuntime/web/include/execinfo.h	1969-12-31 18:00:00
++++ b/ps2xRuntime/web/include/execinfo.h	2026-10-19 03:55:15
+@@ -0,0 +1,11 @@
++// [web] glibc's backtrace API for the browser build (the runtime only uses it in diagnostics): no frames.
++#pragma once
++#ifdef __cplusplus
++extern "C" {
++#endif
++static inline int backtrace(void **buffer, int size) { (void)buffer; (void)size; return 0; }
++static inline char **backtrace_symbols(void *const *buffer, int size) { (void)buffer; (void)size; return 0; }
++static inline void backtrace_symbols_fd(void *const *buffer, int size, int fd) { (void)buffer; (void)size; (void)fd; }
++#ifdef __cplusplus
++}
++#endif
+diff -ruN a/ps2xRuntime/web/known_shaders.inc b/ps2xRuntime/web/known_shaders.inc
+--- a/ps2xRuntime/web/known_shaders.inc	1969-12-31 18:00:00
++++ b/ps2xRuntime/web/known_shaders.inc	2026-10-19 03:51:13
+@@ -0,0 +1,12 @@
++// Shader variants (Play!'s SHADERCAPS) this game uses, compiled during the loading screens so a
++// draw never waits for one. Collected from "[gsh] new shader" log lines (boot, menus, matches).
++    0x0000000000000000ull, 0x0000000000000424ull, 0x0000000000000524ull, 0x0000000000002424ull,
++    0x0000000000002524ull, 0x0000000000002c00ull, 0x0000000000002c24ull, 0x0000000000002e00ull,
++    0x0000000000002f00ull, 0x0000000000002f03ull, 0x0000000000002f27ull, 0x0000000006002f00ull,
++    0x0000000007002f00ull, 0x000000001a002424ull, 0x000000001a002500ull, 0x000000001a002524ull,
++    0x000000001a002c00ull, 0x000000001a002c24ull, 0x000000001a002c27ull, 0x000000001a002c48ull,
++    0x000000001a002e00ull, 0x000000001a002e24ull, 0x000000001a002e48ull, 0x000000001a002f00ull,
++    0x000000001a002f24ull, 0x000000001a006524ull, 0x000000001a006f24ull, 0x0000000060002c00ull,
++    0x0000000060002c03ull, 0x0000000060002c27ull, 0x0000004000002500ull, 0x0000004000002503ull,
++    0x0000004000002527ull, 0x000000401a002500ull, 0x000000401a002524ull, 0x000000401a002548ull,
++    0x000000401a006524ull,
+diff -ruN a/ps2xRuntime/web/library_fetch_stream.js b/ps2xRuntime/web/library_fetch_stream.js
+--- a/ps2xRuntime/web/library_fetch_stream.js	1969-12-31 18:00:00
++++ b/ps2xRuntime/web/library_fetch_stream.js	2026-10-19 03:51:13
+@@ -0,0 +1,289 @@
++/**
++ * WasmFS fetch backend for the game disc, replacing Emscripten's (src/lib/libwasmfs_fetch.js):
++ * the same on-demand HTTP Range reads, plus
++ *  - read-ahead: sequential reads (streamed music, videos, loading) fetch the next chunks in
++ *    the background, several requests at once, so the game rarely waits for the network;
++ *  - one request per chunk: a read waits for a chunk already on its way instead of asking again;
++ *  - a bounded cache (least recently used chunks go), instead of keeping every chunk ever read;
++ *  - a persistent copy in the browser's Cache Storage: what was played once is read locally the
++ *    next time (keyed by the server's ETag, so a changed file is fetched again).
++ */
++
++addToLibrary({
++  $wasmFS$JSMemoryRanges: {},
++
++  _wasmfs_create_fetch_backend_js__deps: [
++    '$wasmFS$backends',
++    '$wasmFS$JSMemoryRanges',
++    '_wasmfs_fetch_get_file_url',
++    '_wasmfs_fetch_get_chunk_size',
++  ],
++  _wasmfs_create_fetch_backend_js: async function(backend) {
++    const READ_AHEAD_CHUNKS = 8;     // chunks fetched ahead of a sequential read
++    const STREAMS = 4;               // interleaved sequential readers followed at once (video, audio...)
++    const MAX_CACHED_CHUNKS = 384;   // per file (x chunk size, 1 MB here)
++
++    // Persistent chunk store (absent in some private modes: then memory only).
++    var diskCache = (typeof caches !== 'undefined') ? caches.open('ps2x-disc-v1').catch(() => null) : Promise.resolve(null);
++
++    // fetch() with a deadline and retries: on phones a request can stall for good (a dead
++    // connection after a network change), and with no timeout the game waited on it forever
++    // ("starting the game..." that never ends). A 404 is final; anything else is retried.
++    // The deadline is on progress, not on the whole request: a phone's connection can stall
++    // mid-transfer, and a whole-request deadline (19 s for a 1 MB chunk) let one stalled read
++    // hold the game's music for close to two minutes over its retries.
++    const STALL_MS = 6000;
++    async function fetchRetry(url, init, expectBytes) {
++      for (var attempt = 1; ; attempt++) {
++        var abort = new AbortController();
++        var timer = 0;
++        var stalled = () => { clearTimeout(timer); timer = setTimeout(() => abort.abort(), STALL_MS); };
++        stalled();
++        try {
++          // cache: 'no-store': the chunks are kept in Cache Storage already, and Chrome's HTTP
++          // cache makes requests for one URL queue behind a single writer (up to 20 s each):
++          // on a cold start the disc reads stalled behind each other until they timed out.
++          var response = await fetch(url, Object.assign({cache: 'no-store'}, init, {signal: abort.signal}));
++          if (response.status === 404) throw response;
++          if (!response.ok) throw new Error(`HTTP ${response.status}`);
++          if (init.method === 'HEAD') return response;
++          var bytes;
++          if (response.body && expectBytes) {
++            // Read as it arrives: every piece pushes the stall deadline back
++            bytes = new Uint8Array(expectBytes);
++            var got = 0, reader = response.body.getReader();
++            for (;;) {
++              stalled();
++              var part = await reader.read();
++              if (part.done) break;
++              if (got + part.value.byteLength > expectBytes) throw new Error(`long read`);
++              bytes.set(part.value, got);
++              got += part.value.byteLength;
++            }
++            if (got !== expectBytes) throw new Error(`short read ${got}/${expectBytes}`);
++          } else {
++            bytes = new Uint8Array(await response.arrayBuffer());
++            if (expectBytes && bytes.byteLength !== expectBytes) throw new Error(`short read ${bytes.byteLength}/${expectBytes}`);
++          }
++          return bytes;
++        } catch (e) {
++          if (e && e.status === 404) throw e;
++          if (attempt >= 6) throw {status: 0};
++          err(`[disc] ${url.split('/').pop()}: ${e && e.name === 'AbortError' ? 'stalled' : e}; retrying (${attempt})`);
++          await new Promise((r) => setTimeout(r, 300 * attempt));
++        } finally {
++          clearTimeout(timer);
++        }
++      }
++    }
++
++    function chunkKey(info, i) {
++      return `${info.url}?ps2x-chunk=${i}&size=${info.chunkSize}&v=${encodeURIComponent(info.version)}`;
++    }
++
++    function fileUrl(file) {
++      var name = UTF8ToString(__wasmfs_fetch_get_file_url(file));
++      if (name.indexOf('://') !== -1) return name;
++      try {
++        return new URL(name, self.location.origin).toString();
++      } catch (_e) {
++        throw {status: 404};
++      }
++    }
++
++    // First access: size and range support (HEAD), or the whole file when it is small or the
++    // server can't do ranges.
++    async function openFile(file) {
++      var info = wasmFS$JSMemoryRanges[file];
++      if (info) return info.ready ? info : await info.opening;
++      var url = fileUrl(file);
++      var chunkSize = __wasmfs_fetch_get_chunk_size(file);
++      info = wasmFS$JSMemoryRanges[file] = {url, chunkSize, size: 0, chunks: new Map(), pending: new Map(),
++                                            ready: false, streams: []};
++      info.opening = (async () => {
++        var head = await fetchRetry(url, {method: 'HEAD', headers: {'Range': 'bytes=0-'}});
++        var length = head.ok && head.headers.has('Content-Length') ? parseInt(head.headers.get('Content-Length'), 10) : 0;
++        if (head.ok && head.headers.get('Accept-Ranges') == 'bytes' && length > chunkSize * 2) {
++          info.size = length;
++          info.version = head.headers.get('ETag') || head.headers.get('Last-Modified') || String(length);
++        } else {
++          var data = await fetchRetry(url, {});
++          info.size = data.byteLength;
++          info.chunkSize = Math.max(1, data.byteLength);
++          info.chunks.set(0, data);
++        }
++        info.ready = true;
++        return info;
++      })();
++      try {
++        return await info.opening;
++      } catch (e) {
++        wasmFS$JSMemoryRanges[file] = undefined;
++        throw e;
++      }
++    }
++
++    function chunkCount(info) {
++      return Math.ceil(info.size / info.chunkSize);
++    }
++
++    // Fetches chunks [first, last] that are neither cached nor on their way, as one request.
++    function requestChunks(info, first, last) {
++      last = Math.min(last, chunkCount(info) - 1);
++      while (first <= last && (info.chunks.has(first) || info.pending.has(first))) first++;
++      while (last >= first && (info.chunks.has(last) || info.pending.has(last))) last--;
++      if (first > last) return;
++      // One promise per chunk, settled as soon as that chunk is in: a read never waits for its
++      // neighbours in the same request.
++      var settle = new Map();
++      for (var i = first; i <= last; i++) {
++        let resolve, reject;
++        var promise = new Promise((ok, fail) => { resolve = ok; reject = fail; });
++        promise.catch(() => {});
++        settle.set(i, {resolve, reject});
++        info.pending.set(i, promise);
++      }
++      var arrived = (i, chunk) => {
++        if (!info.chunks.has(i)) info.chunks.set(i, chunk);
++        info.pending.delete(i);
++        settle.get(i).resolve();
++        settle.delete(i);
++      };
++      (async () => {
++        // Chunks already in the browser's store come from there; the rest from the network.
++        var cache = await diskCache;
++        var missing = [];
++        for (var i = first; i <= last; i++) {
++          var hit = cache ? await cache.match(chunkKey(info, i)).catch(() => null) : null;
++          if (hit) arrived(i, new Uint8Array(await hit.arrayBuffer()));
++          else missing.push(i);
++        }
++        while (missing.length) {
++          var a = missing[0], b = a;
++          while (missing.length > b - a + 1 && missing[b - a + 1] === b + 1) b++;
++          missing.splice(0, b - a + 1);
++          var start = a * info.chunkSize;
++          var end = Math.min((b + 1) * info.chunkSize, info.size);
++          var bytes = await fetchRetry(info.url, {headers: {'Range': `bytes=${start}-${end - 1}`}}, end - start);
++          for (var j = a; j <= b; j++) {
++            var chunk = bytes.slice(j * info.chunkSize - start, (j + 1) * info.chunkSize - start);
++            arrived(j, chunk);
++            if (cache) cache.put(chunkKey(info, j), new Response(chunk)).catch(() => {});
++          }
++        }
++      })().catch((error) => {
++        for (var [i, s] of settle) { info.pending.delete(i); s.reject(error); }
++      });
++    }
++
++    function evict(info, keepFrom, keepTo) {
++      // Maps keep insertion order and touch() re-inserts on use: the first ones are the oldest.
++      for (var key of info.chunks.keys()) {
++        if (info.chunks.size <= MAX_CACHED_CHUNKS) break;
++        if (key >= keepFrom && key <= keepTo) continue;
++        info.chunks.delete(key);
++      }
++    }
++
++    function touch(info, i) {
++      var chunk = info.chunks.get(i);
++      info.chunks.delete(i);
++      info.chunks.set(i, chunk);
++      return chunk;
++    }
++
++    async function getFileRange(info, offset, len) {
++      if (info.chunks.size === 1 && info.chunkSize >= info.size) return; // whole file
++      var first = (offset / info.chunkSize) | 0;
++      var last = ((offset + len - 1) / info.chunkSize) | 0;
++      // Sequential reading? The game may interleave several streams (a video, its sound, music):
++      // a read continues one of them when it starts where that one ended (or in the same chunk).
++      var stream = info.streams.find((st) => first === st.chunk || first === st.chunk + 1);
++      if (stream) {
++        info.streams.splice(info.streams.indexOf(stream), 1);
++        // Only moving on to a new chunk counts: many small reads inside one chunk are not a stream
++        if (last > stream.chunk) stream.streak++;
++      } else {
++        stream = {chunk: last, streak: 0};
++        if (info.streams.length >= STREAMS) info.streams.shift();
++      }
++      stream.chunk = last;
++      info.streams.push(stream);
++      requestChunks(info, first, last);
++      // Ahead of the reader, as far as it has proven to go: 1 chunk, then 2, then the full
++      // read-ahead for long streams (videos). The next chunk goes in its own request, first.
++      var ahead = stream.streak >= 4 ? READ_AHEAD_CHUNKS : Math.min(stream.streak, 2);
++      if (ahead >= 1) requestChunks(info, last + 1, last + 1);
++      if (ahead >= 2) requestChunks(info, last + 2, last + ahead);
++      var waitStart = 0;
++      for (var i = first; i <= last; i++) {
++        var hedge = null, failure = null;
++        while (!info.chunks.has(i)) {
++          waitStart ||= performance.now();
++          if (!info.pending.has(i)) requestChunks(info, i, i);
++          // The game is waiting on it: if it is slow (often inside a read-ahead request of
++          // several chunks, or on a connection that stalled), ask for this chunk alone as well,
++          // and take whichever answer comes first.
++          await Promise.race([info.pending.get(i).catch((e) => { failure = e; }), hedge || new Promise(() => {}),
++                              new Promise((r) => setTimeout(r, 1500))]);
++          if (failure && failure.status === 404) throw failure;
++          if (!info.chunks.has(i) && !hedge && performance.now() - waitStart >= 1500) {
++            let index = i;
++            var start = index * info.chunkSize, end = Math.min(start + info.chunkSize, info.size);
++            hedge = fetchRetry(info.url, {headers: {'Range': `bytes=${start}-${end - 1}`}}, end - start)
++              .then((chunk) => { if (!info.chunks.has(index)) info.chunks.set(index, chunk); })
++              .catch(() => {});
++          }
++        }
++      }
++      if (waitStart) {
++        // The game had to wait for the network: count it (and show long waits with ?debug)
++        var waited = performance.now() - waitStart;
++        info.waits = (info.waits || 0) + 1;
++        info.waitedMs = (info.waitedMs || 0) + waited;
++        if (waited > 20) err(`[disc] waited ${waited.toFixed(0)} ms for chunk ${first}-${last} (stream streak ${stream.streak}, ${info.waits} waits, ${info.waitedMs.toFixed(0)} ms total)`);
++      }
++      evict(info, first, last + READ_AHEAD_CHUNKS);
++    }
++
++    wasmFS$backends[backend] = {
++      allocFile: async (file) => { /* nop */ },
++      freeFile: async (file) => {
++        wasmFS$JSMemoryRanges[file] = undefined;
++      },
++      write: async (file, buffer, length, offset) => {
++        console.error('fetch backend: files are read-only');
++      },
++      read: async (file, buffer, length, offset) => {
++        if (offset < 0 || length <= 0) return 0;
++        var info;
++        try {
++          info = await openFile(file);
++          length = Math.min(length, info.size - offset);
++          if (length <= 0) return 0;
++          await getFileRange(info, offset, length);
++        } catch (failedResponse) {
++          return failedResponse.status === 404 ? -{{{ cDefs.ENOENT }}} : -{{{ cDefs.EBADF }}};
++        }
++        var chunkSize = info.chunkSize;
++        var first = (offset / chunkSize) | 0;
++        var last = ((offset + length - 1) / chunkSize) | 0;
++        for (var i = first; i <= last; i++) {
++          var chunk = touch(info, i);
++          var chunkStart = i * chunkSize;
++          var start = Math.max(chunkStart, offset);
++          var end = Math.min(chunkStart + chunkSize, offset + length);
++          HEAPU8.set(chunk.subarray(start - chunkStart, end - chunkStart), buffer + (start - offset));
++        }
++        return length;
++      },
++      getSize: async (file) => {
++        try {
++          return (await openFile(file)).size;
++        } catch (failedResponse) {
++          return 0;
++        }
++      },
++    };
++  },
++});
+diff -ruN a/ps2xRuntime/web/play_gs_host.cpp b/ps2xRuntime/web/play_gs_host.cpp
+--- a/ps2xRuntime/web/play_gs_host.cpp	1969-12-31 18:00:00
++++ b/ps2xRuntime/web/play_gs_host.cpp	2026-10-19 04:50:29
+@@ -0,0 +1,1674 @@
++// GS host for the browser build: the consumer side of the live ring (gs_dump_writer.cpp) running
++// on the page's main thread, drawing with the GS, VIF1/VU1 and GIF of the Play! emulator
++// (https://github.com/jpd002/Play-, BSD-2-Clause): GSH_OpenGL on WebGL2, VU1 on Play!'s
++// WebAssembly JIT.
++//
++// It does what pcsx2-gsrunner -live does with the same stream (GSDumpReplayer.cpp):
++//   header + privileged GS registers, then packets
++//   Transfer(path, data) -> GIF path 1/2/3      VSync(field) -> vblank, flip
++//   Registers(8 KB)      -> privileged regs     ReadFIFO2    -> local->host transfer
++//   0x10 VIF1 stream     -> VIF1 (UNPACK/MPG fill VU1, MSCAL runs it, XGKICK/DIRECT reach the GIF)
++//   0x11 VIF1 register   -> FBRST / ERR / MARK
++// It runs once per browser frame (requestAnimationFrame) and never blocks: whole packets only,
++// the rest waits for the next frame. The game side runs on workers and blocks on a full ring.
++// Keyboard and gamepad are read here and published through the ring header, like the Mac host.
++
++#include "../src/lib/ps2_live_ring.h"
++
++#include <emscripten.h>
++#include <emscripten/html5.h>
++#include <emscripten/threading.h>
++
++#include "BasicBlock.h"
++#include "FrameDump.h"
++#include "Jitter_CodeGen_Wasm.h"
++#include "MIPS.h"
++#include "MemoryUtils.h"
++#include "Ps2Const.h"
++#include "ee/DMAC.h"
++#include "ee/GIF.h"
++#include "ee/INTC.h"
++#include "ee/MA_VU.h"
++#include "ee/Vif.h"
++#include "ee/Vpu.h"
++#include "ee/VuExecutor.h"
++#include "gs/GSH_OpenGL/GSH_OpenGL.h"
++#include "gs/GsPixelFormats.h"
++#include "DefaultAppConfig.h" // CAppConfig::GetBasePath, defined once per Play! app
++
++#include <pthread.h>
++#include <unistd.h>
++
++#include <algorithm>
++#include <array>
++#include <map>
++#include <atomic>
++#include <cstdio>
++#include <condition_variable>
++#include <cstdlib>
++#include <deque>
++#include <mutex>
++#include <cstring>
++#include <iterator>
++#include <memory>
++#include <string>
++#include <vector>
++
++extern "C" uint32 LWL_Proxy(uint32, uint32, CMIPS*);
++extern "C" uint32 LWR_Proxy(uint32, uint32, CMIPS*);
++extern "C" uint64 LDL_Proxy(uint32, uint64, CMIPS*);
++extern "C" uint64 LDR_Proxy(uint32, uint64, CMIPS*);
++extern "C" void SWL_Proxy(uint32, uint32, CMIPS*);
++extern "C" void SWR_Proxy(uint32, uint32, CMIPS*);
++extern "C" void SDL_Proxy(uint32, uint64, CMIPS*);
++extern "C" void SDR_Proxy(uint32, uint64, CMIPS*);
++
++EM_JS_DEPS(ps2xShaderList, "$stringToNewUTF8,$UTF8ToString");
++
++// The shader list kept by an earlier session ("hex,hex,..."), read from IndexedDB (GL thread)
++extern "C" EMSCRIPTEN_KEEPALIVE void ps2xPrecompileShaderList(char* list);
++
++namespace
++{
++	// PCSX2 GS dump packet types and the live extensions (gs_dump_writer.cpp).
++	constexpr uint8_t kTypeTransfer = 0;
++	constexpr uint8_t kTypeVSync = 1;
++	constexpr uint8_t kTypeReadFifo2 = 2;
++	constexpr uint8_t kTypeRegisters = 3;
++	constexpr uint8_t kTypeLiveVif1 = 0x10;
++	constexpr uint8_t kTypeLiveVif1Reg = 0x11;
++	constexpr uint8_t kPath2 = 1, kPath3 = 2, kPath1New = 3;
++	constexpr uint32_t kPrivRegsSize = 8192;
++
++	// Where VIF1 data is staged in the emulated EE RAM for CVif::ReceiveDMA (end of the 32 MB).
++	constexpr uint32_t kVifStageAddr = 0x01F00000;
++	constexpr uint32_t kVifStageSize = 0x00100000;
++
++	class CGSH_Web : public CGSH_OpenGL
++	{
++	public:
++		explicit CGSH_Web(EMSCRIPTEN_WEBGL_CONTEXT_HANDLE context)
++		    : CGSH_OpenGL(false) // not threaded: everything runs on the page's main thread
++		    , m_context(context)
++		{
++		}
++
++		// Runs the GS calls queued by the GIF / vblank (draws, flip) on this thread.
++		void Pump()
++		{
++			ProcessPendingCalls();
++		}
++
++	protected:
++		void InitializeImpl() override
++		{
++			emscripten_webgl_make_context_current(m_context);
++			CGSH_OpenGL::InitializeImpl();
++		}
++	public:
++		bool debug = false;
++		uint64_t regCounts[0x80] = {};
++		bool traceOn = false;
++		uint32_t traceVertexRun = 0, traceLines = 0, traceWb = 0;
++		std::map<uint64, uint64_t> regValues[0x80];
++
++	protected:
++		void WriteRegisterImpl(uint8 reg, uint64 value) override
++		{
++			if(!debug)
++			{
++				CGSH_OpenGL::WriteRegisterImpl(reg, value);
++				return;
++			}
++			regCounts[reg & 0x7F]++;
++			if(traceOn)
++			{
++				const bool vertex = reg == 0x01 || reg == 0x02 || reg == 0x03 || reg == 0x04 || reg == 0x05 || reg == 0x0C || reg == 0x0D;
++				if(vertex && traceVertexRun > 8)
++					traceVertexRun++;
++				else
++				{
++					if(!vertex && traceVertexRun > 8)
++						std::printf("[trace]   ... %u vertex writes\n", traceVertexRun - 8);
++					traceVertexRun = vertex ? traceVertexRun + 1 : 0;
++					if(traceLines++ < 4000)
++						std::printf("[trace] %02x %016llx%s\n", reg, (unsigned long long)value, m_framebufferWriteBacks != traceWb ? " (after write-back)" : "");
++					traceWb = m_framebufferWriteBacks;
++				}
++			}
++			if(reg == 0x06 || reg == 0x07 || reg == 0x4C || reg == 0x4D || reg == 0x4E || reg == 0x4F || reg == 0x00 || reg == 0x50 || reg == 0x52)
++				regValues[reg][value]++;
++			CGSH_OpenGL::WriteRegisterImpl(reg, value);
++		}
++		void PresentBackbuffer() override
++		{
++			// The browser presents the canvas when the animation frame returns.
++		}
++
++	private:
++		EMSCRIPTEN_WEBGL_CONTEXT_HANDLE m_context;
++	};
++
++	struct alignas(16) Host
++	{
++		ps2live::RingHeader* ring = nullptr;
++		uint8_t* ringData = nullptr;
++		uint64_t ringCapacity = 0;
++		bool headerDone = false;
++
++		uint8* ram = nullptr;
++		uint8* spr = nullptr;
++		uint8* vuMem0 = nullptr;
++		uint8* vuMem1 = nullptr;
++		uint8* microMem1 = nullptr;
++
++		CMIPS ee{MEMORYMAP_ENDIAN_LSBF, true};
++		CMIPS vu1{MEMORYMAP_ENDIAN_LSBF};
++		CMA_VU maVu1{PS2::VUMEM1SIZE - 1};
++		CINTC intc;
++		std::unique_ptr<CDMAC> dmac;
++		CGSHandler* gs = nullptr;
++		CGSH_Web* gsWeb = nullptr;
++		std::unique_ptr<CGIF> gif;
++		std::shared_ptr<CVpu> vpu1;
++
++		std::vector<uint8_t> packet;
++		std::vector<uint8_t> vifCarry; // VIF1 bytes not yet a whole quadword
++		std::vector<uint8_t> privRegs = std::vector<uint8_t>(kPrivRegsSize, 0);
++		uint64_t lastSmode2 = ~0ull;
++
++		uint32_t frames = 0;
++		double statsStart = 0.0;
++		// Debug counters (printed every 2 s from inside the packet loop).
++		uint64_t nVif = 0, nVifReg = 0, nXfer = 0, nVsync = 0, nRegs = 0, nFifo = 0;
++		double vuMs = 0.0, gsMs = 0.0, debugStart = 0.0;
++		double glMs = 0.0, glMaxMs = 0.0, rafMaxMs = 0.0, lastRaf = 0.0;
++		uint32_t rafs = 0;
++		uint32_t hdLoadedBefore = 0;
++		uint64_t vuSlices = 0;
++		uint64_t drawCalls = 0;
++		uint64_t totalVsyncs = 0;
++		double vblankWaitMs = 0.0, idleMs = 0.0;
++		uint32 presentWidth = 0, presentHeight = 0;
++		uint64_t flips = 0;
++		Framework::CSignal<void()>::Connection flipConnection;
++		uint64_t pathBytes[4] = {};
++		uint64_t xgkicks = 0;
++		uint64_t vuStarts = 0;
++		std::map<uint32_t, uint64_t> vifRegWrites; // address -> count (last value in vifRegLast)
++		std::map<uint32_t, uint32_t> vifRegLast;
++		CVpu::VuStateChangedEvent::Connection vuStateConnection;
++		CGSHandler::NewFrameEvent::Connection newFrameConnection;
++
++		// The GIF thread (GifThread): the VIF1/VU1 worker queues everything for the GIF and the
++		// GS here, in order, and goes on with the next microprogram meanwhile
++		struct GifItem
++		{
++			uint8_t kind = 0;
++			uint8_t path = 0;
++			uint32_t value = 0;
++			std::vector<uint8_t> data;
++			void* ptr = nullptr;
++			bool* done = nullptr;
++		};
++		std::mutex gifMutex;
++		std::condition_variable gifHasWork, gifHasRoom, gifDone;
++		std::deque<GifItem> gifQueue;
++		size_t gifQueuedBytes = 0;
++		size_t gifUnsignalledBytes = 0; // queued since the GIF thread was last woken
++		bool gifWaiting = false;        // the GIF thread sleeps on gifHasWork
++		bool gifProducerWaiting = false;
++		std::deque<std::pair<uint32_t, std::vector<uint8_t>>> gifDeferred; // waiting for another path's packet
++		double gifIdleMs = 0.0, gifQueueWaitMs = 0.0;
++		std::unique_ptr<CGIF::IAsyncSink> gifSink;
++	};
++
++	Host* g_host = nullptr;
++	EMSCRIPTEN_WEBGL_CONTEXT_HANDLE g_context = 0;
++
++	// --- input -----------------------------------------------------------------------------
++
++	// libpad bit order (active high in the ring): 0 SELECT 1 L3 2 R3 3 START 4 UP 5 RIGHT 6 DOWN
++	// 7 LEFT 8 L2 9 R2 10 L1 11 R1 12 TRIANGLE 13 CIRCLE 14 CROSS 15 SQUARE.
++	std::atomic<uint32_t> g_keyButtons{0};
++	std::atomic<uint32_t> g_keyStick{0}; // bit0 left, bit1 right, bit2 up, bit3 down
++
++	uint32_t KeyBit(const char* code, uint32_t* stick)
++	{
++		struct Map { const char* code; uint32_t bit; uint32_t stick; };
++		static const Map kMap[] = {
++			{"ArrowUp", 1u << 4, 0}, {"ArrowRight", 1u << 5, 0}, {"ArrowDown", 1u << 6, 0}, {"ArrowLeft", 1u << 7, 0},
++			{"KeyZ", 1u << 15, 0}, {"KeyX", 1u << 14, 0}, {"KeyC", 1u << 13, 0}, {"KeyV", 1u << 12, 0},
++			{"KeyQ", 1u << 10, 0}, {"KeyE", 1u << 11, 0}, {"Digit1", 1u << 8, 0}, {"Digit3", 1u << 9, 0},
++			{"Enter", 1u << 3, 0}, {"Backspace", 1u << 0, 0}, {"ShiftRight", 1u << 0, 0},
++			{"ControlLeft", 1u << 1, 0}, {"ControlRight", 1u << 1, 0},
++			{"KeyA", 0, 1}, {"KeyD", 0, 2}, {"KeyW", 0, 4}, {"KeyS", 0, 8},
++		};
++		for(const Map& m : kMap)
++		{
++			if(std::strcmp(code, m.code) == 0)
++			{
++				*stick = m.stick;
++				return m.bit;
++			}
++		}
++		*stick = 0;
++		return 0;
++	}
++
++	bool g_debug = false; // <page>?debug: GS statistics every 2 s, F8/F9 dumps
++	int g_scale = 2;      // internal resolution (decided on the page thread, from the URL)
++	bool g_hd = true;     // HD texture pack (data/hd/): on unless <page>?hd=0 (start screen setting)
++	bool g_halfRate = false; // picture at 30 fps (the game at 60): <page>?fps=30
++	bool g_fsr = true;       // FSR 1 upscaling to the window: on unless <page>?fsr=0 (start screen setting)
++	bool g_wide = true;      // [dbz] the game draws 16:9 (anamorphic): fill the 16:9 canvas; <page>?aspect=43 keeps 4:3
++	// ?vulocals=1: VU1 context fields kept in wasm locals for whole functions. Off: measured slower in a
++	// match (VU1 worker ~50% vs ~36%: small blocks with many exits flush every written field at each)
++	bool g_vuContextLocals = false;
++	// ?vumodules=1: merge a micro memory image's VU1 blocks into one wasm instance. Off: 2.2x blocks/s in a
++	// bench but no gain in a match (VU1 ~36.5% vs ~36.8%, game thread higher)
++	bool g_vuModuleGroups = false;
++	bool g_vuFlagAnalysis = true; // ?vuflags=0: VU1 flags maintained even when nothing reads them
++	bool g_vuFlagTracking = true; // ?vuflagtrack=0: VU1 flag reads always scan the whole pipeline
++	// [dbz] GS switches for DBZ's post-processing chain (Play! copy dbz/play-dbz), from the page URL
++	bool g_dbzOpt_zmask = true, g_dbzOpt_swsprites = false, g_dbzOpt_exactfbtex = true, g_dbzOpt_exactsmall = false;
++	int g_dbzOpt_wbskip = 2;
++	bool g_vuSuperblocks = true; // ?superblocks=0: one VU1 basic block per compiled function
++	bool g_vuStats = false;  // ?vustats=1: VU1 block transition statistics (use with ?chain=0)
++	int g_vuSlowPercent = 0; // ?vuslow=N: test aid, see RunVu1
++	bool g_vuDump = false;   // ?vudump=1 (with ?chain=0&vustats=1): Module._ps2xVuDump() gives the hottest VU1 blocks' code
++	std::mutex g_vuDumpMutex;
++	std::vector<uint8_t> g_vuDumpBlob;
++	int g_vuChainParam = 1;  // VU1 block chaining: 1 = tail calls if available, else dispatcher; 0 = off (?chain=0); 2 = dispatcher (?chain=dispatch)
++	ps2live::RingHeader* g_ring = nullptr;
++	// Canvas size in device pixels, measured on the page thread (the GL thread can't read CSS)
++	std::atomic<uint32_t> g_wantedWidth{0};
++	std::atomic<uint32_t> g_wantedHeight{0};
++	int g_traceState = 0; // F9: 1 = start at the next vsync, 2 = tracing this frame
++
++	EM_BOOL OnKey(int eventType, const EmscriptenKeyboardEvent* e, void*)
++	{
++		if(eventType == EMSCRIPTEN_EVENT_KEYDOWN && std::strcmp(e->code, "F9") == 0 && g_traceState == 0)
++			g_traceState = 1;
++		uint32_t stick = 0;
++		const uint32_t bit = KeyBit(e->code, &stick);
++		if(g_debug)
++			std::printf("[pad] %s %s -> bit %08x stick %x\n", eventType == EMSCRIPTEN_EVENT_KEYDOWN ? "down" : "up", e->code, bit, stick);
++		if(!bit && !stick)
++			return EM_FALSE;
++		if(eventType == EMSCRIPTEN_EVENT_KEYDOWN)
++		{
++			g_keyButtons |= bit;
++			g_keyStick |= stick;
++		}
++		else
++		{
++			g_keyButtons &= ~bit;
++			g_keyStick &= ~stick;
++		}
++		return EM_TRUE; // no page scrolling with the arrows
++	}
++
++	EM_BOOL OnBlur(int, const EmscriptenFocusEvent*, void*)
++	{
++		g_keyButtons = 0;
++		g_keyStick = 0;
++		return EM_FALSE;
++	}
++
++	uint32_t AxisByte(double value)
++	{
++		const int v = static_cast<int>(128.0 + value * 127.5);
++		return static_cast<uint32_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
++	}
++
++	// Keyboard + first gamepad (W3C standard mapping) into the ring header.
++	void PublishPad(ps2live::RingHeader* ring)
++	{
++		uint32_t buttons = g_keyButtons.load();
++		const uint32_t stick = g_keyStick.load();
++		uint32_t lx = (stick & 1) ? 0x00 : ((stick & 2) ? 0xFF : 0x80);
++		uint32_t ly = (stick & 4) ? 0x00 : ((stick & 8) ? 0xFF : 0x80);
++		uint32_t rx = 0x80, ry = 0x80;
++
++		if(emscripten_sample_gamepad_data() == EMSCRIPTEN_RESULT_SUCCESS && emscripten_get_num_gamepads() > 0)
++		{
++			EmscriptenGamepadEvent pad;
++			for(int i = 0; i < emscripten_get_num_gamepads(); i++)
++			{
++				if(emscripten_get_gamepad_status(i, &pad) != EMSCRIPTEN_RESULT_SUCCESS || !pad.connected)
++					continue;
++				// "standard" mapping, and also controllers the browser couldn't map (Firefox on macOS,
++				// some third-party pads): they nearly always follow the same order.
++				if(pad.numButtons >= 4)
++				{
++					// Standard mapping: 0 A 1 B 2 X 3 Y 4 LB 5 RB 6 LT 7 RT 8 Back 9 Start
++					// 10 L3 11 R3 12 Up 13 Down 14 Left 15 Right.
++					static const int kBitForButton[16] = {14, 13, 15, 12, 10, 11, 8, 9, 0, 3, 1, 2, 4, 6, 7, 5};
++					for(int b = 0; b < 16 && b < pad.numButtons; b++)
++						if(pad.digitalButton[b])
++							buttons |= 1u << kBitForButton[b];
++					if(!stick && pad.numAxes >= 2)
++					{
++						lx = AxisByte(pad.axis[0]);
++						ly = AxisByte(pad.axis[1]);
++					}
++					if(pad.numAxes >= 4)
++					{
++						rx = AxisByte(pad.axis[2]);
++						ry = AxisByte(pad.axis[3]);
++					}
++				}
++				break;
++			}
++		}
++		ring->padButtons = buttons;
++		ring->padAxes = lx | (ly << 8) | (rx << 16) | (ry << 24);
++		ring->padSequence = ring->padSequence + 1;
++	}
++
++	// --- ring reading ------------------------------------------------------------------------
++
++	// The indices are atomics: the producer publishes writePos with a release store after copying
++	// the bytes, and this acquire load makes those bytes visible here. With plain loads, ARM
++	// (phones, Apple silicon) could serve the packet bytes before the new writePos, and the reader
++	// saw a stale packet id ("unknown packet").
++	uint64_t Available(Host& h)
++	{
++		const int64_t w = __atomic_load_n(&h.ring->writePos, __ATOMIC_ACQUIRE);
++		return static_cast<uint64_t>(w - h.ring->readPos);
++	}
++
++	// Copies size bytes at offset `skip` past the read position, without consuming them.
++	void Peek(Host& h, uint64_t skip, void* dst, uint64_t size)
++	{
++		uint8_t* out = static_cast<uint8_t*>(dst);
++		uint64_t pos = static_cast<uint64_t>(h.ring->readPos) + skip;
++		while(size)
++		{
++			const uint64_t offset = pos % h.ringCapacity;
++			const uint64_t chunk = std::min(size, h.ringCapacity - offset);
++			std::memcpy(out, h.ringData + offset, chunk);
++			out += chunk;
++			pos += chunk;
++			size -= chunk;
++		}
++	}
++
++	void Consume(Host& h, uint64_t size)
++	{
++		__atomic_store_n(&h.ring->readPos, h.ring->readPos + static_cast<int64_t>(size), __ATOMIC_RELEASE);
++		__atomic_thread_fence(__ATOMIC_SEQ_CST); // readPos store before the producerWaiting load
++		if(h.ring->producerWaiting)
++			ps2live::eventSet(&ps2live::ringEvents(h.ring)->space);
++	}
++
++	template <typename T>
++	T PeekValue(Host& h, uint64_t skip)
++	{
++		T value;
++		Peek(h, skip, &value, sizeof(T));
++		return value;
++	}
++
++	// --- GS / VIF1 ---------------------------------------------------------------------------
++
++	// PS2MEM_GS layout (as PCSX2 dumps it) -> Play!'s privileged register writes (0x12000000 + offset).
++	void ApplyPrivRegisters(Host& h)
++	{
++		static const uint32_t kRegs[] = {0x00, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0x1010};
++		for(uint32_t offset : kRegs)
++		{
++			uint64_t value;
++			std::memcpy(&value, h.privRegs.data() + offset, sizeof(value));
++			h.gs->WritePrivRegister(0x12000000 + offset, static_cast<uint32_t>(value));
++			h.gs->WritePrivRegister(0x12000000 + offset + 4, static_cast<uint32_t>(value >> 32));
++		}
++		{
++			// Display changes (PMODE, SMODE2, DISPFB1/2, DISPLAY1/2), for the "flashes" hunt
++			static uint64_t s_last[6] = {};
++			static int s_logged = 0;
++			static const uint32_t kShown[6] = {0x00, 0x20, 0x70, 0x80, 0x90, 0xA0};
++			for(int i = 0; i < 6; i++)
++			{
++				uint64_t value;
++				std::memcpy(&value, h.privRegs.data() + kShown[i], sizeof(value));
++				if(value != s_last[i] && s_logged < 400)
++				{
++					s_logged++;
++					std::printf("[display] vsync %llu reg %02x: %llx -> %llx\n", (unsigned long long)h.totalVsyncs, kShown[i],
++					            (unsigned long long)s_last[i], (unsigned long long)value);
++					s_last[i] = value;
++				}
++			}
++		}
++		uint64_t smode2;
++		std::memcpy(&smode2, h.privRegs.data() + 0x20, sizeof(smode2));
++		if(smode2 != h.lastSmode2)
++		{
++			h.lastSmode2 = smode2;
++			// NTSC (the game is SLUS); SMODE2: bit 0 INT (interlaced), bit 1 FFMD (frame mode).
++			h.gs->SetCrt((smode2 & 1) != 0, 2, (smode2 & 2) != 0);
++		}
++	}
++
++	enum : uint8_t
++	{
++		kGifPackets = 1,
++		kGifVSync,
++		kGifReadFifo2,
++		kGifPrivRegs,
++		kGifPath3Mask,
++		kGifReadImage,
++	};
++	constexpr size_t kGifQueueLimit = 16u << 20; // the VU1 worker waits beyond this (a few frames' worth)
++
++	// Waking another thread is expensive in WebAssembly (it cost the VU1 worker ~16% when done for
++	// each of the hundreds of packets per frame): the GIF thread is woken at frame ends, for work
++	// someone waits for, and when enough has piled up; it drains everything queued each time.
++	constexpr size_t kGifWakeBytes = 256u << 10;
++
++	void GifEnqueue(Host& h, Host::GifItem&& item)
++	{
++		const bool urgent = (item.kind == kGifVSync) || (item.kind == kGifReadImage) || (item.kind == kGifReadFifo2);
++		std::unique_lock<std::mutex> lock(h.gifMutex);
++		if(h.gifQueuedBytes > kGifQueueLimit)
++		{
++			const double waitStart = emscripten_get_now();
++			if(h.gifWaiting)
++			{
++				h.gifWaiting = false;
++				h.gifHasWork.notify_one();
++			}
++			h.gifProducerWaiting = true;
++			h.gifHasRoom.wait(lock, [&]() { return h.gifQueuedBytes <= kGifQueueLimit / 2; });
++			h.gifProducerWaiting = false;
++			h.gifQueueWaitMs += emscripten_get_now() - waitStart;
++		}
++		const size_t bytes = item.data.size() + 64;
++		h.gifQueuedBytes += bytes;
++		h.gifUnsignalledBytes += bytes;
++		h.gifQueue.push_back(std::move(item));
++		const bool wake = h.gifWaiting && (urgent || (h.gifUnsignalledBytes >= kGifWakeBytes));
++		if(wake)
++		{
++			h.gifWaiting = false;
++			h.gifUnsignalledBytes = 0;
++		}
++		lock.unlock();
++		if(wake) h.gifHasWork.notify_one();
++	}
++
++	void GifEnqueuePackets(Host& h, uint32_t pathIndex, const uint8_t* data, uint32_t size)
++	{
++		Host::GifItem item;
++		item.kind = kGifPackets;
++		item.path = static_cast<uint8_t>(pathIndex);
++		item.data.assign(data, data + size);
++		GifEnqueue(h, std::move(item));
++	}
++
++	// Bytes of the GIF packet (tags up to the one with EOP, and their data) at `start` in VU1 data
++	// memory, which it may wrap around. XGKICK hands the GIF a packet the VU program may overwrite
++	// right after, so the worker copies exactly that much.
++	uint32_t GifPacketLength(const uint8_t* memory, uint32_t memorySize, uint32_t start)
++	{
++		uint32_t offset = 0;
++		while(offset < memorySize)
++		{
++			uint64_t tag;
++			std::memcpy(&tag, memory + ((start + offset) % memorySize), sizeof(tag));
++			const uint32_t loops = static_cast<uint32_t>(tag & 0x7FFF);
++			const bool eop = ((tag >> 15) & 1) != 0;
++			const uint32_t flag = static_cast<uint32_t>((tag >> 58) & 3);
++			uint32_t regs = static_cast<uint32_t>(tag >> 60);
++			if(regs == 0) regs = 16;
++			offset += 16;
++			if(flag == 0)
++				offset += loops * regs * 16; // PACKED
++			else if(flag == 1)
++				offset += ((loops * regs + 1) / 2) * 16; // REGLIST
++			else
++				offset += loops * 16; // IMAGE
++			if(eop) break;
++		}
++		return std::min(offset, memorySize);
++	}
++
++	void GifKick(Host& h, uint32_t value)
++	{
++		const uint32_t start = (value & 0x3FF) * 16;
++		const uint32_t length = GifPacketLength(h.vuMem1, static_cast<uint32_t>(PS2::VUMEM1SIZE), start);
++		Host::GifItem item;
++		item.kind = kGifPackets;
++		item.path = 1;
++		item.data.resize(length);
++		const uint32_t first = std::min<uint32_t>(length, static_cast<uint32_t>(PS2::VUMEM1SIZE) - start);
++		std::memcpy(item.data.data(), h.vuMem1 + start, first);
++		std::memcpy(item.data.data() + first, h.vuMem1, length - first);
++		GifEnqueue(h, std::move(item));
++	}
++
++	// GIF thread: packets of one path; if another path is in the middle of a packet the GIF won't
++	// take them yet, so they wait (in order) until that packet's end arrives
++	bool GifTryPackets(Host& h, uint32_t pathIndex, std::vector<uint8_t>& data, uint32_t& done)
++	{
++		while(done < data.size())
++		{
++			const uint32_t size = static_cast<uint32_t>(data.size());
++			const uint32_t n = h.gif->ProcessMultiplePackets(data.data(), size, done, size, CGsPacketMetadata(pathIndex));
++			if(n == 0) return false;
++			done += n;
++		}
++		return true;
++	}
++
++	void GifRunItem(Host& h, Host::GifItem& item)
++	{
++		switch(item.kind)
++		{
++		case kGifPackets:
++			h.gifDeferred.emplace_back(item.path, std::move(item.data));
++			break;
++		case kGifVSync:
++		{
++			if(g_traceState == 2)
++			{
++				h.gsWeb->traceOn = false;
++				g_traceState = 0;
++				std::printf("[trace] end\n");
++			}
++			else if(g_traceState == 1)
++			{
++				g_traceState = 2;
++				h.gsWeb->traceOn = true;
++				h.gsWeb->traceLines = 0;
++				std::printf("[trace] begin\n");
++			}
++			// Queues the frame's end and the flip for the GL thread. With two frames already
++			// queued (Play!'s MAX_INFLIGHT_FRAMES) this waits: the picture never lags far behind.
++			const double waitStart = emscripten_get_now();
++			h.gs->SetVBlank();
++			h.gs->ResetVBlank();
++			h.vblankWaitMs += emscripten_get_now() - waitStart;
++			break;
++		}
++		case kGifReadFifo2:
++		{
++			std::vector<uint8_t> discard((static_cast<size_t>(item.value) + 1) * 16);
++			h.gs->ReadImageData(discard.data(), item.value * 16);
++			h.gs->SendGSCall([]() {}, true, true); // the GL thread has read it: the buffer can go
++			break;
++		}
++		case kGifPrivRegs:
++			std::memcpy(h.privRegs.data(), item.data.data(), std::min(item.data.size(), h.privRegs.size()));
++			ApplyPrivRegisters(h);
++			break;
++		case kGifPath3Mask:
++			h.gif->SetPath3Masked(item.value != 0);
++			break;
++		case kGifReadImage:
++		{
++			h.gs->ReadImageData(item.ptr, item.value);
++			{
++				std::lock_guard<std::mutex> lock(h.gifMutex);
++				*item.done = true;
++			}
++			h.gifDone.notify_all();
++			break;
++		}
++		}
++		// Packets in arrival order, except that while a path is in the middle of a packet the GIF
++		// only takes that path's data (its continuation may come after other paths' packets)
++		while(!h.gifDeferred.empty())
++		{
++			auto next = h.gifDeferred.begin();
++			const uint32_t activePath = h.gif->GetActivePath();
++			if(activePath != 0)
++			{
++				next = std::find_if(h.gifDeferred.begin(), h.gifDeferred.end(),
++				                    [activePath](const auto& packets) { return packets.first == activePath; });
++				if(next == h.gifDeferred.end())
++					break; // the rest of that packet hasn't arrived yet
++			}
++			uint32_t done = 0;
++			if(GifTryPackets(h, next->first, next->second, done))
++			{
++				h.gifDeferred.erase(next);
++			}
++			else
++			{
++				next->second.erase(next->second.begin(), next->second.begin() + done);
++				if(done == 0)
++				{
++					std::printf("[webgs] GIF path %u refused while path %u is active\n", next->first, activePath);
++					h.gifDeferred.erase(next); // can't happen; don't wedge the GIF
++				}
++			}
++		}
++	}
++
++	void* GifThread(void* arg)
++	{
++		Host& h = *static_cast<Host*>(arg);
++		std::deque<Host::GifItem> batch;
++		for(;;)
++		{
++			{
++				std::unique_lock<std::mutex> lock(h.gifMutex);
++				if(h.gifQueue.empty())
++				{
++					const double waitStart = emscripten_get_now();
++					h.gifWaiting = true;
++					h.gifHasWork.wait(lock, [&]() { return !h.gifWaiting; });
++					h.gifIdleMs += emscripten_get_now() - waitStart;
++				}
++				h.gifWaiting = false;
++				h.gifUnsignalledBytes = 0;
++				batch.swap(h.gifQueue);
++			}
++			size_t bytes = 0;
++			for(auto& item : batch)
++			{
++				bytes += item.data.size() + 64; // before: GifRunItem may move the data away
++				GifRunItem(h, item);
++			}
++			batch.clear();
++			bool producerWaiting;
++			{
++				std::lock_guard<std::mutex> lock(h.gifMutex);
++				h.gifQueuedBytes -= bytes;
++				producerWaiting = h.gifProducerWaiting;
++			}
++			if(producerWaiting) h.gifHasRoom.notify_all();
++		}
++		return nullptr;
++	}
++
++	// What Play!'s VIF1 sends to the GIF (DIRECT, MSKPATH3, image read-backs), through the queue
++	class GifSink : public CGIF::IAsyncSink
++	{
++	public:
++		explicit GifSink(Host& host)
++		    : m_host(host)
++		{
++		}
++		void QueuePackets(const uint8* data, uint32 size, uint32 pathIndex) override
++		{
++			GifEnqueuePackets(m_host, pathIndex, data, size);
++		}
++		void QueuePath3Mask(bool masked) override
++		{
++			Host::GifItem item;
++			item.kind = kGifPath3Mask;
++			item.value = masked ? 1 : 0;
++			GifEnqueue(m_host, std::move(item));
++		}
++		void ReadImageData(void* data, uint32 size) override
++		{
++			bool done = false;
++			Host::GifItem item;
++			item.kind = kGifReadImage;
++			item.ptr = data;
++			item.value = size;
++			item.done = &done;
++			GifEnqueue(m_host, std::move(item));
++			std::unique_lock<std::mutex> lock(m_host.gifMutex);
++			m_host.gifDone.wait(lock, [&]() { return done; });
++		}
++
++	private:
++		Host& m_host;
++	};
++
++	void RunVu1(Host& h)
++	{
++		// The clock is a call out to JavaScript (~1.5% of the worker at a microprogram run's rate):
++		// timed only for the ?debug statistics, its only reader
++		const double start = g_debug ? emscripten_get_now() : 0.0;
++		for(int i = 0; i < 100000 && h.vpu1->IsVuRunning(); i++)
++		{
++			h.vpu1->Execute(5000);
++			h.vuSlices++;
++		}
++		if(g_debug)
++			h.vuMs += emscripten_get_now() - start;
++		if(g_vuStats)
++		{
++			// ?vustats=1 (with ?chain=0): how VU1 blocks follow each other, for superblocks.
++			static double s_last = 0.0;
++			const double now = emscripten_get_now();
++			if(s_last == 0.0)
++				s_last = now;
++			else if(now - s_last >= 5000.0)
++			{
++				const auto stats = static_cast<CVuExecutor*>(h.vu1.m_executor.get())->TakeBlockStats();
++				const double n = static_cast<double>(std::max<uint64_t>(stats.entries, 1));
++				std::printf("[webgs] VU1 blocks: %.0f entries/s, %.1f instructions each, next block: fall-through %.0f%%, same block %.0f%%, "
++				            "most frequent successor %.0f%% (%u blocks)\n",
++				            stats.entries * 1000.0 / (now - s_last), stats.instructions / n, 100.0 * stats.fallThrough / n,
++				            100.0 * stats.sameBlock / n, 100.0 * stats.dominantSuccessor / n, stats.blocks);
++				if(g_vuDump)
++				{
++					auto blob = static_cast<CVuExecutor*>(h.vu1.m_executor.get())->DumpHotBlocks(40);
++					std::lock_guard<std::mutex> lock(g_vuDumpMutex);
++					g_vuDumpBlob = std::move(blob);
++				}
++				s_last = now;
++			}
++		}
++	}
++
++	void DebugStats(Host& h)
++	{
++		const double now = emscripten_get_now();
++		if(now - h.debugStart < 2000.0)
++			return;
++		uint64_t pmode = 0, dispfb1 = 0, display1 = 0;
++		std::memcpy(&pmode, h.privRegs.data() + 0x00, 8);
++		std::memcpy(&dispfb1, h.privRegs.data() + 0x70, 8);
++		std::memcpy(&display1, h.privRegs.data() + 0x80, 8);
++		std::printf("[webgs] 2s: draws %llu, PMODE %llx DISPFB1 %llx DISPLAY1 %llx\n", (unsigned long long)h.drawCalls,
++		            (unsigned long long)pmode, (unsigned long long)dispfb1, (unsigned long long)display1);
++		h.drawCalls = 0;
++		{
++			// What is on screen: flips, GS RAM where DISPFB1 points, and the canvas centre.
++			const uint32_t fbp = static_cast<uint32_t>(dispfb1 & 0x1FF) * 8192u;
++			const uint8* gsRam = h.gs->GetRam();
++			uint64_t nonzero = 0, sum = 0;
++			for(uint32_t i = 0; i < 640u * 448u * 4u && fbp + i < 4u * 1024u * 1024u; i += 4)
++			{
++				const uint32_t v = gsRam[fbp + i] | (gsRam[fbp + i + 1] << 8) | (gsRam[fbp + i + 2] << 16);
++				nonzero += v != 0;
++				sum += v;
++			}
++			uint64_t ramNonzero = 0;
++			uint32_t firstNz = 0xFFFFFFFF, lastNz = 0;
++			for(uint32_t i = 0; i < 4u * 1024u * 1024u; i += 4)
++			{
++				if(*reinterpret_cast<const uint32_t*>(gsRam + i) != 0)
++				{
++					ramNonzero++;
++					if(firstNz == 0xFFFFFFFF)
++						firstNz = i;
++					lastNz = i;
++				}
++			}
++			const uint64* r = h.gs->GetRegisters();
++			std::printf("[webgs] 2s: gs ram nonzero words %llu [%x..%x], BITBLTBUF %llx TRXPOS %llx TRXREG %llx TRXDIR %llx\n",
++			            (unsigned long long)ramNonzero, firstNz, lastNz, (unsigned long long)r[0x50], (unsigned long long)r[0x51],
++			            (unsigned long long)r[0x52], (unsigned long long)r[0x53]);
++			uint8_t px[4] = {};
++			glBindFramebuffer(GL_FRAMEBUFFER, 0);
++			int cw = 0, ch = 0;
++			emscripten_get_canvas_element_size("#canvas", &cw, &ch);
++			glReadPixels(cw / 2, ch / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
++			std::printf("[webgs] 2s: flips %llu, gs ram @%x nonzero %llu sum %llx, canvas %dx%d centre %02x%02x%02x glerr %x\n",
++			            (unsigned long long)h.flips, fbp, (unsigned long long)nonzero, (unsigned long long)sum, cw, ch, px[0], px[1], px[2],
++			            glGetError());
++			h.flips = 0;
++		}
++		const uint64* gsRegs = h.gs->GetRegisters();
++		std::printf("[webgs] 2s: path1 %llu B (xgkick %llu) path2 %llu B path3 %llu B, GS PRIM %llx FRAME_1 %llx XYZ2 %llx\n",
++		            (unsigned long long)h.pathBytes[1], (unsigned long long)h.xgkicks, (unsigned long long)h.pathBytes[2],
++		            (unsigned long long)h.pathBytes[3], (unsigned long long)gsRegs[0x00], (unsigned long long)gsRegs[0x4C],
++		            (unsigned long long)gsRegs[0x05]);
++		h.pathBytes[1] = h.pathBytes[2] = h.pathBytes[3] = h.xgkicks = 0;
++		std::printf("[webgs] 2s: framebuffer write-backs %u, software sprites %u, hd textures shown %u, loaded %u\n", h.gsWeb->m_framebufferWriteBacks,
++		            h.gsWeb->m_softwareSprites, h.gsWeb->m_hdTexturesShown, h.gsWeb->m_hdTexturesLoaded);
++		h.gsWeb->m_hdTexturesShown = 0;
++		h.gsWeb->m_framebufferWriteBacks = 0;
++		h.gsWeb->m_softwareSprites = 0;
++		std::printf("[webgs] 2s: gs reg writes:");
++		for(int i = 0; i < 0x80; i++)
++		{
++			if(h.gsWeb->regCounts[i])
++				std::printf(" %02x:%llu", i, (unsigned long long)h.gsWeb->regCounts[i]);
++			h.gsWeb->regCounts[i] = 0;
++		}
++		std::printf("\n");
++		for(int reg : {0x00, 0x06, 0x07, 0x4C, 0x4D, 0x4E, 0x4F, 0x50, 0x52})
++		{
++			auto& values = h.gsWeb->regValues[reg];
++			std::printf("[webgs] 2s: reg %02x values (%zu):", reg, values.size());
++			int shown = 0;
++			for(const auto& [value, count] : values)
++				if(shown++ < 64)
++					std::printf(" %llx x%llu", (unsigned long long)value, (unsigned long long)count);
++			std::printf("\n");
++			values.clear();
++		}
++		std::printf("[webgs] 2s: vu starts %llu, VIF1 STAT %08x, reg writes:", (unsigned long long)h.vuStarts,
++		            h.vpu1->GetVif().GetRegister(0x10003C00));
++		for(const auto& [address, count] : h.vifRegWrites)
++			std::printf(" %08x x%llu (last %08x)", address, (unsigned long long)count, h.vifRegLast[address]);
++		std::printf("\n");
++		h.vuStarts = 0;
++		h.vifRegWrites.clear();
++		std::printf("[webgs] 2s: vif %llu (vu %.0f ms, %llu slices) vifreg %llu xfer %llu vsync %llu regs %llu fifo %llu gs %.0f ms, ring pending %lld KB, vu running %d\n",
++		            (unsigned long long)h.nVif, h.vuMs, (unsigned long long)h.vuSlices, (unsigned long long)h.nVifReg,
++		            (unsigned long long)h.nXfer, (unsigned long long)h.nVsync, (unsigned long long)h.nRegs,
++		            (unsigned long long)h.nFifo, h.gsMs, (long long)(Available(h) / 1024), h.vpu1->IsVuRunning() ? 1 : 0);
++		std::printf("[webgs] 2s: worker waited %.0f ms at vblanks, %.0f ms for data\n", h.vblankWaitMs, h.idleMs);
++		h.vblankWaitMs = h.idleMs = 0.0;
++		h.nVif = h.nVifReg = h.nXfer = h.nVsync = h.nRegs = h.nFifo = h.vuSlices = 0;
++		h.vuMs = h.gsMs = 0.0;
++		h.debugStart = now;
++	}
++
++	// Feeds whole quadwords of the game's VIF1 stream; a VIF waiting for the VU gets it run.
++	void FeedVif1Work(Host& h, const uint8_t* bytes, uint32_t size);
++
++	void FeedVif1(Host& h, const uint8_t* bytes, uint32_t size)
++	{
++		if(g_vuSlowPercent <= 0)
++			return FeedVif1Work(h, bytes, size);
++		// ?vuslow=N (tests): VIF1/VU1 work takes N% longer, to reproduce a phone's saturated worker
++		const double start = emscripten_get_now();
++		FeedVif1Work(h, bytes, size);
++		const double until = emscripten_get_now() + (emscripten_get_now() - start) * g_vuSlowPercent / 100.0;
++		while(emscripten_get_now() < until)
++		{
++		}
++	}
++
++	void FeedVif1Work(Host& h, const uint8_t* bytes, uint32_t size)
++	{
++		static int s_dumped = 0;
++		if(s_dumped < 12 && size >= 16)
++		{
++			s_dumped++;
++			uint32_t w[8] = {};
++			std::memcpy(w, bytes, std::min<uint32_t>(size, sizeof(w)));
++			std::printf("[webgs] vif1 #%d size %u carry %zu: %08x %08x %08x %08x %08x %08x %08x %08x\n", s_dumped, size,
++			            h.vifCarry.size(), w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
++		}
++		h.vifCarry.insert(h.vifCarry.end(), bytes, bytes + size);
++		const uint32_t whole = static_cast<uint32_t>(h.vifCarry.size()) & ~15u;
++		CVif& vif = h.vpu1->GetVif();
++		uint32_t done = 0;
++		while(done < whole)
++		{
++			const uint32_t chunk = std::min(whole - done, kVifStageSize);
++			std::memcpy(h.ram + kVifStageAddr, h.vifCarry.data() + done, chunk);
++			const uint32_t qwc = chunk / 16;
++			uint32_t consumed = 0;
++			int stalls = 0;
++			while(consumed < qwc)
++			{
++				const uint32_t n = vif.ReceiveDMA(kVifStageAddr + consumed * 16, qwc - consumed, Dmac::CChannel::CHCR_DIR_FROM, false);
++				static int s_logged = 0;
++				if(s_logged < 12)
++				{
++					s_logged++;
++					std::printf("[webgs] ReceiveDMA qwc %u -> %u, VIF STAT %08x, vu running %d\n", qwc - consumed, n,
++					            vif.GetRegister(0x10003C00), h.vpu1->IsVuRunning() ? 1 : 0);
++				}
++				consumed += n;
++				if(n == 0)
++				{
++					if(!h.vpu1->IsVuRunning() || ++stalls > 64)
++					{
++						std::printf("[webgs] VIF1 stuck, dropping %u qwords\n", qwc - consumed);
++						consumed = qwc;
++						break;
++					}
++					RunVu1(h);
++				}
++			}
++			done += chunk;
++		}
++		h.vifCarry.erase(h.vifCarry.begin(), h.vifCarry.begin() + whole);
++		RunVu1(h); // MSCAL at the end of the chunk
++	}
++
++	void Transfer(Host& h, uint8_t path, const uint8_t* data, uint32_t size)
++	{
++		const unsigned pathIndex = path == kPath1New ? 1 : path == kPath2 ? 2 : path == kPath3 ? 3 : 0;
++		if(!pathIndex || !size)
++			return;
++		h.pathBytes[pathIndex] += size;
++		GifEnqueuePackets(h, pathIndex, data, size); // the GIF thread arbitrates the paths
++	}
++
++	// Processes whole packets until a vsync (drawn) or the data runs out. True if a frame was drawn.
++	bool ProcessPackets(Host& h)
++	{
++		if(!h.headerDone)
++		{
++			if(Available(h) < 8)
++				return false;
++			const uint32_t crc = PeekValue<uint32_t>(h, 0);
++			const uint32_t headerSize = PeekValue<uint32_t>(h, 4);
++			uint64_t stateSize = headerSize;
++			uint64_t headerBytes = 0;
++			if(crc == 0xFFFFFFFFu)
++			{
++				headerBytes = headerSize;
++				if(Available(h) < 8 + headerBytes)
++					return false;
++				std::vector<uint8_t> header(headerBytes);
++				Peek(h, 8, header.data(), headerBytes);
++				uint32_t dumpStateSize = 0;
++				std::memcpy(&dumpStateSize, header.data() + 4, sizeof(dumpStateSize)); // GSDumpHeader.state_size
++				stateSize = dumpStateSize;
++			}
++			const uint64_t total = 8 + headerBytes + stateSize + kPrivRegsSize;
++			if(Available(h) < total)
++				return false;
++			Host::GifItem regs;
++			regs.kind = kGifPrivRegs;
++			regs.data.resize(kPrivRegsSize);
++			Peek(h, 8 + headerBytes + stateSize, regs.data.data(), kPrivRegsSize);
++			Consume(h, total);
++			GifEnqueue(h, std::move(regs));
++			h.headerDone = true;
++			std::printf("[webgs] live GS stream connected\n");
++		}
++
++		for(;;)
++		{
++			const uint64_t avail = Available(h);
++			if(avail < 1)
++				return false;
++			const uint8_t id = PeekValue<uint8_t>(h, 0);
++			switch(id)
++			{
++			case kTypeLiveVif1:
++			{
++				if(avail < 5)
++					return false;
++				const uint32_t length = PeekValue<uint32_t>(h, 1);
++				if(avail < 5ull + length)
++					return false;
++				h.packet.resize(length);
++				Peek(h, 5, h.packet.data(), length);
++				Consume(h, 5ull + length);
++				h.nVif++;
++				FeedVif1(h, h.packet.data(), length & ~3u);
++				break;
++			}
++			case kTypeLiveVif1Reg:
++			{
++				if(avail < 9)
++					return false;
++				const uint32_t address = PeekValue<uint32_t>(h, 1);
++				const uint32_t value = PeekValue<uint32_t>(h, 5);
++				Consume(h, 9);
++				h.nVifReg++;
++				h.vifRegWrites[address]++;
++				h.vifRegLast[address] = value;
++				h.vpu1->GetVif().SetRegister(address, value);
++				break;
++			}
++			case kTypeTransfer:
++			{
++				if(avail < 6)
++					return false;
++				const uint8_t path = PeekValue<uint8_t>(h, 1);
++				const uint32_t length = PeekValue<uint32_t>(h, 2);
++				if(avail < 6ull + length)
++					return false;
++				h.packet.resize(length);
++				Peek(h, 6, h.packet.data(), length);
++				Consume(h, 6ull + length);
++				h.nXfer++;
++				Transfer(h, path, h.packet.data(), length);
++				break;
++			}
++			case kTypeVSync:
++			{
++				if(avail < 2)
++					return false;
++				Consume(h, 2);
++				h.nVsync++;
++				h.totalVsyncs++;
++				Host::GifItem item;
++				item.kind = kGifVSync;
++				GifEnqueue(h, std::move(item));
++				return true;
++			}
++			case kTypeReadFifo2:
++			{
++				if(avail < 5)
++					return false;
++				const uint32_t qwc = PeekValue<uint32_t>(h, 1);
++				Consume(h, 5);
++				h.nFifo++;
++				Host::GifItem item;
++				item.kind = kGifReadFifo2;
++				item.value = qwc;
++				GifEnqueue(h, std::move(item));
++				break;
++			}
++			case kTypeRegisters:
++			{
++				if(avail < 1 + kPrivRegsSize)
++					return false;
++				Host::GifItem item;
++				item.kind = kGifPrivRegs;
++				item.data.resize(kPrivRegsSize);
++				Peek(h, 1, item.data.data(), kPrivRegsSize);
++				Consume(h, 1 + kPrivRegsSize);
++				h.nRegs++;
++				GifEnqueue(h, std::move(item));
++				break;
++			}
++			default:
++				std::printf("[webgs] unknown packet 0x%02X, stopping\n", id);
++				h.ring->consumerQuit = 1;
++				return false;
++			}
++		}
++	}
++
++	// Follows the canvas' size on the page (window resize, fullscreen): drawing buffer and GS
++	// presentation in device pixels.
++	void UpdatePresentation(Host& h)
++	{
++		const uint32 width = g_wantedWidth.load();
++		const uint32 height = g_wantedHeight.load();
++		if(width == 0 || height == 0 || (width == h.presentWidth && height == h.presentHeight))
++			return;
++		h.presentWidth = width;
++		h.presentHeight = height;
++		emscripten_set_canvas_element_size("#canvas", static_cast<int>(width), static_cast<int>(height));
++		CGSHandler::PRESENTATION_PARAMS presentation;
++		presentation.mode = g_wide ? CGSHandler::PRESENTATION_MODE_FILL : CGSHandler::PRESENTATION_MODE_FIT;
++		presentation.windowWidth = width;
++		presentation.windowHeight = height;
++		h.gs->SetPresentationParams(presentation);
++	}
++
++	EM_BOOL OnAnimationFrame(double time, void*)
++	{
++		Host& h = *g_host;
++		UpdatePresentation(h);
++		// The GS calls the worker thread queued (draws, transfers, flips) run here, in the thread
++		// that owns the canvas (OffscreenCanvas); the last flip is what the page shows.
++		const double gsStart = emscripten_get_now();
++		// WebGL state cache, once: Play! sets the whole texture/buffer state for every draw (about
++		// 3000 WebGL calls per frame in a match). Each call goes to Chrome's GPU process, which
++		// on phones made this thread too slow for 60 fps. Calls that change nothing are dropped
++		// here, below all of Play!'s 58 places that touch the state, so none can disagree.
++		// It also counts the calls that remain (statistics).
++		EM_ASM({
++			if (self.ps2xGlWrapped || typeof GLctx === 'undefined' || !GLctx) return;
++			self.ps2xGlWrapped = true;
++			self.ps2xGlCalls = 0;
++			self.ps2xGlMs = 0;
++			self.ps2xGlSkipped = 0;
++			self.ps2xGlByName = {};
++			const gl = GLctx;
++			const raw = {};
++			const proto = Object.getPrototypeOf(gl);
++			for (const name of Object.getOwnPropertyNames(proto)) {
++				let original;
++				try { original = gl[name]; } catch (e) { continue; }
++				if (typeof original !== 'function' || name === 'constructor') continue;
++				raw[name] = original.bind(gl);
++			}
++			const counted = raw;
++			const skip = () => { self.ps2xGlSkipped++; };
++			let activeUnit = gl.TEXTURE0;
++			const boundTextures = new Map(); // unit -> texture (TEXTURE_2D)
++			const boundBuffers = new Map();  // target -> buffer
++			const boundBases = new Map();    // target:index -> buffer
++			let vertexArray = null;
++			let program = null;
++			let readFramebuffer = null;
++			let drawFramebuffer = null;
++			const enabled = new Map();
++			let viewport = '';
++			let scissor = '';
++			let colorMask = '';
++			let depthMask = null;
++			let blendFunc = '';
++			let blendEquation = '';
++			let depthFunc = null;
++			gl.activeTexture = function(unit) { if (unit === activeUnit) return skip(); activeUnit = unit; counted.activeTexture(unit); };
++			gl.bindTexture = function(target, texture) {
++				if (target === gl.TEXTURE_2D) {
++					if (boundTextures.get(activeUnit) === texture) return skip();
++					boundTextures.set(activeUnit, texture);
++				}
++				counted.bindTexture(target, texture);
++			};
++			gl.texParameteri = function(target, pname, value) {
++				const texture = target === gl.TEXTURE_2D ? boundTextures.get(activeUnit) : null;
++				if (texture) {
++					const params = texture.ps2xParams || (texture.ps2xParams = {});
++					if (params[pname] === value) return skip();
++					params[pname] = value;
++				}
++				counted.texParameteri(target, pname, value);
++			};
++			gl.bindBuffer = function(target, buffer) {
++				if (boundBuffers.get(target) === buffer) return skip();
++				boundBuffers.set(target, buffer);
++				counted.bindBuffer(target, buffer);
++			};
++			gl.bindBufferBase = function(target, index, buffer) {
++				// (It also binds the generic target; skipped, that one keeps its cached value.)
++				const key = target + ':' + index;
++				if (boundBases.get(key) === buffer) return skip();
++				boundBases.set(key, buffer);
++				boundBuffers.set(target, buffer);
++				counted.bindBufferBase(target, index, buffer);
++			};
++			// Shader parameter blocks re-sent unchanged: compared with the last upload
++			gl.bufferData = function(target, data, usage, offset, length) {
++				const buffer = boundBuffers.get(target);
++				if (target === gl.UNIFORM_BUFFER && buffer && data && data.buffer && typeof offset === 'number' && length > 0 && length <= 1024) {
++					const bytes = new Uint8Array(data.buffer, data.byteOffset + offset, length);
++					const last = buffer.ps2xLast;
++					if (last && last.length === length && usage === buffer.ps2xUsage) {
++						let same = true;
++						for (let i = 0; i < length; i++) if (last[i] !== bytes[i]) { same = false; break; }
++						if (same) return skip();
++					}
++					buffer.ps2xLast = bytes.slice();
++					buffer.ps2xUsage = usage;
++				} else if (buffer) {
++					buffer.ps2xLast = null;
++				}
++				return counted.bufferData.apply(null, arguments);
++			};
++			gl.bindBufferRange = function(target, index, buffer, offset, size) {
++				boundBases.delete(target + ':' + index);
++				boundBuffers.set(target, buffer);
++				counted.bindBufferRange(target, index, buffer, offset, size);
++			};
++			gl.bindVertexArray = function(vao) {
++				if (vao === vertexArray) return skip();
++				vertexArray = vao;
++				boundBuffers.delete(gl.ELEMENT_ARRAY_BUFFER);
++				counted.bindVertexArray(vao);
++			};
++			gl.useProgram = function(p) { if (p === program) return skip(); program = p; counted.useProgram(p); };
++			gl.bindFramebuffer = function(target, fb) {
++				if (target === gl.FRAMEBUFFER) {
++					if (fb === drawFramebuffer && fb === readFramebuffer) return skip();
++					drawFramebuffer = readFramebuffer = fb;
++				} else if (target === gl.DRAW_FRAMEBUFFER) {
++					if (fb === drawFramebuffer) return skip();
++					drawFramebuffer = fb;
++				} else if (target === gl.READ_FRAMEBUFFER) {
++					if (fb === readFramebuffer) return skip();
++					readFramebuffer = fb;
++				}
++				counted.bindFramebuffer(target, fb);
++			};
++			gl.enable = function(cap) { if (enabled.get(cap) === true) return skip(); enabled.set(cap, true); counted.enable(cap); };
++			gl.disable = function(cap) { if (enabled.get(cap) === false) return skip(); enabled.set(cap, false); counted.disable(cap); };
++			gl.viewport = function(x, y, w, h) { const k = x + ',' + y + ',' + w + ',' + h; if (k === viewport) return skip(); viewport = k; counted.viewport(x, y, w, h); };
++			gl.scissor = function(x, y, w, h) { const k = x + ',' + y + ',' + w + ',' + h; if (k === scissor) return skip(); scissor = k; counted.scissor(x, y, w, h); };
++			gl.colorMask = function(r, g, b, a) { const k = '' + r + g + b + a; if (k === colorMask) return skip(); colorMask = k; counted.colorMask(r, g, b, a); };
++			gl.depthMask = function(f) { if (f === depthMask) return skip(); depthMask = f; counted.depthMask(f); };
++			gl.depthFunc = function(f) { if (f === depthFunc) return skip(); depthFunc = f; counted.depthFunc(f); };
++			gl.blendFuncSeparate = function(a, b, c, d) { const k = a + ',' + b + ',' + c + ',' + d; if (k === blendFunc) return skip(); blendFunc = k; counted.blendFuncSeparate(a, b, c, d); };
++			gl.blendFunc = function(a, b) { blendFunc = ''; counted.blendFunc(a, b); };
++			gl.blendEquationSeparate = function(a, b) { const k = a + ',' + b; if (k === blendEquation) return skip(); blendEquation = k; counted.blendEquationSeparate(a, b); };
++			gl.blendEquation = function(a) { blendEquation = ''; counted.blendEquation(a); };
++			// Deleted objects leave the bindings (as GL does)
++			gl.deleteTexture = function(t) { for (const [u, b] of boundTextures) if (b === t) boundTextures.set(u, null); counted.deleteTexture(t); };
++			gl.deleteBuffer = function(b) {
++				for (const [k, v] of boundBuffers) if (v === b) boundBuffers.set(k, null);
++				for (const [k, v] of boundBases) if (v === b) boundBases.set(k, null);
++				counted.deleteBuffer(b);
++			};
++			gl.deleteFramebuffer = function(f) {
++				if (drawFramebuffer === f) drawFramebuffer = null;
++				if (readFramebuffer === f) readFramebuffer = null;
++				counted.deleteFramebuffer(f);
++			};
++			gl.deleteVertexArray = function(v) { if (vertexArray === v) vertexArray = null; counted.deleteVertexArray(v); };
++			gl.deleteProgram = function(p) { if (program === p) program = null; counted.deleteProgram(p); };
++			// Wrapped elsewhere in Emscripten's code paths: keep the cache right if anything
++			// saves and restores bindings with getParameter
++		});
++		h.gsWeb->Pump();
++		const double pumpMs = emscripten_get_now() - gsStart;
++		h.gsMs += pumpMs;
++		h.glMs += pumpMs;
++		h.glMaxMs = std::max(h.glMaxMs, pumpMs);
++		if(h.lastRaf != 0.0)
++			h.rafMaxMs = std::max(h.rafMaxMs, time - h.lastRaf);
++		h.lastRaf = time;
++		h.rafs++;
++		if(g_debug)
++			DebugStats(h);
++		if(h.statsStart == 0.0)
++			h.statsStart = time; // rAF time is page-relative; emscripten_get_now() is absolute with pthreads
++		if(time - h.statsStart >= 5000.0)
++		{
++			// Also where time goes on the GL thread (GPU-bound devices show it here)
++			auto& gs = *h.gsWeb;
++			std::printf("[webgs] %.1f game fps on screen (gl %.1f ms/frame, max %.0f ms, longest frame gap %.0f ms, fb copies %.0f/frame; "
++			            "shaders %u in %.0f ms (%u precompiled), read-backs %u in %.0f ms, texture uploads %u (%u unchanged, skipped), hd loaded %u)\n",
++			            h.frames * 1000.0 / (time - h.statsStart), h.rafs ? h.glMs / h.rafs : 0.0, h.glMaxMs, h.rafMaxMs,
++			            h.frames ? static_cast<double>(gs.m_dstCopies) / h.frames : 0.0, gs.m_shaderCompiles, gs.m_shaderCompileMs, gs.m_shadersPrecompiled,
++			            gs.m_framebufferWriteBacks, gs.m_writeBackMs, gs.m_textureUploads,
++			            gs.m_textureUploadsSkipped, gs.m_hdTexturesLoaded - h.hdLoadedBefore);
++			std::printf("[webgs] dbz: depth-mask passes %u, write-backs skipped (RAM newer) %u, before uploads %u\n", gs.m_depthMaskPasses,
++			            gs.m_skippedWriteBacks, gs.m_transferWriteBacks);
++			gs.m_depthMaskPasses = 0;
++			gs.m_transferWriteBacks = 0;
++			gs.m_skippedWriteBacks = 0;
++			if(g_debug)
++				for(const auto& [k, n] : gs.m_wbStats)
++					std::printf("[webgs] dbz: write-back fb %x psm %x for tex psm %x at %x: %u\n", (unsigned)(k >> 32), (unsigned)((k >> 24) & 0xFF),
++					            (unsigned)((k >> 16) & 0xFF), (unsigned)((k & 0xFFFF) << 13), n);
++			gs.m_wbStats.clear();
++			if(auto added = gs.TakeNewShaderCaps(); !added.empty())
++			{
++				// Remembered for the next session (precompiled then)
++				std::string list;
++				for(uint64_t caps : added)
++				{
++					char hex[20];
++					std::snprintf(hex, sizeof(hex), "%s%016llx", list.empty() ? "" : ",", static_cast<unsigned long long>(caps));
++					list += hex;
++				}
++				EM_ASM({
++					const added = UTF8ToString($0).split(',');
++					try
++					{
++						const open = indexedDB.open('ps2x', 1);
++						open.onupgradeneeded = () => open.result.createObjectStore('kv');
++						open.onsuccess = () => {
++							const store = open.result.transaction('kv', 'readwrite').objectStore('kv');
++							const get = store.get('shaders-v1');
++							get.onsuccess = () => {
++								const known = new Set((get.result || '').split(',').filter((c) => c.length == 16));
++								for(const c of added) known.add(c);
++								store.put([...known].slice(-1024).join(','), 'shaders-v1');
++							};
++						};
++					}
++					catch(e)
++					{
++					}
++				}, list.c_str());
++			}
++			// VIF1/VU1 worker load: what it didn't spend waiting for the game's data or for the GL
++			// thread (two frames queued); near 100% it holds the picture (and the game) back
++			{
++				const double windowMs = time - h.statsStart;
++				std::printf("[webgs] VU1 worker %.0f%% busy (waited %.0f ms for data, %.0f ms for the GIF thread); "
++				            "GIF thread %.0f%% busy (waited %.0f ms for work, %.0f ms for the GL thread)\n",
++				            windowMs > 0.0 ? 100.0 * (1.0 - (h.idleMs + h.gifQueueWaitMs) / windowMs) : 0.0, h.idleMs, h.gifQueueWaitMs,
++				            windowMs > 0.0 ? std::clamp(100.0 * (1.0 - (h.gifIdleMs + h.vblankWaitMs) / windowMs), 0.0, 100.0) : 0.0, h.gifIdleMs, h.vblankWaitMs);
++				if(!g_debug)
++					h.idleMs = h.vblankWaitMs = h.gifIdleMs = h.gifQueueWaitMs = 0.0;
++			}
++			{
++				const auto& slow = gs.m_slowestFrameTimes;
++				std::printf("[webgs] slowest frame %.0f ms on the GL thread: draw batches %.0f ms (largest %.0f), transfers %.0f ms, "
++				            "flip %.0f ms (present %.0f)\n", slow.total, slow.batches, slow.largestBatch, slow.transfers, slow.flip, slow.present);
++				gs.m_slowestFrameTimes = CGSHandler::FRAME_TIMES();
++			}
++			std::printf("[webgs] image transfers: %u swizzled in the VU1 worker; on the GL thread: %u format, %u alignment, %u range, %u interrupted\n",
++			            gs.m_producerSwizzled, gs.m_producerDirect[0], gs.m_producerDirect[1], gs.m_producerDirect[2], gs.m_producerDirect[3]);
++			gs.m_producerSwizzled = 0;
++			for(uint32& count : gs.m_producerDirect)
++				count = 0;
++			gs.m_slowestBatchMs = 0.0;
++			for(double& slowest : gs.m_slowestMs)
++				slowest = 0.0;
++			h.hdLoadedBefore = gs.m_hdTexturesLoaded;
++			h.glMs = h.glMaxMs = h.rafMaxMs = 0.0;
++			h.rafs = 0;
++			gs.m_dstCopies = gs.m_shaderCompiles = gs.m_textureUploads = gs.m_textureUploadsSkipped = 0;
++			gs.m_shaderCompileMs = gs.m_writeBackMs = gs.m_textureUploadMs = 0.0;
++			if(!g_debug)
++				gs.m_framebufferWriteBacks = 0;
++			h.frames = 0;
++			h.statsStart = time;
++		}
++		return h.ring->producerAlive ? EM_TRUE : EM_FALSE;
++	}
++
++	void RegisterJitFunctions();
++
++	// DMAC/GIF/VIF1/VU1 for the worker thread: built there, because the VU1 JIT adds its code to
++	// the function table of the thread that compiles it (each WebAssembly thread has its own).
++	void SetupEmulation(Host* h)
++	{
++		h->dmac = std::make_unique<CDMAC>(h->ram, h->spr, h->vuMem0, h->vuMem1, h->ee);
++		h->gif = std::make_unique<CGIF>(h->gs, *h->dmac, h->ram, h->spr);
++		h->vpu1 = std::make_shared<CVpu>(1, CVpu::VPUINIT(h->microMem1, h->vuMem1, &h->vu1), *h->gif, h->intc, h->ram, h->spr);
++
++		// VU1 context, as Play!'s EE subsystem sets it up.
++		CMIPS& vu1 = h->vu1;
++		vu1.m_executor = std::make_unique<CVuExecutor>(vu1, PS2::MICROMEM1SIZE);
++		{
++			// VU1 blocks jump straight to the next block (7 million blocks a second in a match, ~6
++			// instructions each): with wasm tail calls where the browser has them (~18% less VU1
++			// worker time on a Mac), otherwise handed to the dispatcher by the block that ended.
++			// ?chain=0 turns chaining off, ?chain=dispatch forces the dispatcher hand-off.
++			const int chainParam = g_vuChainParam; // read on the page thread (a worker's location is its script)
++			const bool tailCalls = (chainParam == 1) && Jitter::CCodeGen_Wasm::HasTailCalls();
++			if(chainParam != 0)
++				static_cast<CVuExecutor*>(vu1.m_executor.get())->EnableBlockChaining(tailCalls);
++			static_cast<CVuExecutor*>(vu1.m_executor.get())->EnableBlockStats(g_vuStats);
++			CBasicBlock::s_keepCode = g_vuDump;
++			// Superblocks: blocks that follow each other when a conditional branch isn't taken are
++			// compiled into one function (~45% of block-to-block transitions in a match).
++			CVuExecutor::s_superblocks = g_vuSuperblocks;
++			// Flags nothing in micro memory reads aren't maintained (?vuflags=0 keeps them all)
++			CVuExecutor::s_flagAnalysis = g_vuFlagAnalysis;
++			// Flag reads after a value queued in the same block read its slot directly (?vuflagtrack=0: scan)
++			VUShared::s_flagTracking = g_vuFlagTracking;
++			// A micro memory image's blocks, once they stop changing, are merged into one wasm instance:
++			// chained jumps no longer cross instances (~18 ns each in Chrome, ~43 ns in Firefox)
++			CVuExecutor::s_moduleGroups = g_vuModuleGroups;
++			// VU1 context fields stay in wasm locals for a whole compiled function (CodeGen
++			// CacheContextInLocals) instead of being stored/reloaded around every block
++			Jitter::CCodeGen_Wasm::s_cacheContextInLocals = g_vuContextLocals;
++			std::printf("[webgs] VU1 superblocks %s\n", g_vuSuperblocks ? "on" : "off");
++			std::printf("[webgs] VU1 block chaining %s\n", (chainParam == 0) ? "off" : tailCalls ? "with tail calls" : "through the dispatcher");
++		}
++		vu1.m_pMemoryMap->InsertReadMap(0x00000000, 0x00003FFF, h->vuMem1, 0x00);
++		vu1.m_pMemoryMap->InsertReadMap(0x00008000, 0x00008FFF, [h](uint32 address, uint32) -> uint32 {
++			if(address == CVpu::VU_ADDR_ITOP)
++				return h->vpu1->GetVif().GetITOP();
++			if(address == CVpu::VU_ADDR_TOP)
++				return h->vpu1->GetVif().GetTOP();
++			return 0xCCCCCCCC;
++		}, 0x01);
++		vu1.m_pMemoryMap->InsertWriteMap(0x00000000, 0x00003FFF, h->vuMem1, 0x00);
++		vu1.m_pMemoryMap->InsertWriteMap(0x00008000, 0x00008FFF, [h](uint32 address, uint32 value) -> uint32 {
++			if(address == CVpu::VU_ADDR_XGKICK)
++			{
++				h->xgkicks++;
++				GifKick(*h, value);
++			}
++			return 0;
++		}, 0x01);
++		vu1.m_pMemoryMap->InsertInstructionMap(0x00000000, 0x00003FFF, h->microMem1, 0x01);
++		vu1.m_pArch = &h->maVu1;
++		vu1.m_pAddrTranslator = CMIPS::TranslateAddress64;
++		vu1.m_vuMem = h->vuMem1;
++		h->vuStateConnection = h->vpu1->VuStateChanged.Connect([h](CVpu::VU_STATE state) {
++			if(state == CVpu::VU_STATE_RUNNING)
++				h->vuStarts++;
++		});
++		h->vpu1->Reset();
++	}
++
++	// Worker thread: the live stream, VIF1, VU1 (its JIT code lives in this thread's function
++	// table) and the GIF; everything for the GS goes to the page thread through Play!'s mailbox.
++	void* HostThread(void* arg)
++	{
++		Host& h = *static_cast<Host*>(arg);
++		RegisterJitFunctions();
++		SetupEmulation(&h);
++		h.gifSink = std::make_unique<GifSink>(h);
++		h.gif->SetAsyncSink(h.gifSink.get());
++		{
++			pthread_t gifThread;
++			pthread_create(&gifThread, nullptr, &GifThread, &h);
++			pthread_detach(gifThread);
++		}
++		for(;;)
++		{
++			bool drew = false;
++			for(int i = 0; i < 4 && ProcessPackets(h); i++)
++				drew = true;
++			if(!drew)
++			{
++				if(!h.ring->producerAlive && h.headerDone)
++					break;
++				const double sleepStart = emscripten_get_now();
++				usleep(300); // the game writes a frame every ~16 ms
++				h.idleMs += emscripten_get_now() - sleepStart;
++			}
++		}
++		return nullptr;
++	}
++
++	void RegisterJitFunctions()
++	{
++		using Jitter::CWasmFunctionRegistry;
++		CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&EmptyBlockHandler), "_EmptyBlockHandler", "vi");
++		CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&MemoryUtils_GetByteProxy), "_MemoryUtils_GetByteProxy", "iii");
++		CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&MemoryUtils_GetHalfProxy), "_MemoryUtils_GetHalfProxy", "iii");
++		CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&MemoryUtils_GetWordProxy), "_MemoryUtils_GetWordProxy", "iii");
++		CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&MemoryUtils_GetDoubleProxy), "_MemoryUtils_GetDoubleProxy", "jii");
++		CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&MemoryUtils_SetByteProxy), "_MemoryUtils_SetByteProxy", "viii");
++		CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&MemoryUtils_SetHalfProxy), "_MemoryUtils_SetHalfProxy", "viii");
++		CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&MemoryUtils_SetWordProxy), "_MemoryUtils_SetWordProxy", "viii");
++		CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&MemoryUtils_SetDoubleProxy), "_MemoryUtils_SetDoubleProxy", "viji");
++		CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&LWL_Proxy), "_LWL_Proxy", "iiii");
++		CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&LWR_Proxy), "_LWR_Proxy", "iiii");
++		CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&LDL_Proxy), "_LDL_Proxy", "jiji");
++		CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&LDR_Proxy), "_LDR_Proxy", "jiji");
++		CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&SWL_Proxy), "_SWL_Proxy", "viii");
++		CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&SWR_Proxy), "_SWR_Proxy", "viii");
++		CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&SDL_Proxy), "_SDL_Proxy", "viji");
++		CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&SDR_Proxy), "_SDR_Proxy", "viji");
++	}
++
++	// Main thread: builds the GS/VIF1/VU1/GIF and starts the frame loop.
++	// GL thread: owns the canvas (transferred as an OffscreenCanvas), the WebGL context and Play!'s
++	// GS; draws in its own requestAnimationFrame loop.
++	void* GlThread(void* arg)
++	{
++		auto* ring = static_cast<ps2live::RingHeader*>(arg);
++
++		EmscriptenWebGLContextAttributes attr;
++		emscripten_webgl_init_context_attributes(&attr);
++		attr.majorVersion = 2;
++		attr.minorVersion = 0;
++		attr.alpha = EM_FALSE;
++		attr.antialias = EM_FALSE;
++		// Not preserved: the browser swaps instead of copying the whole picture every frame (a
++		// heavy copy on phone GPUs). A frame with no flip draws nothing, so the last one stays.
++		attr.preserveDrawingBuffer = EM_FALSE;
++		attr.powerPreference = EM_WEBGL_POWER_PREFERENCE_HIGH_PERFORMANCE;
++		attr.proxyContextToMainThread = EMSCRIPTEN_WEBGL_CONTEXT_PROXY_DISALLOW;
++		g_context = emscripten_webgl_create_context("#canvas", &attr);
++		if(g_context <= 0)
++		{
++			std::printf("[webgs] WebGL2 is not available (%d)\n", static_cast<int>(g_context));
++			ring->consumerQuit = 1;
++			return nullptr;
++		}
++
++		Host* h = new Host();
++		h->ring = ring;
++		h->ringData = ps2live::ringData(ring);
++		h->ringCapacity = ring->capacity;
++		h->ram = static_cast<uint8*>(std::aligned_alloc(16, PS2::EE_RAM_SIZE));
++		h->spr = static_cast<uint8*>(std::aligned_alloc(16, PS2::EE_SPR_SIZE));
++		h->vuMem0 = static_cast<uint8*>(std::aligned_alloc(16, PS2::VUMEM0SIZE));
++		h->vuMem1 = static_cast<uint8*>(std::aligned_alloc(16, PS2::VUMEM1SIZE));
++		h->microMem1 = new uint8[PS2::MICROMEM1SIZE];
++		std::memset(h->ram, 0, PS2::EE_RAM_SIZE);
++		std::memset(h->vuMem1, 0, PS2::VUMEM1SIZE);
++		std::memset(h->microMem1, 0, PS2::MICROMEM1SIZE);
++
++		CGSH_OpenGL::RegisterPreferences();
++		CAppConfig::GetInstance().SetPreferenceInteger(PREF_CGSH_OPENGL_RESOLUTION_FACTOR, g_scale);
++		std::printf("[webgs] internal resolution x%d\n", g_scale);
++
++		h->gsWeb = new CGSH_Web(g_context);
++		h->gsWeb->debug = g_debug;
++		h->gs = h->gsWeb;
++		h->gs->SetIntc(&h->intc);
++
++		h->newFrameConnection = h->gs->OnNewFrame.Connect([h](uint32 drawCalls) {
++			h->drawCalls += drawCalls;
++			h->frames++; // a game frame finished on screen (runs on the page thread)
++		});
++		h->flipConnection = h->gs->OnFlipComplete.Connect([h]() { h->flips++; });
++		h->gs->Initialize();
++		h->gsWeb->Pump();
++		UpdatePresentation(*h);
++		h->gs->Reset();
++		h->gsWeb->Pump();
++		if(g_hd)
++			h->gsWeb->EnableHdTextures("data/hd");
++		h->gsWeb->SetHalfRateImage(g_halfRate);
++		h->gsWeb->SetFsr(g_fsr);
++		h->gsWeb->m_depthMaskPass = g_dbzOpt_zmask;
++		h->gsWeb->m_skipTransferredWriteBacks = g_dbzOpt_wbskip;
++		h->gsWeb->m_softwareSpritesEnabled = g_dbzOpt_swsprites;
++		h->gsWeb->m_exactFbTextures = g_dbzOpt_exactfbtex;
++		h->gsWeb->m_exactSmallBuffers = g_dbzOpt_exactsmall;
++		h->gsWeb->SetProducerSwizzle(true); // texture uploads swizzled in the VIF1/VU1 worker, not here
++		{
++			// Shaders built ahead of time: the game's known variants, then the ones this browser
++			// met in earlier sessions (IndexedDB). With KHR_parallel_shader_compile the driver
++			// builds them in the background; without it, one per frame.
++			const bool parallel = EM_ASM_INT({ return GLctx.getExtension('KHR_parallel_shader_compile') ? 1 : 0; }) != 0;
++			h->gsWeb->SetParallelShaderCompile(parallel);
++			static const uint64_t knownShaders[] = {
++#include "known_shaders.inc"
++			    0};
++			h->gsWeb->PrecompileShaders(knownShaders, std::size(knownShaders) - 1);
++			std::printf("[webgs] %zu known shaders queued (parallel compile %s)\n", std::size(knownShaders) - 1, parallel ? "yes" : "no");
++			EM_ASM({
++				try
++				{
++					const open = indexedDB.open('ps2x', 1);
++					open.onupgradeneeded = () => open.result.createObjectStore('kv');
++					open.onsuccess = () => {
++						const get = open.result.transaction('kv').objectStore('kv').get('shaders-v1');
++						get.onsuccess = () => {
++							if(get.result) _ps2xPrecompileShaderList(stringToNewUTF8(get.result));
++						};
++					};
++				}
++				catch(e)
++				{
++				}
++			});
++		}
++		std::printf("[webgs] picture at %d fps\n", g_halfRate ? 30 : 60);
++
++		ring->consumerAlive = 1;
++		ring->consumerFlags = 1; // never waits on the data event: no wake-ups needed
++		g_host = h;
++		h->statsStart = 0.0;
++		pthread_t thread;
++		pthread_create(&thread, nullptr, &HostThread, h);
++		pthread_detach(thread);
++		std::printf("[webgs] GS host started (Play! GS on WebGL2 in its own thread, VIF1/VU1/GIF in another)\n");
++		emscripten_request_animation_frame_loop(&OnAnimationFrame, nullptr);
++		emscripten_exit_with_live_runtime(); // back to this worker's event loop, which runs the frames
++		return nullptr;
++	}
++
++	// Page thread: only what needs the DOM: keyboard, gamepads and the canvas size.
++	EM_BOOL OnPageFrame(double, void*)
++	{
++		double cssWidth = 0.0, cssHeight = 0.0;
++		emscripten_get_element_css_size("#canvas", &cssWidth, &cssHeight);
++		double ratio = emscripten_get_device_pixel_ratio();
++		// Phones: at most 1080 device pixels on the short side. Their 3x screens made every
++		// full-screen pass (FSR, clears, the browser's compositing) work on ~3 million pixels,
++		// more than the eye gets from a PS2 picture there; the browser stretches the rest.
++		static const bool phone = EM_ASM_INT({ return /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent) ? 1 : 0; }) != 0;
++		const double shortSide = std::min(cssWidth, cssHeight) * ratio;
++		if(phone && shortSide > 1080.0)
++			ratio *= 1080.0 / shortSide;
++		g_wantedWidth.store(static_cast<uint32_t>(cssWidth * ratio + 0.5));
++		g_wantedHeight.store(static_cast<uint32_t>(cssHeight * ratio + 0.5));
++		PublishPad(g_ring);
++		return g_ring->producerAlive ? EM_TRUE : EM_FALSE;
++	}
++
++	void StartOnMainThread(void* arg)
++	{
++		g_ring = static_cast<ps2live::RingHeader*>(arg);
++		// Internal resolution: <page>?scale=N (1 = native PS2). Default 2, or 1 on phones, tablets
++		// and machines with few cores, where the GPU has less room.
++		g_scale = EM_ASM_INT({
++			const small = /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent) || (navigator.hardwareConcurrency || 8) <= 4;
++			const fallback = small ? 1 : 2;
++			const value = parseInt(new URLSearchParams(location.search).get('scale') || String(fallback), 10);
++			return value >= 1 && value <= 4 ? value : fallback;
++		});
++		g_debug = EM_ASM_INT({ return new URLSearchParams(location.search).has('debug') ? 1 : 0; }) != 0;
++		g_hd = EM_ASM_INT({ return new URLSearchParams(location.search).get('hd') === '1' ? 1 : 0; }) != 0;   // [dbz] no HD pack: off unless ?hd=1
++		g_fsr = EM_ASM_INT({ return new URLSearchParams(location.search).get('fsr') === '0' ? 0 : 1; }) != 0;
++		g_wide = EM_ASM_INT({ return new URLSearchParams(location.search).get('aspect') === '43' ? 0 : 1; }) != 0;
++		g_vuContextLocals = EM_ASM_INT({ return new URLSearchParams(location.search).get('vulocals') === '1' ? 1 : 0; }) != 0;
++		g_vuModuleGroups = EM_ASM_INT({ return new URLSearchParams(location.search).get('vumodules') === '1' ? 1 : 0; }) != 0;
++		g_vuFlagAnalysis = EM_ASM_INT({ return new URLSearchParams(location.search).get('vuflags') === '0' ? 0 : 1; }) != 0;
++		g_vuFlagTracking = EM_ASM_INT({ return new URLSearchParams(location.search).get('vuflagtrack') === '0' ? 0 : 1; }) != 0;
++		g_dbzOpt_zmask = EM_ASM_INT({ return new URLSearchParams(location.search).get('zmask') === '0' ? 0 : 1; }) != 0;
++		g_dbzOpt_wbskip = EM_ASM_INT({ const v = new URLSearchParams(location.search).get('wbskip'); return v === null ? 2 : (parseInt(v) || 0); });
++		g_dbzOpt_swsprites = EM_ASM_INT({ return new URLSearchParams(location.search).get('swsprites') === '1' ? 1 : 0; }) != 0;
++		g_dbzOpt_exactfbtex = EM_ASM_INT({ return new URLSearchParams(location.search).get('exactfbtex') === '0' ? 0 : 1; }) != 0;
++		g_dbzOpt_exactsmall = EM_ASM_INT({ return new URLSearchParams(location.search).get('exactsmall') === '1' ? 1 : 0; }) != 0;
++		std::printf("[webgs] dbz options: zmask %d wbskip %d swsprites %d exactfbtex %d exactsmall %d\n", g_dbzOpt_zmask, g_dbzOpt_wbskip,
++		            g_dbzOpt_swsprites, g_dbzOpt_exactfbtex, g_dbzOpt_exactsmall);
++		g_vuSuperblocks = EM_ASM_INT({ return new URLSearchParams(location.search).get('superblocks') === '0' ? 0 : 1; }) != 0;
++		g_vuSlowPercent = EM_ASM_INT({ return parseInt(new URLSearchParams(location.search).get('vuslow') || '0', 10) || 0; });
++		g_vuDump = EM_ASM_INT({ return new URLSearchParams(location.search).has('vudump') ? 1 : 0; }) != 0;
++		g_vuStats = EM_ASM_INT({ return new URLSearchParams(location.search).has('vustats') ? 1 : 0; }) != 0;
++		g_vuChainParam = EM_ASM_INT({
++			const chain = new URLSearchParams(location.search).get('chain');
++			return chain === '0' ? 0 : chain === 'dispatch' ? 2 : 1;
++		});
++		g_halfRate = EM_ASM_INT({
++			const fps = new URLSearchParams(location.search).get('fps');
++			return fps === '30' ? 1 : 0;
++		}) != 0;
++		OnPageFrame(0.0, nullptr); // first size, before the GL thread starts
++
++		emscripten_set_keydown_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, EM_TRUE, &OnKey);
++		emscripten_set_keyup_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, EM_TRUE, &OnKey);
++		emscripten_set_blur_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, EM_TRUE, &OnBlur);
++		emscripten_request_animation_frame_loop(&OnPageFrame, nullptr);
++
++		pthread_attr_t attr;
++		pthread_attr_init(&attr);
++		emscripten_pthread_attr_settransferredcanvases(&attr, "#canvas");
++		pthread_t thread;
++		const int error = pthread_create(&thread, &attr, &GlThread, g_ring);
++		pthread_attr_destroy(&attr);
++		if(error != 0)
++		{
++			std::printf("[webgs] could not give the canvas to a thread (%d)\n", error);
++			g_ring->consumerQuit = 1;
++			return;
++		}
++		pthread_detach(thread);
++	}
++} // namespace
++
++// Called by gs_dump_writer.cpp on the game's thread when PS2X_GS_LIVE=1.
++bool ps2xWebStartGsHost(ps2live::RingHeader* header)
++{
++	emscripten_async_run_in_main_runtime_thread(EM_FUNC_SIG_VI, &StartOnMainThread, header);
++	return true;
++}
++
++// ?vudump=1: [size (uint32)][blob] of the hottest VU1 blocks (see CGenericMipsExecutor::DumpHotBlocks)
++extern "C" EMSCRIPTEN_KEEPALIVE uint8_t* ps2xVuDump()
++{
++	static std::vector<uint8_t> copy;
++	std::lock_guard<std::mutex> lock(g_vuDumpMutex);
++	const uint32_t size = static_cast<uint32_t>(g_vuDumpBlob.size());
++	copy.resize(4 + size);
++	std::memcpy(copy.data(), &size, 4);
++	std::memcpy(copy.data() + 4, g_vuDumpBlob.data(), size);
++	return copy.data();
++}
++
++extern "C" EMSCRIPTEN_KEEPALIVE void ps2xPrecompileShaderList(char* list)
++{
++	std::vector<uint64_t> caps;
++	for(char* item = std::strtok(list, ","); item; item = std::strtok(nullptr, ","))
++		caps.push_back(std::strtoull(item, nullptr, 16));
++	std::free(list);
++	if(g_host && !caps.empty())
++	{
++		g_host->gsWeb->PrecompileShaders(caps.data(), caps.size());
++		std::printf("[webgs] %zu shaders from earlier sessions queued\n", caps.size());
++	}
++}
+diff -ruN a/ps2xRuntime/web/site/index.html b/ps2xRuntime/web/site/index.html
+--- a/ps2xRuntime/web/site/index.html	1969-12-31 18:00:00
++++ b/ps2xRuntime/web/site/index.html	2026-10-19 04:12:22
+@@ -0,0 +1,299 @@
++<!doctype html>
++<html lang="es">
++<head>
++<meta charset="utf-8">
++<meta name="viewport" content="width=device-width, initial-scale=1">
++<title>Dragon Ball Z Budokai Tenkaichi 4</title>
++<style>
++  :root { color-scheme: dark; --bg: #0b0b0d; --fg: #e8e6e3; --dim: #8b8a88; --accent: #e8792b; }
++  * { box-sizing: border-box; }
++  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; }
++  main { height: 100%; display: grid; grid-template-rows: 1fr auto; }
++  #stage { position: relative; display: grid; place-items: center; overflow: hidden; }
++  #canvas { width: min(100vw, calc((100vh - 40px) * 16 / 9)); aspect-ratio: 16 / 9; background: #000; outline: none; }
++  /* Fullscreen: the whole screen */
++  #stage:fullscreen { background: #000; }
++  #stage:fullscreen #canvas { width: 100vw; height: 100vh; aspect-ratio: auto; }
++  #status { position: absolute; inset: 0; display: grid; place-items: center; pointer-events: none; text-align: center; }
++  #status[hidden] { display: none; }
++  #status b { display: block; font-size: 18px; margin-bottom: 6px; }
++  #play { pointer-events: auto; margin-top: 18px; font: 600 16px system-ui, sans-serif; color: #111; background: var(--accent);
++          border: 0; border-radius: 6px; padding: 10px 28px; cursor: pointer; }
++  #settings { pointer-events: auto; margin: 16px auto 0; display: grid; grid-template-columns: auto auto; gap: 8px 12px;
++              align-items: center; text-align: left; font-size: 13px; color: var(--dim); width: max-content; max-width: calc(100vw - 32px); }
++  #settings select { font: 13px system-ui, sans-serif; color: var(--fg); background: #1a1a1d; border: 1px solid #333; border-radius: 4px; padding: 4px 6px; }
++  #bar { width: 260px; height: 4px; background: #222; border-radius: 2px; overflow: hidden; margin: 10px auto 0; }
++  #bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .2s; }
++  footer { display: flex; gap: 16px; align-items: center; padding: 8px 16px; color: var(--dim); font-size: 12px; }
++  footer button { background: none; border: 1px solid #333; color: var(--fg); border-radius: 4px; padding: 3px 8px; cursor: pointer; }
++  #log { display: none; position: fixed; right: 0; bottom: 36px; width: min(640px, 100vw); height: 40vh; overflow: auto;
++         background: rgba(0,0,0,.85); color: #bdbdbd; font: 11px/1.35 ui-monospace, monospace; padding: 8px; white-space: pre-wrap; }
++  #log.open { display: block; }
++</style>
++</head>
++<body>
++<main>
++  <div id="stage">
++    <canvas id="canvas" tabindex="0" oncontextmenu="event.preventDefault()"></canvas>
++    <div id="status"><div><b id="statusTitle">Cargando…</b><span id="statusText">Descargando el juego (solo la primera vez)</span><div id="bar"><i></i></div>
++      <button id="play">▶ Jugar</button>
++      <div id="settings">
++        <label for="optScale">Resolución</label>
++        <select id="optScale">
++          <option value="auto">Automática</option>
++          <option value="1">1x · nativa PS2 (más rápida)</option>
++          <option value="2">2x · 1280×896</option>
++          <option value="3">3x · 1920×1344</option>
++          <option value="4">4x · 2560×1792</option>
++          <option value="5">5x · 3200×2240</option>
++          <option value="6">6x · 3840×2688 (4K)</option>
++        </select>
++        <label for="optFsr">Escalado</label>
++        <select id="optFsr">
++          <option value="1">FSR 1 (más nítido)</option>
++          <option value="0">Normal (bilineal)</option>
++        </select>
++        <label for="optFps">Imagen</label>
++        <select id="optFps">
++          <option value="auto">Cada cuadro del juego</option>
++          <option value="30">Máximo 30 fps (menos trabajo gráfico)</option>
++        </select>
++        <label for="optAudio">Sonido</label>
++        <select id="optAudio">
++          <option value="auto">Automático</option>
++          <option value="stable">Estable (más búfer, para teléfonos)</option>
++          <option value="normal">Normal</option>
++          <option value="low">Baja latencia (PC rápido)</option>
++        </select>
++      </div></div></div>
++  </div>
++  <footer>
++    <span>Flechas = cruceta · WASD = stick · Z X C V = □ ✕ ○ △ · Q E 1 3 = L1 R1 L2 R2 · Enter = START · mando compatible</span>
++    <span id="fps"></span>
++    <button id="sound" hidden>Activar sonido</button>
++    <span style="flex:1"></span>
++    <button id="full">Pantalla completa</button>
++    <button id="diagBtn">Enviar diagnóstico</button>
++    <button id="logBtn">Log</button>
++  </footer>
++</main>
++<pre id="log"></pre>
++<script>
++  const log = document.getElementById('log');
++  const statusBox = document.getElementById('status');
++  const statusTitle = document.getElementById('statusTitle');
++  const statusText = document.getElementById('statusText');
++  const bar = document.querySelector('#bar i');
++  const fps = document.getElementById('fps');
++  const lines = [];
++  const maxLines = new URLSearchParams(location.search).has('debug') ? 400000 : 2000;
++  function append(text) {
++    text = text.replace(/\[MC\][^\[]*/g, ''); // memory card chatter (several lines per frame)
++    if (!text.trim()) return;
++    lines.push(text);
++    if (lines.length > maxLines) lines.splice(0, maxLines / 4);
++    if (log.classList.contains('open')) { log.textContent = lines.join('\n'); log.scrollTop = log.scrollHeight; }
++    const m = /\[webgs\] ([\d.]+) game fps/.exec(text);
++    if (m) fps.textContent = m[1] + ' fps';
++    if (text.includes('[webgs] live GS stream connected')) statusBox.hidden = true;
++  }
++  // Sends this session's statistics (frame times, sound, disc waits) and the device's details to
++  // the server, only when the player presses the button, to find what slows a given device down.
++  const diagBtn = document.getElementById('diagBtn');
++  diagBtn.onclick = async () => {
++    let gpu = '?';
++    try {
++      const gl = document.createElement('canvas').getContext('webgl2');
++      const info = gl.getExtension('WEBGL_debug_renderer_info');
++      gpu = info ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
++    } catch (e) {}
++    const report = [
++      'url: ' + location.href, 'agent: ' + navigator.userAgent, 'gpu: ' + gpu,
++      `cores: ${navigator.hardwareConcurrency} memory: ${navigator.deviceMemory || '?'} GB screen: ${screen.width}x${screen.height} @${devicePixelRatio}`,
++      'audio: ' + (typeof audioContext !== 'undefined' && audioContext ? `${audioContext.state} base latency ${audioContext.baseLatency} output latency ${audioContext.outputLatency}` : 'none'),
++      '', ...lines.slice(-3000)].join('\n');
++    diagBtn.disabled = true; diagBtn.textContent = 'Enviando…';
++    try {
++      const response = await fetch('diag', { method: 'POST', body: report });
++      diagBtn.textContent = response.ok ? 'Enviado ✓' : 'Error al enviar';
++    } catch (e) { diagBtn.textContent = 'Error al enviar'; }
++    setTimeout(() => { diagBtn.disabled = false; diagBtn.textContent = 'Enviar diagnóstico'; }, 4000);
++  };
++  document.getElementById('logBtn').onclick = () => { log.classList.toggle('open'); log.textContent = lines.join('\n'); };
++  document.getElementById('full').onclick = () => document.getElementById('stage').requestFullscreen?.();
++  if (!crossOriginIsolated) {
++    statusTitle.textContent = 'El navegador no permite hilos aquí';
++    statusText.textContent = 'La página necesita las cabeceras COOP/COEP del servidor.';
++  }
++  let audioContext = null;
++  const isMobile = /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);
++  var Module = {
++    canvas: document.getElementById('canvas'),
++    print: append,
++    printErr: append,
++    setStatus: (text) => {
++      const m = /\((\d+(\.\d+)?)\/(\d+)\)/.exec(text);
++      if (m) bar.style.width = (100 * m[1] / m[3]).toFixed(1) + '%';
++    },
++    onAbort: (what) => { statusBox.hidden = false; statusTitle.textContent = 'Se detuvo'; statusText.textContent = String(what); },
++    monitorRunDependencies: (left) => { if (!left) { statusText.textContent = 'Arrancando el juego…'; bar.style.width = '100%'; } },
++    // The game starts on the "Jugar" click: browsers only allow sound after one, and this way the
++    // sound is there from the first video. The download goes on meanwhile.
++    preRun: [() => Module.addRunDependency('play-click'), () => {
++      // Diagnostics: ?env=NAME=value sets an environment variable of the game code
++      for (const kv of new URLSearchParams(location.search).getAll('env')) {
++        const i = kv.indexOf('=');
++        if (i > 0 && typeof ENV == 'object') ENV[kv.slice(0, i)] = kv.slice(i + 1);
++      }
++    }],
++  };
++  // Settings on the start screen: kept in this browser, handed to the game as page parameters
++  // (?scale, ?fsr, ?hd, ?audio), which a link can also set.
++  const settingNames = { scale: 'optScale', fsr: 'optFsr', fps: 'optFps', audio: 'optAudio' };
++  const saved = (() => { try { return JSON.parse(localStorage.getItem('ps2x-settings') || '{}'); } catch (e) { return {}; } })();
++  const params = new URLSearchParams(location.search);
++  for (const [name, id] of Object.entries(settingNames)) {
++    const value = params.get(name) ?? saved[name];
++    const select = document.getElementById(id);
++    if (value !== undefined && [...select.options].some((o) => o.value === value)) select.value = value;
++  }
++  function applySettings() {
++    const chosen = {};
++    for (const [name, id] of Object.entries(settingNames)) {
++      chosen[name] = document.getElementById(id).value;
++      if (chosen[name] === 'auto') params.delete(name); else params.set(name, chosen[name]);
++    }
++    try { localStorage.setItem('ps2x-settings', JSON.stringify(chosen)); } catch (e) {}
++    history.replaceState(null, '', location.pathname + (params.toString() ? '?' + params : ''));
++  }
++  const audioMode = () => { const m = new URLSearchParams(location.search).get('audio'); return m && m !== 'auto' ? m : (isMobile ? 'stable' : 'normal'); };
++  const playButton = document.getElementById('play');
++  playButton.onclick = () => {
++    applySettings();
++    document.getElementById('settings').remove();
++    playButton.remove();
++    // Stable sound (phones): larger output buffers ('playback'), fewer glitches when the CPU is busy
++    audioContext = new AudioContext({ sampleRate: 48000, latencyHint: audioMode() === 'stable' ? 'playback' : 'interactive' });
++    audioContext.resume();
++    document.getElementById('canvas').focus();
++    Module.removeRunDependency('play-click');
++  };
++  document.getElementById('canvas').focus();
++
++  // Sound: the game writes 48 kHz stereo into a ring buffer in its (shared) memory and this
++  // worklet plays it from there. Browsers only start audio after a click or a key press.
++  const audioWorklet = `
++    class Ps2xOutput extends AudioWorkletProcessor {
++      constructor(options) {
++        super();
++        const o = options.processorOptions;
++        this.ring = new Int16Array(o.buffer, o.ring, o.frames * 2);
++        this.index = new Uint32Array(o.buffer, o.index, 2);
++        this.frames = o.frames;
++        this.waiting = true;
++        this.lastL = this.lastR = 0;
++        this.fadeLeft = 0; this.fadeFrom = 0; this.fadeIn = 128;
++        this.underruns = this.skips = this.blocks = 0;
++        this.frac = 0;
++        // Frames kept queued: ~50 ms (phones ~100 ms), growing after each underrun up to 150 ms
++        // (phones 200 ms), whose threads get descheduled more often
++        // [starting target, largest target] in frames (48 kHz); stable rides out ~1/3 s hiccups
++        const sizes = { low: [1600, 4800], normal: [2400, 7200], stable: [6000, 16000] }[o.mode] || [2400, 7200];
++        this.target = sizes[0];
++        this.maxTarget = sizes[1];
++        this.level = this.target;
++        this.capture = null;
++        this.port.onmessage = (e) => { if (e.data === 'capture') this.capture = []; };
++      }
++      // No allocations in here: the audio thread must never wait for the garbage collector
++      // (on phones its pauses were heard as glitches).
++      left16(pos) { return this.ring[(pos % this.frames) * 2] * (1 / 32768); }
++      right16(pos) { return this.ring[(pos % this.frames) * 2 + 1] * (1 / 32768); }
++      process(inputs, outputs) {
++        const left = outputs[0][0], right = outputs[0][1];
++        const written = Atomics.load(this.index, 0);
++        let read = Atomics.load(this.index, 1);
++        let queued = (written - read) >>> 0;
++        // Far too much queued (the game caught up after a stall): jump ahead, cross-fading from the
++        // old position over 128 samples (a speed-up would be heard as faster, higher sound)
++        if (queued > Math.min(this.frames - 2048, this.target * 2.5)) {
++          this.fadeFrom = read; this.fadeLeft = 128;
++          read = (written - this.target) >>> 0; queued = this.target; this.level = queued; this.skips++;
++        }
++        // Back from a gap as soon as some sound is queued (it fades in), not after a long silence
++        if (this.waiting && queued >= this.target * 0.4) { this.waiting = false; this.fadeIn = 0; }
++        if (!this.waiting && queued < left.length + 2) {
++          // Ran dry: keep a bit more sound queued from now on
++          this.waiting = true; this.underruns++;
++          this.target = Math.min(this.target + 600, this.maxTarget);
++        }
++        // The game's clock and the sound card's differ (the game makes ~48-49 kHz): play slightly
++        // faster or slower, at most 3% (not heard), to keep the target queued
++        this.level += (queued - this.level) * 0.01;
++        const step = 1 + Math.max(-0.03, Math.min(0.03, (this.level - this.target) / this.target * 0.04));
++        for (let i = 0; i < left.length; i++) {
++          if (!this.waiting && ((written - read) >>> 0) > 1) {
++            const next = (read + 1) >>> 0;
++            const l0 = this.left16(read), r0 = this.right16(read);
++            let outL = l0 + (this.left16(next) - l0) * this.frac;
++            let outR = r0 + (this.right16(next) - r0) * this.frac;
++            if (this.fadeLeft > 0) { // cross-fade from where it was before a jump
++              const k = this.fadeLeft / 128;
++              outL = outL * (1 - k) + this.left16(this.fadeFrom) * k;
++              outR = outR * (1 - k) + this.right16(this.fadeFrom) * k;
++              this.fadeFrom = (this.fadeFrom + 1) >>> 0; this.fadeLeft--;
++            }
++            if (this.fadeIn < 128) { // back from a gap: fade in instead of a click
++              const g = ++this.fadeIn / 128;
++              outL = this.lastL + (outL - this.lastL) * g; outR = this.lastR + (outR - this.lastR) * g;
++            }
++            this.lastL = outL;
++            this.lastR = outR;
++            this.frac += step;
++            const whole = Math.floor(this.frac);
++            this.frac -= whole;
++            read = (read + whole) >>> 0;
++          } else {
++            this.lastL *= 0.995; this.lastR *= 0.995;
++          }
++          left[i] = this.lastL;
++          right[i] = this.lastR;
++          if (this.capture && !this.waiting) { this.capture.push(this.lastL); if (this.capture.length >= 48000 * 8) { this.port.postMessage({ capture: this.capture }); this.capture = null; } }
++        }
++        Atomics.store(this.index, 1, read);
++        if (++this.blocks % 1500 === 0) {
++          const produced = ((written - (this.lastWritten ?? written)) >>> 0) / (currentTime - (this.lastTime ?? currentTime) || 1);
++          this.lastWritten = written; this.lastTime = currentTime;
++          this.port.postMessage({ underruns: this.underruns, skips: this.skips, queued, step, produced, target: this.target });
++        }
++        return true;
++      }
++    }
++    registerProcessor('ps2x-output', Ps2xOutput);`;
++  async function ps2xStartAudio(buffer, ring, frames, index) {
++    audioContext ??= new AudioContext({ sampleRate: 48000, latencyHint: audioMode() === 'stable' ? 'playback' : 'interactive' });
++    const url = URL.createObjectURL(new Blob([audioWorklet], { type: 'text/javascript' }));
++    await audioContext.audioWorklet.addModule(url);
++    const node = new AudioWorkletNode(audioContext, 'ps2x-output', {
++      numberOfInputs: 0, outputChannelCount: [2],
++      processorOptions: { buffer, ring, frames, index, mode: audioMode() },
++    });
++    node.connect(audioContext.destination);
++    node.port.onmessage = (e) => {
++      if (e.data.capture) { window.ps2xAudioCapture = e.data.capture; return; }
++      append(`[audio] underruns ${e.data.underruns}, skips ${e.data.skips}, queued ${e.data.queued}, rate ${e.data.step.toFixed(4)}, target ${e.data.target}, game makes ${e.data.produced.toFixed(0)} Hz`);
++    };
++    window.ps2xAudioNode = node;
++    if (audioContext.state !== 'running') sound.hidden = false;
++  }
++  const sound = document.getElementById('sound');
++  function resumeAudio() {
++    if (audioContext && audioContext.state !== 'running') audioContext.resume().then(() => { sound.hidden = true; });
++  }
++  for (const type of ['pointerdown', 'keydown']) window.addEventListener(type, resumeAudio, { capture: true });
++  window.addEventListener('gamepadconnected', resumeAudio);
++  sound.onclick = resumeAudio;
++</script>
++<script src="ps2EntryRunner.js"></script>
++</body>
++</html>
+diff -ruN a/ps2xRuntime/web/wasm_compat.h b/ps2xRuntime/web/wasm_compat.h
+--- a/ps2xRuntime/web/wasm_compat.h	1969-12-31 18:00:00
++++ b/ps2xRuntime/web/wasm_compat.h	2026-10-19 03:56:25
+@@ -0,0 +1,19 @@
++// [web] Force-included in every translation unit of the browser build (web/web.cmake).
++#pragma once
++#if defined(__EMSCRIPTEN__)
++#include <xmmintrin.h>
++#ifdef __cplusplus
++// xxhash.h includes <arm_neon.h> inside its extern "C" block on wasm SIMD, and that pulls in the em_asm
++// templates: include them here first, at C++ linkage.
++#include <emscripten/em_asm.h>
++#endif
++#ifdef __cplusplus
++extern "C" {
++#endif
++// Emscripten's SSE headers have _mm_getcsr but no _mm_setcsr: WebAssembly has no rounding-mode or
++// flush-to-zero control, so the native builds' MXCSR changes (EE rounding, VU denormals) are no-ops here.
++static inline void _mm_setcsr(unsigned int csr) { (void)csr; }
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff -ruN a/ps2xRuntime/web/web.cmake b/ps2xRuntime/web/web.cmake
+--- a/ps2xRuntime/web/web.cmake	1969-12-31 18:00:00
++++ b/ps2xRuntime/web/web.cmake	2026-10-19 04:28:56
+@@ -0,0 +1,216 @@
++# [web] Browser build of the runtime (Emscripten, included from ../CMakeLists.txt).
++#
++# The game runs on workers (PROXY_TO_PTHREAD); the page's main thread is the GS host: the live GS stream
++# (src/lib/ps2_gs_live.cpp, the same packets the PCSX2 host gets natively) drawn by Play!'s GS on WebGL2
++# (web/play_gs_host.cpp, shared with the NBA Street V3 browser port). The runtime's own window, GL renderer,
++# SDL2, ImGui overlay, Vulkan backends and front-end are not used: web/bt3gl_headless.cpp answers the raylib
++# calls (no window, no drawing; audio streams are mixed into the page's AudioWorklet ring).
++#
++#   PS2X_PLAY_ROOT   Play! source checkout          PS2X_PLAY_BUILD  its Emscripten build (build_wasm)
++#   PS2X_WASM_DEPS   prefix with FFmpeg built for wasm (include/, lib/)
++
++set(PS2X_PLAY_ROOT "$ENV{HOME}/NBAStreetRecomp/dbz/play-dbz" CACHE PATH "Play! source checkout (the DBZ copy: GS changes for its post-processing chain)")
++set(PS2X_PLAY_BUILD "${PS2X_PLAY_ROOT}/build_wasm" CACHE PATH "Play! Emscripten build directory")
++set(PS2X_WASM_DEPS "$ENV{HOME}/NBAStreetRecomp/wasm-deps/prefix" CACHE PATH "wasm FFmpeg prefix")
++set(PS2X_WASM_LINK_OPT "-O3" CACHE STRING "Optimization level of the final wasm link")
++set(PS2X_RAM_MB "128" CACHE STRING "Guest RDRAM backing store in MB")
++add_compile_definitions(PS2X_RAM_MB=${PS2X_RAM_MB} PS2X_WEB=1
++    XXH_VECTOR=0)   # xxhash's NEON path includes <arm_neon.h> (Emscripten's pulls in em_asm templates) inside extern "C"
++add_compile_options("SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/web/wasm_compat.h")
++include_directories("${CMAKE_CURRENT_SOURCE_DIR}/web/include")   # execinfo.h stand-in
++
++include(FetchContent)
++set(FETCHCONTENT_QUIET TRUE)
++
++# raylib headers (declarations only) + the headless implementation
++set(bt3gl_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/bt3gl")
++add_library(bt3gl STATIC "${CMAKE_CURRENT_SOURCE_DIR}/web/bt3gl_headless.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/web/glad_null.cpp")
++target_include_directories(bt3gl PUBLIC "${bt3gl_SOURCE_DIR}/src")
++target_compile_definitions(bt3gl PUBLIC PLATFORM_WEB_HEADLESS)
++
++# ImGui (the settings overlay keeps the game's settings; it never draws here)
++FetchContent_Declare(imgui GIT_REPOSITORY https://github.com/ocornut/imgui.git GIT_TAG "docking" GIT_SHALLOW TRUE)
++FetchContent_GetProperties(imgui)
++if(NOT imgui_POPULATED)
++    FetchContent_Populate(imgui)
++endif()
++set(PS2X_IMGUI_SOURCE_DIR "${imgui_SOURCE_DIR}")
++add_library(imgui STATIC
++    "${PS2X_IMGUI_SOURCE_DIR}/imgui.cpp"
++    "${PS2X_IMGUI_SOURCE_DIR}/imgui_draw.cpp"
++    "${PS2X_IMGUI_SOURCE_DIR}/imgui_tables.cpp"
++    "${PS2X_IMGUI_SOURCE_DIR}/imgui_widgets.cpp"
++    "${PS2X_IMGUI_SOURCE_DIR}/imgui_demo.cpp"
++    "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp")
++target_include_directories(imgui PUBLIC "${PS2X_IMGUI_SOURCE_DIR}" "${PS2X_IMGUI_SOURCE_DIR}/backends")
++target_compile_definitions(imgui PUBLIC IMGUI_ENABLE_DOCKING)
++
++add_library(ps2_host_backend INTERFACE)
++target_link_libraries(ps2_host_backend INTERFACE bt3gl)
++
++# FFmpeg (MPEG/PSS videos), built for wasm
++add_library(ffmpeg INTERFACE)
++target_include_directories(ffmpeg INTERFACE "${PS2X_WASM_DEPS}/include")
++target_link_libraries(ffmpeg INTERFACE
++    "${PS2X_WASM_DEPS}/lib/libavformat.a" "${PS2X_WASM_DEPS}/lib/libavcodec.a" "${PS2X_WASM_DEPS}/lib/libswresample.a"
++    "${PS2X_WASM_DEPS}/lib/libswscale.a" "${PS2X_WASM_DEPS}/lib/libavutil.a")
++
++add_library(ps2x_settings STATIC src/lib/ps2x_settings.cpp)
++target_include_directories(ps2x_settings PUBLIC include)
++
++add_subdirectory(third_party/rcheevos EXCLUDE_FROM_ALL)
++
++add_library(ps2_runtime STATIC
++    src/lib/game_overrides.cpp
++    src/lib/bt4mod_overrides.cpp
++    src/lib/ps2x_mods.cpp
++    src/lib/ps2x_dueldump.cpp
++    src/lib/ps2x_net_texdump.cpp
++    src/lib/ps2x_duel_fields.cpp
++    src/lib/ps2x_mainmenu.cpp
++    src/lib/ps2x_injected.cpp
++    src/lib/ps2_eeprof.cpp
++    src/lib/ps2_stepcensus.cpp
++    src/lib/ps2_seamprobe.cpp
++    src/lib/ps2_seammesh.cpp
++    src/lib/ps2_fiber.cpp
++    src/lib/ps2_gif_arbiter.cpp
++    src/lib/ps2_gs_live.cpp
++    src/lib/ps2_audio.cpp
++    src/lib/ps2_audio_vag.cpp
++    src/lib/ps2_host_audio.cpp
++    src/lib/ps2_host_window.cpp
++    src/lib/ui_sdl.cpp
++    src/lib/ps2_host_pad.cpp
++    src/lib/ps2_gs_gpu.cpp
++    src/lib/ps2_gs_gpu_renderer.cpp
++    src/lib/ps2_win_timer.cpp
++    src/lib/ps2_gs_memory.cpp
++    src/lib/ps2_gs_rasterizer.cpp
++    src/lib/ps2_texreplace.cpp
++    src/lib/ps2_coverage.cpp
++    src/lib/ps2_iop_module.cpp
++    src/lib/ps2_fmv_override.cpp
++    src/lib/ps2_netplay.cpp
++    src/lib/ps2x_achieve.cpp
++    src/lib/ps2x_notify.cpp
++    src/lib/ps2x_notify_sound.cpp
++    src/lib/ps2x_perf.cpp
++    src/lib/ps2x_memstat.cpp
++    src/lib/ps2_iop.cpp
++    src/lib/ps2_iop_audio.cpp
++    src/lib/ps2_iop_dbcman.cpp
++    src/lib/ps2_iop_sdrdrv.cpp
++    src/lib/ps2_iop_cl.cpp
++    src/lib/ps2_memory.cpp
++    src/lib/ps2_pad.cpp
++    src/lib/pad_config.cpp
++    src/lib/ps2_runtime.cpp
++    src/lib/ps2_interp.cpp
++    src/lib/ps2_vif1_interpreter.cpp
++    src/lib/ps2_vu1.cpp
++    src/lib/ps2_vu1_native.cpp
++    src/lib/games_database.cpp
++    src/gfx/gl/GlApi.cpp
++    src/gfx/gl/GlDevice.cpp
++    src/gfx/gl/GlGfx.cpp
++    src/gfx/gl/gsrl_vendor.cpp
++    src/gfx/gl/gsrl.cpp
++    src/gfx/gl_context.cpp
++    src/gfx/gs_resources.cpp
++    src/gfx/gs_rt.cpp
++    src/gfx/gs_gl.cpp
++    src/gfx/image_io.cpp
++    src/gfx/video_overlay.cpp)
++file(GLOB_RECURSE KERNEL_SRC_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel/*.cpp")
++target_sources(ps2_runtime PRIVATE ${KERNEL_SRC_FILES})
++target_include_directories(ps2_runtime PUBLIC include src/lib/Kernel src)
++target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2x_settings rcheevos)
++target_link_libraries(ps2_runtime PRIVATE imgui)
++# Same numeric contract as the native builds: no FMA contraction, type punning, wraparound.
++target_compile_options(ps2_runtime PRIVATE -O3 -fno-strict-aliasing -fwrapv -ffp-contract=off -flto=thin)
++
++# The game: generated EE code, the recompiled DBZP.BIN overlay, the recompiled IOP modules.
++file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*.cpp")
++file(GLOB RUNNER_OVERLAY_SRC_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/runner_overlay/*.cpp")
++list(REMOVE_ITEM RUNNER_SRC_FILES "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/main.cpp")
++file(GLOB IOP_NATIVE_SRC_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/iop_native/*/*.cpp")
++add_executable(ps2EntryRunner
++    ${RUNNER_SRC_FILES} ${RUNNER_OVERLAY_SRC_FILES} ${IOP_NATIVE_SRC_FILES}
++    src/main.cpp
++    src/lib/ps2_settings_overlay.cpp
++    src/gfx/ps2x_ui.cpp
++    web/web_platform.cpp
++    web/play_gs_host.cpp)
++set_source_files_properties(${RUNNER_OVERLAY_SRC_FILES} PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
++set(PS2X_RUNNER_UNITY_BUILD_BATCH_SIZE 16 CACHE STRING "Unity build batch size for ps2EntryRunner")
++set_target_properties(ps2EntryRunner PROPERTIES UNITY_BUILD ON UNITY_BUILD_BATCH_SIZE "${PS2X_RUNNER_UNITY_BUILD_BATCH_SIZE}")
++target_link_libraries(ps2EntryRunner PRIVATE ps2_runtime imgui)
++target_compile_definitions(ps2EntryRunner PRIVATE PS2X_ENABLE_DEBUG_UI=1)
++set(PS2X_RUNNER_OPT "-O2" CACHE STRING "Optimisation flag for the generated runner sources")
++target_compile_options(ps2EntryRunner PRIVATE ${PS2X_RUNNER_OPT} -ffp-contract=off -fno-strict-aliasing -fwrapv -flto=thin)
++target_precompile_headers(ps2EntryRunner PRIVATE
++    "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_runtime.h"
++    "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_functions.h"
++    "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_stubs.h"
++    "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_stubs.h"
++    "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_syscalls.h")
++set_source_files_properties(src/main.cpp src/lib/ps2_settings_overlay.cpp src/gfx/ps2x_ui.cpp ${IOP_NATIVE_SRC_FILES}
++    PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
++# Table registrations: huge initializer TUs, nothing to optimize.
++file(GLOB _ps2x_register_srcs CONFIGURE_DEPENDS
++    "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/register_functions.cpp"
++    "${CMAKE_CURRENT_SOURCE_DIR}/src/runner_overlay/overlay_register.cpp"
++    "${CMAKE_CURRENT_SOURCE_DIR}/src/iop_native/*/register_functions.cpp")
++set_source_files_properties(${_ps2x_register_srcs} PROPERTIES COMPILE_OPTIONS "-O0" SKIP_UNITY_BUILD_INCLUSION ON SKIP_PRECOMPILE_HEADERS ON)
++
++# The page side: Play!'s GS on WebGL2 (same libraries as the NBA Street V3 browser build)
++set(_play_deps "${PS2X_PLAY_ROOT}/deps")
++set_source_files_properties(web/play_gs_host.cpp PROPERTIES
++    SKIP_PRECOMPILE_HEADERS ON SKIP_UNITY_BUILD_INCLUSION ON
++    COMPILE_DEFINITIONS "GLES_COMPATIBILITY;LOGGING_ENABLED=0;HAVE_UNISTD_H;_IOP_EMULATE_MODULES=1;ZWRAP_USE_ZSTD"
++    INCLUDE_DIRECTORIES "${PS2X_PLAY_ROOT}/Source;${_play_deps}/CodeGen/include;${_play_deps}/Framework/include;${_play_deps}/Dependencies/ghc_filesystem/include;${_play_deps}/libchdr/include;${PS2X_PLAY_ROOT}/Source/app_shared")
++set_source_files_properties(web/web_platform.cpp PROPERTIES SKIP_PRECOMPILE_HEADERS ON SKIP_UNITY_BUILD_INCLUSION ON)
++set(_pb "${PS2X_PLAY_BUILD}/Source/ui_js")
++target_link_libraries(ps2EntryRunner PRIVATE
++    "${_pb}/gs/GSH_OpenGL/libgsh_opengl.a"
++    "${_pb}/gs/GSH_OpenGL/FrameworkOpenGl/libFramework_OpenGl.a"
++    "${_pb}/Source/libPlayCore.a"
++    "${_pb}/Source/CodeGen/libCodeGen.a"
++    "${_pb}/Source/Framework/libFramework.a"
++    "${_pb}/Source/Framework/zstd_zlibwrapper/liblibzstd_zlibwrapper_static.a"
++    "${_pb}/Source/Framework/zstd_zlibwrapper/zstd/lib/libzstd.a"
++    "${_pb}/Source/Framework/zstd_zlibwrapper/zlib/libzlibstatic.a"
++    "${_pb}/Source/libchdr/libchdr-static.a"
++    "${_pb}/Source/libchdr/deps/lzma-24.05/liblzma.a"
++    "${_pb}/Source/bzip2-1.0.6/libbz2.a"
++    "${_pb}/Source/xxHash/libxxhash.a"
++    "${_pb}/Source/app_shared/libapp_shared.a"
++    embind)
++
++set_target_properties(ps2EntryRunner PROPERTIES SUFFIX ".js")
++target_link_options(ps2EntryRunner PRIVATE
++    ${PS2X_WASM_LINK_OPT}
++    -sINITIAL_MEMORY=1024MB
++    -sALLOW_MEMORY_GROWTH=1
++    -sMAXIMUM_MEMORY=2GB # Play!'s JIT modules import the memory with a 2 GB maximum
++    -sSTACK_SIZE=16MB
++    -sDEFAULT_PTHREAD_STACK_SIZE=8MB
++    -sMALLOC=mimalloc
++    "-Wl,--thinlto-cache-dir=${CMAKE_BINARY_DIR}/thinlto-cache"
++    -sENVIRONMENT=web,worker
++    -sPROXY_TO_PTHREAD
++    -sWASMFS
++    -sUSE_WEBGL2=1
++    -sMIN_WEBGL_VERSION=2
++    -sMAX_WEBGL_VERSION=2
++    -sALLOW_TABLE_GROWTH
++    -sPTHREAD_POOL_SIZE=24
++    -sEXIT_RUNTIME=0
++    "--profiling-funcs"
++    "-sOFFSCREENCANVAS_SUPPORT=1"
++    "-sOFFSCREENCANVASES_TO_PTHREAD=''"
++    "--js-library=${CMAKE_CURRENT_SOURCE_DIR}/web/library_fetch_stream.js"
++    "-sEXPORTED_RUNTIME_METHODS=['addRunDependency','removeRunDependency','stringToNewUTF8']"
++    "-sEXPORTED_FUNCTIONS=['_main','_EmptyBlockHandler','_MemoryUtils_GetByteProxy','_MemoryUtils_GetHalfProxy','_MemoryUtils_GetWordProxy','_MemoryUtils_GetDoubleProxy','_MemoryUtils_SetByteProxy','_MemoryUtils_SetHalfProxy','_MemoryUtils_SetWordProxy','_MemoryUtils_SetDoubleProxy','_LWL_Proxy','_LWR_Proxy','_LDL_Proxy','_LDR_Proxy','_SWL_Proxy','_SWR_Proxy','_SDL_Proxy','_SDR_Proxy']")
++set_property(TARGET ps2EntryRunner APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/web/library_fetch_stream.js")
+diff -ruN a/ps2xRuntime/web/web_platform.cpp b/ps2xRuntime/web/web_platform.cpp
+--- a/ps2xRuntime/web/web_platform.cpp	1969-12-31 18:00:00
++++ b/ps2xRuntime/web/web_platform.cpp	2026-10-19 04:05:57
+@@ -0,0 +1,111 @@
++// [web] Browser platform for the WebAssembly build, run at the start of main() (on a worker: the build uses
++// PROXY_TO_PTHREAD, so the page's main thread stays free for the GS host).
++//
++// Files (WasmFS):
++//   /dbz/data      fetch backend on <page>/data/: the extracted disc (ELF, IRX, BIN, the AFS archives) and the disc
++//                  image (disc.iso), read on demand in 1 MB HTTP Range requests: the 5 GB of AFS archives are never
++//                  downloaded whole, only what the game reads
++//   /dbz/savedata  OPFS (the browser's private file system): the memory card and settings.toml survive reloads
++// The runtime's "executable directory" is /dbz, so its settings (savedata/settings.toml) and the memory cards
++// (<disc>/../savedata) both land in /dbz/savedata.
++// Environment: the GS host is the page (PS2X_GS_LIVE=1). Audio: web/bt3gl_headless.cpp.
++
++#include <emscripten.h>
++#include <emscripten/wasmfs.h>
++
++#include <cerrno>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++namespace
++{
++	// The extracted disc of SLUS-21978 (Budokai Tenkaichi 4, a BT3 mod), as games/bt3/setup.py leaves it.
++	struct DiscFile
++	{
++		const char* path;
++		bool writable; // the game opens some files read/write (it never writes them)
++	};
++	const DiscFile kDiscFiles[] = {
++	    {"SLUS_216.78", false}, {"SYSTEM.CNF", false},
++	    {"BIN/DBZ4.BIN", true}, {"BIN/DBZP.BIN", true},
++	    {"IRX/CDVDSTM.IRX", false}, {"IRX/CRI_ADXI.IRX", false}, {"IRX/DBCMAN.IRX", false}, {"IRX/DS2O_D.IRX", false},
++	    {"IRX/DS2U_D.IRX", false}, {"IRX/IOPRP300.IMG", false}, {"IRX/LIBSD.IRX", false}, {"IRX/MCMAN.IRX", false},
++	    {"IRX/MCSERV.IRX", false}, {"IRX/MODHSYN.IRX", false}, {"IRX/MODMIDI.IRX", false}, {"IRX/MODSEIN.IRX", false},
++	    {"IRX/MODSESQ.IRX", false}, {"IRX/MODSESQ2.IRX", false}, {"IRX/SDRDRV.IRX", false}, {"IRX/SIO2D.IRX", false},
++	    {"IRX/SIO2MAN.IRX", false}, {"IRX/SOUNDS.IRX", false},
++	    {"DATA/PZS4US.DIR", false}, {"DATA/PZS4US0.AFS", false}, {"DATA/PZS4US1.AFS", false},
++	    {"DATA/PZS4US2.AFS", false}, {"DATA/PZS4US3.AFS", false}, {"DATA/ZS4USED.ADX", false},
++	    {"DATA/ZS4USED.PSS", false}, {"DATA/ZS4USOP.ADX", false}, {"DATA/ZS4USOP.PSS", false},
++	    {"disc.iso", false},
++	};
++
++	// Opens a file the way the runtime will and reports what WasmFS answers (size, first bytes).
++	void ProbeFile(const char* path)
++	{
++		const int fd = open(path, O_RDONLY);
++		if(fd < 0)
++		{
++			std::printf("[web] %s: open failed (%s)\n", path, std::strerror(errno));
++			return;
++		}
++		const off_t size = lseek(fd, 0, SEEK_END);
++		lseek(fd, 0, SEEK_SET);
++		unsigned char head[4] = {};
++		const ssize_t got = read(fd, head, sizeof(head));
++		std::printf("[web] %s: size %lld, read %d -> %02x %02x %02x %02x\n", path, static_cast<long long>(size),
++		            static_cast<int>(got), head[0], head[1], head[2], head[3]);
++		close(fd);
++	}
++
++	bool PageHas(const char* name)
++	{
++		return MAIN_THREAD_EM_ASM_INT({ return new URLSearchParams(location.search).has(UTF8ToString($0)) ? 1 : 0; }, name) != 0;
++	}
++}
++
++void ps2xWasmPlatformInit(int& argc, char**& argv)
++{
++	mkdir("/dbz", 0777);
++	backend_t data = wasmfs_create_fetch_backend("data", 1u << 20);
++	int rc = wasmfs_create_directory("/dbz/data", 0777, data);
++	std::printf("[web] mkdir /dbz/data -> %d\n", rc);
++	mkdir("/dbz/data/BIN", 0777);
++	mkdir("/dbz/data/IRX", 0777);
++	mkdir("/dbz/data/DATA", 0777);
++	for(const DiscFile& f : kDiscFiles)
++	{
++		char path[256];
++		std::snprintf(path, sizeof(path), "/dbz/data/%s", f.path);
++		const int fd = wasmfs_create_file(path, f.writable ? 0666 : 0444, data);
++		if(fd < 0)
++			std::printf("[web] create %s -> %d\n", path, fd);
++		else
++			close(fd);
++	}
++	ProbeFile("/dbz/data/SLUS_216.78");
++	ProbeFile("/dbz/data/DATA/PZS4US0.AFS");
++
++	backend_t opfs = wasmfs_create_opfs_backend();
++	rc = wasmfs_create_directory("/dbz/savedata", 0777, opfs);
++	std::printf("[web] saves: /dbz/savedata (OPFS) -> %d\n", rc);
++
++	setenv("PS2X_EXEDIR", "/dbz", 1);
++	setenv("PS2X_GS_LIVE", "1", 1);
++	setenv("PS2X_CD_IMAGE", "/dbz/data/disc.iso", 1);
++	// No GL here: the runtime's present loop is paced by the headless raylib, not by the barrier pacing.
++	setenv("PS2X_BARPACE", "0", 0);
++	// <page>?debug: more of the runtime's diagnostics
++	if(PageHas("debug"))
++		setenv("PS2X_PAD_LOG", "1", 0);
++
++	static char arg0[] = "ps2EntryRunner";
++	static char arg1[] = "/dbz/data/SLUS_216.78";
++	static char* args[] = {arg0, arg1, nullptr};
++	argc = 2;
++	argv = args;
++	std::printf("[web] files: /dbz/data -> data/ (on demand), saves: OPFS\n");
++}

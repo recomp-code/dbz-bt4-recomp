@@ -1,0 +1,88 @@
+diff --git a/pcsx2/GSDumpReplayer.cpp b/pcsx2/GSDumpReplayer.cpp
+index 2259b89..390530f 100644
+--- a/pcsx2/GSDumpReplayer.cpp
++++ b/pcsx2/GSDumpReplayer.cpp
+@@ -119,6 +119,7 @@ namespace
+ 		HANDLE mapping = nullptr;
+ 		HANDLE data_event = nullptr;
+ 		HANDLE space_event = nullptr;
++		HANDLE readback_event = nullptr; // version 2 rings: ReadFIFO2 replies are ready
+ 		HANDLE producer_process = nullptr; // the game (its pid is the ring suffix)
+ #else
+ 		int mapping_fd = -1;
+@@ -712,6 +713,18 @@ static void GSDumpReplayerLiveStep()
+ 				__atomic_fetch_add(&s_live.events->readbackSeq, 1u, __ATOMIC_RELEASE);
+ 				ps2live::eventSet(&s_live.events->readback);
+ 			}
++#else
++			// Same on Windows: the readback block follows the data area, the wake-up is a named event.
++			if (s_live.readback_event && s_live.header && s_live.header->version >= 2u && !s_live_playback)
++			{
++				const u32 bytes = static_cast<u32>(std::min<u64>(static_cast<u64>(size) * 16u, ps2live::kReadbackCapacity));
++				std::memcpy(ps2live::readbackData(s_live.header), arr.get(), bytes);
++				ps2live::RingReadback* rb = ps2live::ringReadback(s_live.header);
++				rb->bytes = bytes;
++				MemoryBarrier();
++				InterlockedIncrement(reinterpret_cast<volatile LONG*>(&rb->seq));
++				SetEvent(s_live.readback_event);
++			}
+ #endif
+ 		}
+ 		break;
+@@ -1107,6 +1120,15 @@ bool GSDumpReplayer::AttachLiveRing(Error* error)
+ 		ps2live::objectName(ps2live::kDataEventName, s_live_ring_suffix).c_str());
+ 	s_live.space_event = OpenEventW(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE,
+ 		ps2live::objectName(ps2live::kSpaceEventName, s_live_ring_suffix).c_str());
++	// Version 2 (DBZ BT4): ReadFIFO2 replies. Only when the mapping really has the readback block.
++	if (header->version >= 2u)
++	{
++		MEMORY_BASIC_INFORMATION mbi = {};
++		if (VirtualQuery(view, &mbi, sizeof(mbi)) && mbi.RegionSize >= ps2live::mappingSize(header->capacity))
++			s_live.readback_event = OpenEventW(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE,
++				ps2live::objectName(ps2live::kReadbackEventName, s_live_ring_suffix).c_str());
++		Console.WriteLn("(GSDumpReplayer) Live ring v%u, readback %s.", header->version, s_live.readback_event ? "on" : "unavailable");
++	}
+ 	if (!s_live_ring_suffix.empty())
+ 	{
+ 		const DWORD pid = static_cast<DWORD>(std::wcstoul(s_live_ring_suffix.c_str(), nullptr, 10));
+diff --git a/pcsx2/Ps2LiveRing.h b/pcsx2/Ps2LiveRing.h
+index 0045f01..e756232 100644
+--- a/pcsx2/Ps2LiveRing.h
++++ b/pcsx2/Ps2LiveRing.h
+@@ -67,7 +67,35 @@ namespace ps2live
+         return reinterpret_cast<uint8_t *>(header) + sizeof(RingHeader);
+     }
+ 
+-#if !defined(_WIN32)
++#if defined(_WIN32)
++    // Windows, version 2: the events are named kernel objects (kDataEventName, kSpaceEventName, kReadbackEventName),
++    // so the readback block follows the data area directly. For each ReadFIFO2 packet the consumer copies PCSX2's FIFO
++    // data into it, stores its size, bumps seq and sets the readback event (the game waits for it).
++    // Version 1 mappings (NBA Street V3) end after the data area: the consumer never answers those.
++    constexpr const wchar_t *kReadbackEventName = L"Local\\PS2RecompGsLiveReadback";
++    constexpr uint64_t kReadbackCapacity = 8ull << 20; // a 1024x1024 32-bit download plus slack
++
++    struct alignas(64) RingReadback
++    {
++        volatile uint32_t seq;
++        volatile uint32_t bytes;
++    };
++
++    inline uint64_t mappingSize(uint64_t capacity)
++    {
++        return sizeof(RingHeader) + capacity + sizeof(RingReadback) + kReadbackCapacity;
++    }
++
++    inline RingReadback *ringReadback(RingHeader *header)
++    {
++        return reinterpret_cast<RingReadback *>(ringData(header) + header->capacity);
++    }
++
++    inline uint8_t *readbackData(RingHeader *header)
++    {
++        return reinterpret_cast<uint8_t *>(ringReadback(header)) + sizeof(RingReadback);
++    }
++#else
+     // POSIX: the ring is a shm_open object and the two Windows auto-reset events are words in
+     // the same mapping, after the data area (macOS: os_sync_wait_on_address, Linux: futex).
+     // macOS limits shm names to 31 characters, so the base name is short.

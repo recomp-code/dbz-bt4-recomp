@@ -11,6 +11,14 @@ fan mod of BT3, disc `SLUS-219.78`, "Beta 14 Rev2") with [PS2Recomp](https://git
 
 *Native Windows build, PCSX2's GS on Vulkan at 6x, 1920x1080 window (RTX 4090).*
 
+**[▶ Video: the mod's characters and stages, Jiren vs. Zamas (Fusion) at the Tournament of Power](docs/videos/dbz_bt4_mod.mp4)**
+(native Windows build, 6x internal resolution, 2560x1440 at 60 fps, game audio; AV1). It enters the mod's unlock-all
+code on the main menu (hold L1+R1, then Down, Right, Triangle, Down, Left, Triangle, Up: the seven Dragon Balls light up),
+goes through the roster rows that BT3 never had (Super Saiyan Blue forms, Beerus, Broly SSJ3, Cell Max, Goku Black,
+Zamas, Toppo, Jiren, Hit, Cabba, Caulifla, Kale...), the new stages (Tournament of Power, Champa's ring, Planet Tsufuru,
+Red Ribbon base, Muscle Tower, Baba's palace, Space...) and fights on the Tournament of Power stage. Recorded unattended
+with `windows/record_video.ps1` + `windows/mux_video.ps1`.
+
 > **The mod is the work of Team BT4.** Get it, its updates and the PCSX2 extras (the `GameIndex.yaml` with the
 > SLUS-21978 fixes) from their official page: **https://teambt4.wixsite.com/teambt4projects**
 > ([download section](https://teambt4.wixsite.com/teambt4projects/descarga)).
@@ -32,8 +40,14 @@ from your ELF at build time.
   - **audio** is wrong: periodic stale chunks, mono output and extra content. The cause is localized in the EE-side CRI ring writes, probably another mistranslated instruction.
   - Some graphics glitches remain: white areas on some stages, block rectangles and flashes.
 - Native macOS: work in progress.
-- Native Windows (2026-10-19): playable end to end (Team BT4 splash, title, Dragon History, fights at 30 and 60 fps),
-  with the fight-start fade drawn correctly (read-back answered by PCSX2) and DLSS/FSR.
+- The "still to do" items above are the **browser** build's (our own PS2Recomp runtime + Play!'s GS). The native builds
+  use BT3-Recomp's runtime, which does not have them.
+- Native Windows (2026-10-19): playable end to end (Team BT4 splash, title, Dragon History, Duel with the whole unlocked
+  roster, fights at 30 and 60 fps), with the fight-start fade drawn correctly (read-back answered by PCSX2) and DLSS/FSR.
+  Audio: real stereo (a 264 s recording of menus and a fight: side/mid RMS 0.41, 3 mono seconds; `windows/wav_stats.py`).
+  Graphics: no white areas or block rectangles seen on the stages visited so far (Wasteland, Tournament of Power); the
+  remaining stages have not been checked one by one. BT3-Recomp's lockstep netplay (`PS2X_NET_LISTEN` / `PS2X_NET`)
+  connects and stays in sync (0 desyncs over ~6400 frames between two instances on one PC); not tested between two PCs.
 
 ## Native Windows
 
@@ -75,8 +89,13 @@ What the Windows patches change:
   458752 bytes. Once the GS host answers the download with real pixels, the overrun lands on the next heap block's header and
   the game's pool walk (`FUN_00254fe0`, pc 0x255018) loops forever at the start of every fight. This one affects every
   platform; it only went unnoticed while the overrun was filled with zeros from the runtime's own VRAM.
-- `PS2X_PAD_SCRIPT="12:START,15.5:LEFT,16:CROSS+SQUARE"` (+ `PS2X_PAD_SCRIPT_HOLD` ms): timed presses for unattended tests
-  (`windows\run_test.ps1`, contact sheets with `windows\sheet.ps1`).
+- `PS2X_PAD_SCRIPT="12:START,15.5:LEFT,16:CROSS+SQUARE"` (+ `PS2X_PAD_SCRIPT_HOLD` ms): timed presses for unattended tests,
+  seconds since process start, or since the game first reaches a state with `PS2X_PAD_SCRIPT_STATE=0x4` (main menu);
+  `PS2X_AUTOSTART_LEFT=1` makes the auto-start also answer "Si" to the memory-card prompts (`windows\run_test.ps1`,
+  contact sheets with `windows\sheet.ps1`, the video script `windows\video_script.ps1`).
+- `[avsync]` lines (with `PS2X_WAVCAP`): the WAV position every 60 live GS frames, so the host's `PS2X_CAPTURE` video and
+  the runtime's audio can be muxed in sync (`windows\mux_video.ps1`, which retimes the audio piecewise where the game ran
+  below 60 fps, e.g. during loads).
 
 DLSS: the host from [street-recomp-v3](https://github.com/recomp-code/street-recomp-v3) (`4ca3ed7`): temporal DLSS with motion
 vectors estimated on the GPU from the frames (luma block matching at 1/4 and 1/2 resolution, sub-texel refinement) and a
@@ -142,7 +161,7 @@ Test helpers (`native/`): `lrun.sh` (run live), `lshot.sh` (the host saves its o
 | `patches/bt3recomp-bt4mod-windows.patch` | BT3-Recomp runtime, on top of `bt3recomp-bt4mod-full.patch`: the Windows live ring (version 2 with readback), PSMCT24 transfer size, `PS2X_PAD_SCRIPT`. See [Native Windows](#native-windows). |
 | `patches/pcsx2-gsrunner-dbz-windows.patch` | `pcsx2-gsrunner`, on top of the NBA port's tree + `pcsx2-gsrunner-live-dbz.patch`: ReadFIFO2 replies on Windows, the shared `Ps2LiveRing.h`. |
 | `windows/` | Windows launchers (`Jugar_DBZ*.cmd`), build scripts (`env.ps1`, `reconfigure.cmd`, `build_runner.cmd`, `build_pcsx2.cmd`, `make_patch.ps1`), `gshost/dbz.ini` (Vulkan, 6x) and `gshost/dbz_dlss.ini` (2x + DLSS), `iso_extract.py` (ISO9660 extractor), tests (`run_test.ps1`, `sheet.ps1`, `stack_snapshot.ps1`). |
-| `docs/screenshots/` | Screenshots of the native Windows build. |
+| `docs/screenshots/`, `docs/videos/` | Screenshots and the showcase video of the native Windows build. |
 | `gshost/dbz.ini` | PCSX2 GS settings, based on the Team BT4 1080p profile: 3x, merge PP sprites, TC offsets, 16:9. The `GameIndex.yaml` with the SLUS-21978 fixes comes from the Team BT4 PCSX2 extras. |
 | `tools/` | Map and recompile helpers (`mkcombined.py`, `fixcsv.py`, `gaps.py`, `recomp.sh`, `build.sh`), `play_native.sh`, analysis tools (`adxdec.py`, `gstrace.py`, `mdis.py`, `xref.py`), headless tests (`tools/test`), and the local web server and diagnostics receiver (`tools/web`). |
 

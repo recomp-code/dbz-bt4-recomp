@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/src/lib/ps2_gs_live.cpp b/ps2xRuntime/src/lib/ps2_gs_live.cpp
-index 086b77e..5fb6e04 100644
+index 086b77e..2dfa277 100644
 --- a/ps2xRuntime/src/lib/ps2_gs_live.cpp
 +++ b/ps2xRuntime/src/lib/ps2_gs_live.cpp
 @@ -1,5 +1,5 @@
@@ -27,7 +27,17 @@ index 086b77e..5fb6e04 100644
  // [web] The GS host is the page itself (web/play_gs_host.cpp, Play!'s GS on WebGL2, on the browser's main thread):
  // the ring is plain memory of this module, shared with it. Same protocol as the POSIX ring.
  #include <cerrno>
-@@ -81,7 +90,175 @@ namespace ps2_gslive
+@@ -38,6 +47,9 @@ extern char **environ;
+ #define PS2X_GS_LIVE_RING 1
+ #endif
+ 
++// [avsync] ps2_host_audio.cpp: bytes written to PS2X_WAVCAP so far.
++extern std::atomic<uint64_t> g_ps2WavcapBytes;
++
+ namespace ps2_gslive
+ {
+     namespace
+@@ -81,7 +93,175 @@ namespace ps2_gslive
              return (v && v[0]) ? std::string(v) : std::string("SLUS-21978");
          }
  
@@ -204,7 +214,7 @@ index 086b77e..5fb6e04 100644
          struct LiveRing
          {
              int hostStatus = 0;
-@@ -149,6 +326,15 @@ namespace ps2_gslive
+@@ -149,6 +329,15 @@ namespace ps2_gslive
              }
  
              void signal() {} // the page polls once per browser frame
@@ -220,7 +230,7 @@ index 086b77e..5fb6e04 100644
          };
  #elif defined(PS2X_GS_LIVE_RING)
          // shm_open mapping, events as shared words (ps2live::eventSet/eventWait), host started with posix_spawn.
-@@ -298,6 +484,21 @@ namespace ps2_gslive
+@@ -298,6 +487,21 @@ namespace ps2_gslive
                  if (!header->consumerFlags || header->consumerWaiting)
                      ps2live::eventSet(&events->data);
              }
@@ -242,7 +252,7 @@ index 086b77e..5fb6e04 100644
          };
  #endif
  
-@@ -335,12 +536,7 @@ namespace ps2_gslive
+@@ -335,12 +539,7 @@ namespace ps2_gslive
                  {
                      if (!live.write(static_cast<const uint8_t *>(data), size))
                      {
@@ -256,7 +266,7 @@ index 086b77e..5fb6e04 100644
                          std::fflush(stderr);
                          std::_Exit(0);
                      }
-@@ -428,7 +624,7 @@ namespace ps2_gslive
+@@ -428,7 +627,7 @@ namespace ps2_gslive
                          std::fprintf(stderr, "[gslive] GS host started (PCSX2 renderer, serial %s)\n", serial().c_str());
                      }
                      else
@@ -265,7 +275,7 @@ index 086b77e..5fb6e04 100644
                  }
  #endif
                  const char *path = std::getenv("PS2X_GS_DUMP");
-@@ -590,6 +786,13 @@ namespace ps2_gslive
+@@ -590,6 +789,13 @@ namespace ps2_gslive
          const uint32_t qwc = bytes / 16u;
          if (qwc == 0u || !active())
              return false;
@@ -279,7 +289,7 @@ index 086b77e..5fb6e04 100644
          Writer &w = writer();
  #if defined(PS2X_GS_LIVE_RING) && !defined(PS2X_GS_LIVE_WEB) // the browser page does not answer (yet)
          uint32_t seq0 = 0;
-@@ -598,28 +801,28 @@ namespace ps2_gslive
+@@ -598,28 +804,28 @@ namespace ps2_gslive
              if (!w.usable())
                  return false;
              if (w.liveActive)
@@ -314,7 +324,7 @@ index 086b77e..5fb6e04 100644
          if (const char *dd = std::getenv("PS2X_READBACK_DUMP"); dd && dd[0])
          {   // [readback] raw copies for inspection: <dir>/rb_<n>.bin
              static uint32_t s_n = 0;
-@@ -691,9 +894,9 @@ namespace ps2_gslive
+@@ -691,9 +897,9 @@ namespace ps2_gslive
                      if (w.live.hostGone())
                          break;
                      w.live.header->producerWaiting = 1u;
@@ -326,6 +336,19 @@ index 086b77e..5fb6e04 100644
                      w.live.header->producerWaiting = 0u;
                  }
                  w.lagWaitNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+@@ -702,6 +908,12 @@ namespace ps2_gslive
+ #endif
+         if (w.file && w.frames % 600u == 0u)
+             std::fflush(w.file);
++        {   // [avsync] with PS2X_WAVCAP: the audio position at every 60th live frame (the host counts the same VSyncs)
++            static const bool s_av = [](){ const char *v = std::getenv("PS2X_WAVCAP"); return v && v[0]; }();
++            if (s_av && (w.frames % 60u) == 0u)
++                std::fprintf(stderr, "[avsync] frame %u wav_bytes %llu\n", w.frames,
++                             static_cast<unsigned long long>(g_ps2WavcapBytes.load(std::memory_order_relaxed)));
++        }
+         ++w.frames;
+         ++w.statFrames;
+         // PS2X_GS_DUMP_UNTIL=<file>: the dump is closed at the first frame after that file appears (test scripts cut a
 diff --git a/ps2xRuntime/src/lib/ps2_live_ring.h b/ps2xRuntime/src/lib/ps2_live_ring.h
 index 0045f01..e756232 100644
 --- a/ps2xRuntime/src/lib/ps2_live_ring.h
@@ -368,15 +391,50 @@ index 0045f01..e756232 100644
      // the same mapping, after the data area (macOS: os_sync_wait_on_address, Linux: futex).
      // macOS limits shm names to 31 characters, so the base name is short.
 diff --git a/ps2xRuntime/src/lib/game_overrides.cpp b/ps2xRuntime/src/lib/game_overrides.cpp
-index 3c3d250..1a5e837 100644
+index 3c3d250..c6f5560 100644
 --- a/ps2xRuntime/src/lib/game_overrides.cpp
 +++ b/ps2xRuntime/src/lib/game_overrides.cpp
-@@ -724,6 +724,67 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
+@@ -664,6 +664,12 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
+     extern "C" int ps2xNetJumpSettledFor(uint32_t session)
+     { return g_netJumpSession.load(std::memory_order_relaxed) == session && g_netJumpState.load(std::memory_order_relaxed) == 2; }
+ 
++    // [padscript] time base of PS2X_PAD_SCRIPT: dynamic initialisation, i.e. process start.
++    const std::chrono::steady_clock::time_point g_padScriptProcessStart = std::chrono::steady_clock::now();
++    // [padscript] PS2X_PAD_SCRIPT_STATE=<state>: the script's clock starts when the game first reaches that state
++    // (g_bt3StateLive, e.g. 0x4 = main menu); from then on PS2X_AUTOSTART stops pressing.
++    std::atomic<bool> g_padScriptTookOver{false};
++
+     void writeNeutralPadPacket(uint8_t *rdram, uint32_t bufAddr, uint32_t socket)
+     {
+         // TEST (env PS2X_SOUNDREADY): force the sound-ready flags that FUN_0026d9a0
+@@ -698,7 +704,10 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
+         uint8_t b1 = static_cast<uint8_t>((buttons >> 8) & 0xffu);
+         // TEST (env PS2X_AUTOSTART): also tap START+CROSS periodically to auto-advance.
+         static const bool s_autostart = [](){ const char *v = std::getenv("PS2X_AUTOSTART"); return v && v[0] && v[0] != '0'; }();
+-        if (s_autostart)
++        // PS2X_AUTOSTART_LEFT=1: also tap LEFT between the START+CROSS taps (answers "Si" to the memory-card prompts).
++        static const bool s_autoLeft = [](){ const char *v = std::getenv("PS2X_AUTOSTART_LEFT"); return v && v[0] == '1'; }();
++        // [padscript] once a state-based script has taken over, auto-start only keeps fighting (state 0x8); menus are the script's.
++        if (s_autostart && (!g_padScriptTookOver.load(std::memory_order_relaxed) || g_bt3StateLive.load(std::memory_order_relaxed) == 0x8u))
+         {
+             // In a fight START would only pause it: tap attacks and directions in bursts instead, so the fight stays live and busy (effects, blur,
+             // glow) for unattended captures and the packet oracle.
+@@ -713,6 +722,8 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
+                     b0 = static_cast<uint8_t>(b0 & ~0x08u); // START
+                     b1 = static_cast<uint8_t>(b1 & ~0x40u); // CROSS
+                 }
++                if (s_autoLeft && (n % 180u) >= 90u && (n % 180u) < 100u)
++                    b0 = static_cast<uint8_t>(b0 & ~0x80u); // LEFT
+             }
+             else
+             {
+@@ -724,6 +735,79 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
                  if (phase == 6u) { b1 = static_cast<uint8_t>(b1 & ~0x40u); b1 = static_cast<uint8_t>(b1 & ~0x80u); }   // CROSS+SQUARE (ki blast / rush)
              }
          }
 +        // TEST (env PS2X_PAD_SCRIPT="12:START,15.5:LEFT,16:CROSS,..."): timed presses for automated runs, seconds since
-+        // the first pad read, each held PS2X_PAD_SCRIPT_HOLD ms (default 150). Socket 0 only.
++        // the process started (same base as the test scripts' host screenshots), each held PS2X_PAD_SCRIPT_HOLD ms
++        // (default 150). Socket 0 only.
 +        if ((socket & 3u) == 0u)
 +        {
 +            struct Press { double t; uint16_t mask; };
@@ -425,9 +483,20 @@ index 3c3d250..1a5e837 100644
 +            }();
 +            if (!s_script.empty())
 +            {
-+                static const auto s_t0 = std::chrono::steady_clock::now();
++                static const long s_baseState = [](){ const char *v = std::getenv("PS2X_PAD_SCRIPT_STATE"); return (v && v[0]) ? std::strtol(v, nullptr, 0) : -1L; }();
++                static std::chrono::steady_clock::time_point s_stateT0{};
++                if (s_baseState >= 0 && !g_padScriptTookOver.load(std::memory_order_relaxed) &&
++                    g_bt3StateLive.load(std::memory_order_relaxed) == static_cast<uint32_t>(s_baseState))
++                {
++                    s_stateT0 = std::chrono::steady_clock::now();
++                    g_padScriptTookOver.store(true, std::memory_order_relaxed);
++                    std::fprintf(stderr, "[padscript] state 0x%lx reached at %.2f s: script clock starts\n", s_baseState,
++                                 std::chrono::duration<double>(s_stateT0 - g_padScriptProcessStart).count());
++                }
++                const bool scriptLive = s_baseState < 0 || g_padScriptTookOver.load(std::memory_order_relaxed);
++                const auto s_t0 = s_baseState >= 0 ? s_stateT0 : g_padScriptProcessStart;
 +                static const double s_hold = [](){ const char *h = std::getenv("PS2X_PAD_SCRIPT_HOLD"); return (h && h[0]) ? std::strtod(h, nullptr) / 1000.0 : 0.15; }();
-+                const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_t0).count();
++                const double now = scriptLive ? std::chrono::duration<double>(std::chrono::steady_clock::now() - s_t0).count() : -1.0;
 +                for (const Press &p : s_script)
 +                    if (now >= p.t && now < p.t + s_hold)
 +                    {
@@ -460,3 +529,28 @@ index ded5faa..4119bfe 100644
          case 27: // PSMT8H (packed in 32-bit lanes)
          case 36: // PSMT4HL (packed in 32-bit lanes)
          case 44: // PSMT4HH (packed in 32-bit lanes)
+diff --git a/ps2xRuntime/src/lib/ps2_host_audio.cpp b/ps2xRuntime/src/lib/ps2_host_audio.cpp
+index 403aee4..4300093 100644
+--- a/ps2xRuntime/src/lib/ps2_host_audio.cpp
++++ b/ps2xRuntime/src/lib/ps2_host_audio.cpp
+@@ -13,6 +13,12 @@
+ #include <memory>
+ #include <unordered_map>
+ #include <vector>
++#include <atomic>
++#include <cstdint>
++
++// [avsync] bytes written to PS2X_WAVCAP so far; ps2_gs_live.cpp logs it against the live GS frame count so a
++// recording of the host's video can be muxed with this audio.
++std::atomic<uint64_t> g_ps2WavcapBytes{0};
+ 
+ namespace ps2x_audio
+ {
+@@ -185,6 +191,7 @@ namespace ps2x_audio
+                     for (int i = 0; i < frames * 2; ++i) pcm[size_t(i)] = int16_t(std::lround(out[i] * 32767.0f));
+                     std::fwrite(pcm.data(), 2, pcm.size(), s_wav);
+                     s_bytes += uint32_t(pcm.size() * 2);
++                    g_ps2WavcapBytes.store(s_bytes, std::memory_order_relaxed);
+                     if (s_bytes - s_lastHdr > uint32_t(s_devRate) * 2u) { s_lastHdr = s_bytes; hdr(); std::fflush(s_wav); }
+                 }
+             }

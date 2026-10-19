@@ -18,7 +18,7 @@ $base = "$R\tmp_base"
 & $g -C $base apply --whitespace=nowarn --exclude=ps2xRuntime/third_party/parallel-gs "$R\dbz-bt4-recomp\patches\bt3recomp-bt4mod-full.patch"
 if ($LASTEXITCODE -ne 0) { throw "no aplica bt3recomp-bt4mod-full.patch" }
 $rt = @('ps2xRuntime/src/lib/ps2_gs_live.cpp', 'ps2xRuntime/src/lib/ps2_live_ring.h', 'ps2xRuntime/src/lib/game_overrides.cpp',
-        'ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h')
+        'ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h', 'ps2xRuntime/src/lib/ps2_host_audio.cpp')
 Write-Diff 'C:/DBZBT4Recomp/tmp_base' 'C:/DBZBT4Recomp/bt3mod' $rt "$R\patches\bt3recomp-bt4mod-windows.patch"
 & $g -C $base apply --check "$R\patches\bt3recomp-bt4mod-windows.patch"
 $ok1 = $LASTEXITCODE -eq 0

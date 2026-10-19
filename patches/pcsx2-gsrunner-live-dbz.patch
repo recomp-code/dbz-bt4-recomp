@@ -392,7 +392,7 @@ index 6bf6af8eb..28f9cc874 100644
  {
  	NSError* err = nil;
 diff --git a/pcsx2/GSDumpReplayer.cpp b/pcsx2/GSDumpReplayer.cpp
-index 2de413bec..ef5ce009f 100644
+index 2de413bec..2259b895f 100644
 --- a/pcsx2/GSDumpReplayer.cpp
 +++ b/pcsx2/GSDumpReplayer.cpp
 @@ -1,6 +1,7 @@
@@ -448,7 +448,46 @@ index 2de413bec..ef5ce009f 100644
  			VMManager::Internal::VSyncOnCPUThread();
  			if (VMManager::Internal::IsExecutionInterrupted())
  				GSDumpReplayerExitExecution();
-@@ -1143,20 +1149,24 @@ bool GSDumpReplayer::WriteLiveBootDump(const std::string& path, Error* error)
+@@ -696,6 +702,17 @@ static void GSDumpReplayerLiveStep()
+ 				return;
+ 			std::unique_ptr<u8[]> arr(new u8[(size + 1) * 16]);
+ 			MTGS::InitAndReadFIFO(arr.get(), size);
++#if !defined(_WIN32)
++			// The game waits for this download (the frames it reads back were drawn here, not in its own VRAM).
++			if (s_live.events && s_live.header && s_live.header->version >= 2u && !s_live_playback)
++			{
++				const u32 bytes = static_cast<u32>(std::min<u64>(static_cast<u64>(size) * 16u, ps2live::kReadbackCapacity));
++				std::memcpy(ps2live::readbackData(s_live.header), arr.get(), bytes);
++				s_live.events->readbackBytes = bytes;
++				__atomic_fetch_add(&s_live.events->readbackSeq, 1u, __ATOMIC_RELEASE);
++				ps2live::eventSet(&s_live.events->readback);
++			}
++#endif
+ 		}
+ 		break;
+ 
+@@ -1009,8 +1026,9 @@ static bool AttachLiveRingMapping(Error* error)
+ 		return false;
+ 	}
+ 	ps2live::RingHeader* header = static_cast<ps2live::RingHeader*>(view);
+-	if (header->magic != ps2live::kMagic || header->version != ps2live::kVersion ||
+-		static_cast<u64>(st.st_size) < ps2live::mappingSize(header->capacity))
++	// Version 1 rings (games built before ReadFIFO2 replies) have no readback area: accepted, never answered.
++	if (header->magic != ps2live::kMagic || (header->version != ps2live::kVersion && header->version != 1u) ||
++		static_cast<u64>(st.st_size) < ps2live::mappingSize(header->capacity) - (header->version == 1u ? ps2live::kReadbackCapacity : 0u))
+ 	{
+ 		Error::SetString(error, "Live GS ring version mismatch.");
+ 		return false;
+@@ -1076,7 +1094,7 @@ bool GSDumpReplayer::AttachLiveRing(Error* error)
+ 		return false;
+ 	}
+ 	ps2live::RingHeader* header = static_cast<ps2live::RingHeader*>(view);
+-	if (header->magic != ps2live::kMagic || header->version != ps2live::kVersion)
++	if (header->magic != ps2live::kMagic || (header->version != ps2live::kVersion && header->version != 1u))
+ 	{
+ 		Error::SetString(error, "Live GS ring version mismatch.");
+ 		return false;
+@@ -1143,20 +1161,24 @@ bool GSDumpReplayer::WriteLiveBootDump(const std::string& path, Error* error)
  	auto fp = FileSystem::OpenManagedCFile(path.c_str(), "wb", error);
  	if (!fp)
  		return false;
@@ -477,3 +516,77 @@ index 2de413bec..ef5ce009f 100644
  	ok = ok && std::fwrite(regs.data(), regs.size(), 1, fp.get()) == 1;
  	if (!ok)
  		Error::SetString(error, "Failed to write the live boot dump.");
+diff --git a/pcsx2/Ps2LiveRing.h b/pcsx2/Ps2LiveRing.h
+index 753255202..0045f01ba 100644
+--- a/pcsx2/Ps2LiveRing.h
++++ b/pcsx2/Ps2LiveRing.h
+@@ -11,6 +11,8 @@
+ 
+ #if defined(__APPLE__)
+ #include <os/os_sync_wait_on_address.h>
++#elif defined(__EMSCRIPTEN__)
++#include <emscripten/threading.h>
+ #elif defined(__linux__)
+ #include <climits>
+ #include <ctime>
+@@ -22,7 +24,7 @@
+ namespace ps2live
+ {
+     constexpr uint32_t kMagic = 0x50324C52u; // "RL2P"
+-    constexpr uint32_t kVersion = 1u;
++    constexpr uint32_t kVersion = 2u; // 2: ReadFIFO2 replies (readback area after the events)
+     constexpr uint64_t kDefaultCapacity = 256ull << 20;
+ 
+     constexpr const wchar_t *kMappingName = L"Local\\PS2RecompGsLiveRing";
+@@ -75,7 +77,13 @@ namespace ps2live
+     {
+         alignas(64) uint32_t data;  // set by the producer: new bytes in the ring
+         alignas(64) uint32_t space; // set by the consumer: ring space freed
++        // GS -> EE downloads: for each ReadFIFO2 packet the consumer copies PCSX2's FIFO data into the readback
++        // area, stores its size, bumps readbackSeq and sets readback (the game waits for it).
++        alignas(64) uint32_t readback;
++        uint32_t readbackSeq;
++        uint32_t readbackBytes;
+     };
++    constexpr uint64_t kReadbackCapacity = 8ull << 20; // a 1024x1024 32-bit download plus slack
+ 
+     inline std::string objectName(const char *base, const std::string &suffix)
+     {
+@@ -84,7 +92,7 @@ namespace ps2live
+ 
+     inline uint64_t mappingSize(uint64_t capacity)
+     {
+-        return sizeof(RingHeader) + capacity + sizeof(RingEvents);
++        return sizeof(RingHeader) + capacity + sizeof(RingEvents) + kReadbackCapacity;
+     }
+ 
+     inline RingEvents *ringEvents(RingHeader *header)
+@@ -92,12 +100,19 @@ namespace ps2live
+         return reinterpret_cast<RingEvents *>(ringData(header) + header->capacity);
+     }
+ 
++    inline uint8_t *readbackData(RingHeader *header)
++    {
++        return reinterpret_cast<uint8_t *>(ringEvents(header)) + sizeof(RingEvents);
++    }
++
+     // SetEvent on an auto-reset event.
+     inline void eventSet(uint32_t *word)
+     {
+         __atomic_store_n(word, 1u, __ATOMIC_SEQ_CST);
+ #if defined(__APPLE__)
+         os_sync_wake_by_address_any(word, sizeof(*word), OS_SYNC_WAKE_BY_ADDRESS_SHARED);
++#elif defined(__EMSCRIPTEN__)
++        emscripten_futex_wake(word, 1);
+ #elif defined(__linux__)
+         syscall(SYS_futex, word, FUTEX_WAKE, 1, nullptr, nullptr, 0);
+ #endif
+@@ -111,6 +126,8 @@ namespace ps2live
+ #if defined(__APPLE__)
+         os_sync_wait_on_address_with_timeout(word, 0u, sizeof(*word), OS_SYNC_WAIT_ON_ADDRESS_SHARED,
+                                              OS_CLOCK_MACH_ABSOLUTE_TIME, static_cast<uint64_t>(timeoutMs) * 1000000ull);
++#elif defined(__EMSCRIPTEN__)
++        emscripten_futex_wait(word, 0u, static_cast<double>(timeoutMs)); // never on the browser's main thread
+ #elif defined(__linux__)
+         const timespec timeout{static_cast<time_t>(timeoutMs / 1000u), static_cast<long>(timeoutMs % 1000u) * 1000000l};
+         syscall(SYS_futex, word, FUTEX_WAIT, 0, &timeout, nullptr, 0);

@@ -1,5 +1,5 @@
 diff --git a/pcsx2-gsrunner/Main.cpp b/pcsx2-gsrunner/Main.cpp
-index 00647296f..5df73271f 100644
+index 00647296f..3b93a4acd 100644
 --- a/pcsx2-gsrunner/Main.cpp
 +++ b/pcsx2-gsrunner/Main.cpp
 @@ -125,6 +125,36 @@ static u32 s_total_drawn_frames = 0;
@@ -149,7 +149,19 @@ index 00647296f..5df73271f 100644
  	}
  #endif
  	// update GS thread copy of frame number
-@@ -1406,9 +1500,44 @@ static void LiveMenuPublish()
+@@ -1369,8 +1463,9 @@ static void LiveMenuInit()
+ 		{"Antialiasing FXAA", {"Desactivado", "Activado"}, s_settings_interface.GetBoolValue("EmuCore/GS", "fxaa", false) ? 1 : 0},
+ 		{"Nitidez (CAS)", {"Desactivada", "Baja", "Media", "Alta"}, cas},
+ #ifdef __APPLE__
+-		// FSR 1 and DLSS are only implemented in the Vulkan renderer.
+-		{"Reescalado a la ventana", {"Desactivado"}, 0},
++		// FSR 1 and DLSS are only implemented in the Vulkan renderer; Metal has Apple MetalFX.
++		{"Reescalado a la ventana", {"Desactivado", "Apple MetalFX"},
++			std::clamp(s_settings_interface.GetIntValue("EmuCore/GS", "NbaUpscaler", 0), 0, 1)},
+ #else
+ 		{"Reescalado a la ventana", {"Desactivado", "AMD FSR 1", "NVIDIA DLSS"},
+ 			std::clamp(s_settings_interface.GetIntValue("EmuCore/GS", "NbaUpscaler", 0), 0, 2)},
+@@ -1406,9 +1501,44 @@ static void LiveMenuPublish()
  
  static void LiveMenuSave()
  {
@@ -195,7 +207,7 @@ index 00647296f..5df73271f 100644
  		std::fprintf(fp, "Renderer = %d\n", s_menu_pending_renderer >= 0 ? s_menu_pending_renderer :
  			s_settings_interface.GetIntValue("EmuCore/GS", "Renderer", static_cast<int>(kMenuDefaultRenderer)));
  		std::fprintf(fp, "upscale_multiplier = %g\n", s_settings_interface.GetFloatValue("EmuCore/GS", "upscale_multiplier", 1.0f));
-@@ -1427,6 +1556,8 @@ static void LiveMenuSave()
+@@ -1427,6 +1557,8 @@ static void LiveMenuSave()
  		std::fprintf(fp, "LoadTextureReplacements = %s\n", s_settings_interface.GetBoolValue("EmuCore/GS", "LoadTextureReplacements", false) ? "true" : "false");
  		std::fprintf(fp, "LoadTextureReplacementsAsync = true\n");
  		std::fprintf(fp, "DumpReplaceableTextures = %s\n", s_settings_interface.GetBoolValue("EmuCore/GS", "DumpReplaceableTextures", false) ? "true" : "false");
@@ -204,7 +216,7 @@ index 00647296f..5df73271f 100644
  		std::fclose(fp);
  	}
  }
-@@ -1447,6 +1578,7 @@ static void LiveMenuApply(int item)
+@@ -1447,6 +1579,7 @@ static void LiveMenuApply(int item)
  			break;
  		case MENU_RES:
  			s_settings_interface.SetFloatValue("EmuCore/GS", "upscale_multiplier", kMenuUpscale[index]);
@@ -212,7 +224,7 @@ index 00647296f..5df73271f 100644
  			break;
  		case MENU_ANISO:
  			s_settings_interface.SetIntValue("EmuCore/GS", "MaxAnisotropy", kMenuAniso[index]);
-@@ -1664,7 +1796,7 @@ bool GSRunner::CreatePlatformWindow()
+@@ -1664,7 +1797,7 @@ bool GSRunner::CreatePlatformWindow()
  			live_rect = {0, 0, w, h};
  	}
  	AdjustWindowRectEx(&live_rect, WS_OVERLAPPEDWINDOW, FALSE, 0);
@@ -221,7 +233,7 @@ index 00647296f..5df73271f 100644
  		WS_OVERLAPPEDWINDOW | WS_CAPTION | WS_MINIMIZEBOX | WS_SYSMENU | WS_SIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT,
  		s_live ? (live_rect.right - live_rect.left) : WINDOW_WIDTH, s_live ? (live_rect.bottom - live_rect.top) : WINDOW_HEIGHT,
  		nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
-@@ -1992,7 +2124,7 @@ bool GSRunner::CreatePlatformWindow()
+@@ -1992,7 +2125,7 @@ bool GSRunner::CreatePlatformWindow()
  			}
  		}
  	}
@@ -230,6 +242,155 @@ index 00647296f..5df73271f 100644
  	CocoaTools::GetWindowInfoFromWindow(&s_wi, s_window);
  	if (s_live)
  	{
+diff --git a/pcsx2/CMakeLists.txt b/pcsx2/CMakeLists.txt
+index f67f53acd..e2bcdbe45 100644
+--- a/pcsx2/CMakeLists.txt
++++ b/pcsx2/CMakeLists.txt
+@@ -1268,6 +1268,7 @@ if (APPLE)
+ 	find_library(APPKIT_LIBRARY AppKit)
+ 	find_library(IOKIT_LIBRARY IOKit)
+ 	find_library(METAL_LIBRARY Metal)
++	find_library(METALFX_LIBRARY MetalFX)
+ 	find_library(QUARTZCORE_LIBRARY QuartzCore)
+ 	find_library(AVFOUNDATION_LIBRARY AVFoundation)
+ 	find_library(COREMEDIA_LIBRARY CoreMedia)
+@@ -1275,6 +1276,7 @@ if (APPLE)
+ 		${APPKIT_LIBRARY}
+ 		${IOKIT_LIBRARY}
+ 		${METAL_LIBRARY}
++		${METALFX_LIBRARY}
+ 		${QUARTZCORE_LIBRARY}
+ 		${AVFOUNDATION_LIBRARY}
+ 		${COREMEDIA_LIBRARY}
+diff --git a/pcsx2/GS/Renderers/Common/GSDevice.cpp b/pcsx2/GS/Renderers/Common/GSDevice.cpp
+index 48e6fe8ac..5a25627f1 100644
+--- a/pcsx2/GS/Renderers/Common/GSDevice.cpp
++++ b/pcsx2/GS/Renderers/Common/GSDevice.cpp
+@@ -1227,7 +1227,7 @@ void GSDevice::Upscale(GSTexture*& tex, GSVector4i& src_rect, GSVector4& src_uv,
+ 	if (used != s_last_used)
+ 	{
+ 		s_last_used = used;
+-		Console.WriteLn("(PS2Recomp) upscaler: %s (%dx%d -> %dx%d)", used == 2 ? "NVIDIA DLSS" : (used == 1 ? "AMD FSR 1" : "unavailable"),
++		Console.WriteLn("(PS2Recomp) upscaler: %s (%dx%d -> %dx%d)", used == 3 ? "Apple MetalFX" : (used == 2 ? "NVIDIA DLSS" : (used == 1 ? "AMD FSR 1" : "unavailable")),
+ 			src_rect.width(), src_rect.height(), dst_width, dst_height);
+ 	}
+ 	if (!used)
+diff --git a/pcsx2/GS/Renderers/Metal/GSDeviceMTL.h b/pcsx2/GS/Renderers/Metal/GSDeviceMTL.h
+index 1192af18b..724f054d6 100644
+--- a/pcsx2/GS/Renderers/Metal/GSDeviceMTL.h
++++ b/pcsx2/GS/Renderers/Metal/GSDeviceMTL.h
+@@ -249,6 +249,11 @@ public:
+ 
+ 	// Functions and Pipeline States
+ 	MRCOwned<id<MTLComputePipelineState>> m_cas_pipeline[2];
++	// PS2Recomp: Apple MetalFX spatial upscaler (id<MTLFXSpatialScaler>), rebuilt when the sizes change.
++	MRCOwned<id> m_mfx_scaler;
++	MRCOwned<id<MTLTexture>> m_mfx_in;
++	MRCOwned<id<MTLTexture>> m_mfx_out;
++	int m_mfx_in_w = 0, m_mfx_in_h = 0, m_mfx_out_w = 0, m_mfx_out_h = 0;
+ 	std::vector<MRCOwned<id<MTLRenderPipelineState>>> m_convert_pipeline;
+ 	MRCOwned<id<MTLRenderPipelineState>> m_present_pipeline[static_cast<int>(PresentShader::Count)];
+ 	MRCOwned<id<MTLRenderPipelineState>> m_merge_pipeline[4];
+@@ -394,6 +399,7 @@ public:
+ 	void DoShadeBoost(GSTexture* sTex, GSTexture* dTex, const float params[4]) override;
+ 
+ 	bool DoCAS(GSTexture* sTex, GSTexture* dTex, bool sharpen_only, const std::array<u32, NUM_CAS_CONSTANTS>& constants) override;
++	int DoUpscale(GSTexture* sTex, const GSVector4i& src_rect, GSTexture* dTex, int mode, float sharpness) override;
+ 
+ 	MRCOwned<id<MTLFunction>> LoadShader(NSString* name);
+ 	MRCOwned<id<MTLRenderPipelineState>> MakePipeline(MTLRenderPipelineDescriptor* desc, id<MTLFunction> vertex, id<MTLFunction> fragment, NSString* name);
+diff --git a/pcsx2/GS/Renderers/Metal/GSDeviceMTL.mm b/pcsx2/GS/Renderers/Metal/GSDeviceMTL.mm
+index 6bf6af8eb..28f9cc874 100644
+--- a/pcsx2/GS/Renderers/Metal/GSDeviceMTL.mm
++++ b/pcsx2/GS/Renderers/Metal/GSDeviceMTL.mm
+@@ -18,6 +18,8 @@
+ #ifdef __APPLE__
+ #include "GSMTLSharedHeader.h"
+ 
++#import <MetalFX/MetalFX.h>
++
+ static constexpr simd::float2 ToSimd(const GSVector2& vec)
+ {
+ 	return simd::make_float2(vec.x, vec.y);
+@@ -769,6 +771,78 @@ bool GSDeviceMTL::DoCAS(GSTexture* sTex, GSTexture* dTex, bool sharpen_only, con
+ 	return true;
+ }}
+ 
++// PS2Recomp: Apple MetalFX spatial upscaling of the displayed frame up to the window size (the Mac counterpart of
++// the Vulkan renderer's FSR 1 / DLSS). Returns 3 when used, 0 when MetalFX is unavailable.
++int GSDeviceMTL::DoUpscale(GSTexture* sTex, const GSVector4i& src_rect, GSTexture* dTex, int mode, float sharpness)
++{ @autoreleasepool {
++	if (mode == 0)
++		return 0;
++	if (@available(macOS 13.0, *))
++	{
++		id<MTLDevice> dev = m_dev.dev;
++		if (![MTLFXSpatialScalerDescriptor supportsDevice:dev])
++			return 0;
++		const int in_w = src_rect.width(), in_h = src_rect.height();
++		const int out_w = dTex->GetWidth(), out_h = dTex->GetHeight();
++		id<MTLTexture> src = static_cast<GSTextureMTL*>(sTex)->GetTexture();
++		const MTLPixelFormat fmt = [src pixelFormat];
++		if (!m_mfx_scaler || m_mfx_in_w != in_w || m_mfx_in_h != in_h || m_mfx_out_w != out_w || m_mfx_out_h != out_h ||
++			[(id<MTLFXSpatialScaler>)m_mfx_scaler.Get() colorTextureFormat] != fmt)
++		{
++			MTLFXSpatialScalerDescriptor* d = [MTLFXSpatialScalerDescriptor new];
++			d.inputWidth = in_w;
++			d.inputHeight = in_h;
++			d.outputWidth = out_w;
++			d.outputHeight = out_h;
++			d.colorTextureFormat = fmt;
++			d.outputTextureFormat = fmt;
++			d.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;
++			id<MTLFXSpatialScaler> sc = [d newSpatialScalerWithDevice:dev];
++			[d release];
++			if (!sc)
++			{
++				Console.Error("(PS2Recomp) MetalFX: could not create the spatial scaler %dx%d -> %dx%d", in_w, in_h, out_w, out_h);
++				m_mfx_scaler = nil;
++				return 0;
++			}
++			m_mfx_scaler = MRCTransfer((id)sc);
++			MTLTextureDescriptor* od = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt width:out_w height:out_h mipmapped:NO];
++			od.storageMode = MTLStorageModePrivate;
++			od.usage = sc.outputTextureUsage | MTLTextureUsageShaderRead;
++			m_mfx_out = MRCTransfer([dev newTextureWithDescriptor:od]);
++			MTLTextureDescriptor* id_ = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt width:in_w height:in_h mipmapped:NO];
++			id_.storageMode = MTLStorageModePrivate;
++			id_.usage = sc.colorTextureUsage | MTLTextureUsageShaderRead;
++			m_mfx_in = MRCTransfer([dev newTextureWithDescriptor:id_]);
++			m_mfx_in_w = in_w; m_mfx_in_h = in_h; m_mfx_out_w = out_w; m_mfx_out_h = out_h;
++		}
++		id<MTLFXSpatialScaler> sc = (id<MTLFXSpatialScaler>)m_mfx_scaler.Get();
++		g_perfmon.Put(GSPerfMon::TextureCopies, 1);
++		EndRenderPass();
++		id<MTLCommandBuffer> cb = GetRenderCmdBuf();
++		// MetalFX reads its input from the texture origin: copy the displayed rectangle out first.
++		id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
++		[blit setLabel:@"MetalFX input"];
++		[blit copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(src_rect.x, src_rect.y, 0)
++		           sourceSize:MTLSizeMake(in_w, in_h, 1) toTexture:m_mfx_in destinationSlice:0 destinationLevel:0
++		    destinationOrigin:MTLOriginMake(0, 0, 0)];
++		[blit endEncoding];
++		sc.colorTexture = m_mfx_in;
++		sc.outputTexture = m_mfx_out;
++		sc.inputContentWidth = in_w;
++		sc.inputContentHeight = in_h;
++		[sc encodeToCommandBuffer:cb];
++		blit = [cb blitCommandEncoder];
++		[blit setLabel:@"MetalFX output"];
++		[blit copyFromTexture:m_mfx_out sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
++		           sourceSize:MTLSizeMake(out_w, out_h, 1) toTexture:static_cast<GSTextureMTL*>(dTex)->GetTexture()
++		     destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
++		[blit endEncoding];
++		return 3;
++	}
++	return 0;
++}}
++
+ MRCOwned<id<MTLFunction>> GSDeviceMTL::LoadShader(NSString* name)
+ {
+ 	NSError* err = nil;
 diff --git a/pcsx2/GSDumpReplayer.cpp b/pcsx2/GSDumpReplayer.cpp
 index 2de413bec..ef5ce009f 100644
 --- a/pcsx2/GSDumpReplayer.cpp

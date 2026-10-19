@@ -8,6 +8,9 @@
 #   DBZ_RENDERER=pgs   la ruta anterior: paraLLEl-GS sobre MoltenVK (DBZ_SSAA=1/2/4, por defecto 2)
 #   DBZ_WINDOW=1       ventana en lugar de pantalla completa (Alt+Enter o F11 cambia en cualquier momento)
 #   DBZ_ISO=<ruta>     otra imagen del disco
+#   DBZ_60FPS=1        peleas a 60 fps (modo 60 fps de BT3-Recomp: la logica avanza a medio paso). A 6x va justo:
+#                      si da tirones, baja a 5x con F1. En F1, "Reescalado a la ventana" = Apple MetalFX agranda
+#                      la imagen hasta la pantalla cuando la resolucion interna es menor (p. ej. 3x).
 #
 # Controles en la ventana de PCSX2:
 #   Teclado: flechas = cruceta, WASD = stick izquierdo, Z = cuadrado, X = cruz, C = circulo, V = triangulo,
@@ -34,6 +37,11 @@ HOSTARGS="-ini $HOME/NBAStreetRecomp/gshost-dbz/dbz.ini"
 [ "${DBZ_WINDOW:-0}" = "1" ] || HOSTARGS="$HOSTARGS -fullscreen"
 export PS2X_GSHOST_ARGS="$HOSTARGS"
 export PS2X_LIVE_SERIAL=SLUS-21978
+if [ "${DBZ_60FPS:-0}" = "1" ]; then
+  export PS2X_FPS60=1 PS2X_HALFSTEP=$HOME/NBAStreetRecomp/bt3mod/games/bt3/fps60_sites.txt
+else
+  export PS2X_FPS60=0
+fi
 export PS2X_HOST_WINDOW="${PS2X_HOST_WINDOW:-1280x720}"
 export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib:/usr/local/lib:/usr/lib
 exec ./ps2EntryRunner "$ELF" > ~/NBAStreetRecomp/dbz/logs/jugar.log 2>&1

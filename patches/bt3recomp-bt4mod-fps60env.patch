@@ -1,0 +1,16 @@
+diff --git a/ps2xRuntime/src/lib/ps2_settings_overlay.cpp b/ps2xRuntime/src/lib/ps2_settings_overlay.cpp
+index 74817c7..0ec7d1f 100644
+--- a/ps2xRuntime/src/lib/ps2_settings_overlay.cpp
++++ b/ps2xRuntime/src/lib/ps2_settings_overlay.cpp
+@@ -946,7 +946,10 @@ void PS2SettingsOverlay::syncFromRuntime()
+ 
+ void PS2SettingsOverlay::applySettings()
+ {
+-    ps2Set60Fps(m_settings.fps60, nullptr);   // [fps60]
++    {   // [fps60] [bt4mod] PS2X_FPS60 (launcher / tests) wins over the saved toggle
++        const char *e = std::getenv("PS2X_FPS60");
++        ps2Set60Fps((e && e[0]) ? e[0] != '0' : m_settings.fps60, nullptr);
++    }
+     s_logLevel = m_settings.logLevel;   // [loglevel] a live change follows into the runtime's print gates
+     // [ach] Both switches are applied here, not only where they are drawn, so a saved value takes
+     // effect at boot without the player having to open the tab first. applySettings() runs on the

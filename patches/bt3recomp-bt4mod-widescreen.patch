@@ -1,0 +1,17 @@
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp	2026-10-19 01:58:14
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp	2026-10-19 01:58:14
+@@ -8246,6 +8246,14 @@
+                 if (wsScale > 2.5f) wsScale = 2.5f;
+             }
+             if (wsNoFov()) wsScale = 1.0f;   // [wslever] guest half off
++            {   // [bt4mod] the DBZ BT4 mod ships the community 16:9 values built in (lui 0x3F10
++                // @130bf0, both FOV floats already x4/3): scaling them again narrows the sky
++                // backdrop (uncovered strips at the sides) and zooms the camera in.
++                const uint8_t *rd = m_memory.getRDRAM();
++                uint32_t w = 0;
++                if (rd) std::memcpy(&w, rd + 0x130bf0, 4);
++                if (w == 0x3c013f10u && !std::getenv("PS2X_WSFORCE")) wsScale = 1.0f;
++            }
+             if (const char *wsF = std::getenv("PS2X_WSFORCE"))
+             {   // [wsforce] rig override: force the scale regardless of toggle/window aspect
+                 const float f = (float)std::atof(wsF);

@@ -139,7 +139,7 @@ index 0045f01..fac0c83 100644
      // the same mapping, after the data area (macOS: os_sync_wait_on_address, Linux: futex).
      // macOS limits shm names to 31 characters, so the base name is short.
 diff --git a/pcsx2-gsrunner/Main.cpp b/pcsx2-gsrunner/Main.cpp
-index 3b93a4a..737249e 100644
+index 3b93a4a..30b7540 100644
 --- a/pcsx2-gsrunner/Main.cpp
 +++ b/pcsx2-gsrunner/Main.cpp
 @@ -1397,6 +1397,7 @@ namespace
@@ -213,3 +213,14 @@ index 3b93a4a..737249e 100644
  		GSDumpReplayer::SetLiveMenuOpen(s_menu_open.load());
  		LiveMenuPublish();
  		return;
+@@ -1963,6 +1983,10 @@ static bool LivePlatformReadGamepad(u16* buttons)
+ 		if (get_state(pad, &state) == ERROR_SUCCESS)
+ 		{
+ 			*buttons = state.Gamepad.wButtons;
++			// Back + Start opens the launcher over the game (it watches the pad itself): with Back held, Start
++			// does not reach the game, so the combo never pauses the fight.
++			if (*buttons & XINPUT_GAMEPAD_BACK)
++				*buttons &= ~XINPUT_GAMEPAD_START;
+ 			break;
+ 		}
+ 	}

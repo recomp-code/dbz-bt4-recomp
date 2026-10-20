@@ -1,17 +1,35 @@
-Dragon Ball Z Budokai Tenkaichi 4 (mod de Team BT4, Beta 14 Rev2) - Windows
-============================================================================
+Dragon Ball Z Budokai Tenkaichi 4 (Beta 14 Rev2) - Windows
+==========================================================
 
 Como jugar
 ----------
 1. Descomprime el .zip en una carpeta donde puedas escribir (Escritorio, Documentos, Descargas...).
    No lo pongas en "Archivos de programa".
 2. Abre DBZ_BT4.exe.
-3. Pulsa "Seleccionar ISO..." y elige tu ISO del mod: SLUS-219.78, Beta 14 Rev2 (DBZBT4B14REV2).
-   Solo se hace la primera vez. Otra version del mod no sirve: el juego esta recompilado para esa.
-4. Elige la calidad y pulsa JUGAR.
+3. Pulsa "Seleccionar ISO" y elige tu ISO: SLUS-219.78, Beta 14 Rev2 (DBZBT4B14REV2).
+   Solo se hace la primera vez. Otra version no sirve: el juego esta recompilado para esa.
+4. Pulsa JUGAR.
 
-Este paquete NO incluye el juego: necesitas tu propia ISO. El mod es de Team BT4:
-https://teambt4.wixsite.com/teambt4projects
+Este paquete NO incluye el juego: necesitas tu propia ISO.
+
+Jugar en linea
+--------------
+1. En el launcher, pestana EN LINEA: crea una cuenta (usuario y contrasena) o entra con la tuya.
+   Una cuenta sirve para siempre; en este PC queda guardada la sesion, cifrada, nunca la contrasena.
+2. Ahi ves quien esta conectado. Para jugar con alguien:
+   - pulsa "Invitar" en su nombre (o en tu lista de amigos, a la izquierda); cuando acepte, empieza la pelea;
+   - o activa "Buscar partida" para que otros vean que quieres jugar;
+   - o crea una sala ("+ Nueva sala"), con contrasena si quieres, de 2 a 4 jugadores: pelean por turnos.
+   - "Buscar jugador por nombre" encuentra a cualquiera, aunque no este conectado; la estrella lo anade a amigos.
+3. Al aceptar, los dos juegos se abren solos y conectados. Cada uno ve su propio luchador a pantalla completa.
+   No hay que abrir puertos en el router: todo pasa por el servidor.
+4. Durante la partida, Back + Start en el mando (o Shift+Tab en el teclado) abre el launcher encima del juego
+   para ver quien esta en linea, responder una invitacion o hablar en la sala. B (o Back + Start) vuelve al juego.
+   Mientras el launcher esta delante, el mando no mueve a tu luchador.
+5. Si te invitan mientras juegas solo, el aviso aparece encima del juego: A acepta (se cierra tu partida actual,
+   lo que no hayas guardado se pierde), B dice "ahora no".
+Los dos jugadores tienen que tener la misma version de este paquete (el launcher avisa si no).
+Si la pelea va a tirones porque estais lejos, sube "Retraso de controles" en AJUSTES (manda el de quien invita).
 
 Requisitos
 ----------
@@ -26,7 +44,8 @@ Controles
 Mando XInput (Xbox o compatible): A = Cruz, B = Circulo, X = Cuadrado, Y = Triangulo.
 Teclado: flechas = cruceta, WASD = stick izquierdo, Z/X/C/V = Cuadrado/Cruz/Circulo/Triangulo,
          Q/E = L1/R1, 1/3 = L2/R2, Enter = START, Retroceso = SELECT.
-F1 (o Back+Start, o mantener START) = opciones graficas: resolucion interna, DLSS / FSR, nitidez.
+F1 (o mantener START) = opciones del juego: resolucion interna, DLSS / FSR, nitidez, 60 fps.
+Back + Start (o Shift+Tab) = el launcher encima de la partida.
 Alt+Enter o F11 = pantalla completa / ventana.  Cerrar la ventana = salir.
 
 Codigo para desbloquear todo (en el menu principal): manten L1+R1 y pulsa
@@ -35,3 +54,4 @@ Abajo, Derecha, Triangulo, Abajo, Izquierda, Triangulo, Arriba.
 Partidas guardadas: runtime\savedata\.  Registros si algo falla: logs\juego.log y gshost\logs\emulog.txt.
 
 Codigo fuente y como compilarlo: https://github.com/recomp-code/dbz-bt4-recomp
+Servidor en linea: https://github.com/recomp-code/recomp-online

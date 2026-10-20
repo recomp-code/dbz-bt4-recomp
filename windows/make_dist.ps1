@@ -3,7 +3,7 @@
 #   runtime\   ps2EntryRunner.exe (el juego recompilado) + DLLs (FFmpeg, VC++), assets\ y savedata\settings.toml de BT3-Recomp
 #   runtime\data\   lo llena el launcher (ELF del disco); runtime\savedata\ = memory card
 #   gshost\    pcsx2-gsrunner (GS de PCSX2 con DLSS/FSR) + resources + presets dbz*.ini
-param([switch]$NoZip)
+param([switch]$NoZip, [string]$Server = "https://nbas3.xellrecomp.party")
 $ErrorActionPreference = 'Stop'
 $R = "C:\DBZBT4Recomp"
 $dist = "$R\dist\DBZ_BT4_Windows"
@@ -57,8 +57,14 @@ Set-Content "$dist\DLSS\LEEME.txt" -Encoding ascii -Value @(
 Get-Content "$R\gshost_hooktest\ReShade.ini" | Where-Object { $_ -notmatch '^IntermediateCachePath=' } |
     Set-Content "$dist\gshost\presets\ReShade.ini" -Encoding ascii
 
-# launcher
-& "$PSScriptRoot\build_launcher.ps1" -Out "$dist\DBZ_BT4.exe"
+# launcher: the Recomp launcher (Go + Wails, C:\RecompOnline\launcher), online server built in
+Push-Location "C:\RecompOnline\launcher"
+$env:GOTOOLCHAIN = 'local'
+& "$R\tools\go\bin\go.exe" build -tags desktop,production -trimpath `
+    -ldflags "-H windowsgui -s -w -X main.defaultServer=$Server" -o "$dist\DBZ_BT4.exe" .
+$ok = $?
+Pop-Location
+if (-not $ok) { throw "launcher build failed" }
 Copy-Item "$R\dbz-bt4-recomp\windows\LEEME.txt" "$dist\LEEME.txt"
 
 $sum = (Get-ChildItem $dist -Recurse -File | Measure-Object Length -Sum).Sum

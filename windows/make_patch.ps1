@@ -19,7 +19,9 @@ $base = "$R\tmp_base"
 if ($LASTEXITCODE -ne 0) { throw "no aplica bt3recomp-bt4mod-full.patch" }
 $rt = @('ps2xRuntime/src/lib/ps2_gs_live.cpp', 'ps2xRuntime/src/lib/ps2_live_ring.h', 'ps2xRuntime/src/lib/game_overrides.cpp',
         'ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h', 'ps2xRuntime/src/lib/ps2_host_audio.cpp',
-        'games/bt3/fps60_sites.txt', 'ps2xRuntime/src/lib/ps2_stepcensus.cpp')
+        'games/bt3/fps60_sites.txt', 'ps2xRuntime/src/lib/ps2_stepcensus.cpp',
+        # online: the relay client and netwait, and the pad that only counts while the game is in front
+        'ps2xRuntime/src/lib/ps2_netplay.cpp', 'ps2xRuntime/src/lib/pad_config.cpp', 'ps2xRuntime/include/runtime/ps2_gs_live.h')
 Write-Diff 'C:/DBZBT4Recomp/tmp_base' 'C:/DBZBT4Recomp/bt3mod' $rt "$R\patches\bt3recomp-bt4mod-windows.patch"
 & $g -C $base apply --check "$R\patches\bt3recomp-bt4mod-windows.patch"
 $ok1 = $LASTEXITCODE -eq 0

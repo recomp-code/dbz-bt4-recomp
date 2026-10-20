@@ -40,13 +40,36 @@ with `windows/record_video.ps1` + `windows/mux_video.ps1`.
    The launcher shows which version is in use.
 
 Needs Windows 10/11 64-bit and a GPU with Vulkan (DLSS on NVIDIA RTX, FSR on the rest). Xbox-style controllers and the
-keyboard work out of the box. **Hold START for 1.5 s** (or Back+Start, or F1) for the options menu: internal resolution,
+keyboard work out of the box. **Hold START for 1.5 s** (or F1) for the options menu: internal resolution,
 DLSS / FSR, sharpness, anisotropic filtering, aspect ratio, fullscreen, FPS counter and **60 fps fights** (switched at
 once, mid-fight too; the launcher's checkbox sets the starting value). `DBZ_BT4.exe --jugar` starts straight away with the saved
 options (for a desktop shortcut). The zip has the recompiled runner and PCSX2's GS host, **not the disc**: the launcher
 copies the ELF and the IRX modules out of your ISO into `runtime\data\` and the game streams everything else from the ISO.
-Built with `windows/make_dist.ps1`; the launcher's source is `windows/launcher/DBZ_BT4.cs` (`windows/build_launcher.ps1`,
-the C# compiler that ships with Windows).
+Built with `windows/make_dist.ps1`; the launcher (Go + Wails, WebView2) is
+[recomp-code/recomp-online](https://github.com/recomp-code/recomp-online) `launcher/`.
+
+### Play online
+
+The launcher has online play built in, against a server that is already up: **nothing to install or configure, and no
+ports to open** on your router.
+
+1. In the launcher, tab **EN LÍNEA**: create an account (user and password) or sign in. The session is kept on this PC,
+   encrypted with Windows DPAPI; the password never is.
+2. You see who is online. Press **Invitar** on someone (or on a friend in the left column), turn on **Buscar partida**
+   so others see you want to play, or create a **room** (with a password if you like, 2 to 4 players taking turns, with
+   chat). **Buscar jugador por nombre** finds anyone, online or not; the star adds them to your friends.
+3. When the invitation is accepted, both games open by themselves, already connected: each player sees their own
+   fighter full screen (the split screen is gone), at the same 30 or 60 fps.
+4. During the match, **Back + Start** on the controller (or **Shift+Tab**) brings the launcher over the game: who is
+   online, invitations, the room's chat. **B** (or Back + Start again) goes back. While the launcher is in front the pad
+   does not move your fighter, and the combo never pauses the game.
+5. An invitation that arrives while you play alone shows over the game: **A** accepts (your current game closes;
+   anything not saved is lost), **B** says not now.
+
+Both players need the same release (the launcher says so otherwise). The match is lockstep: both games run the same
+frames with both players' inputs, a few frames late (the input delay, 3 by default) so they have time to cross the
+internet through the relay; the two sides compare a hash of the game state as they go. If the fight stutters because
+you are far apart, raise **Retraso de controles** in AJUSTES (the inviter's value is used).
 
 > **The mod is the work of Team BT4.** Get it, its updates and the PCSX2 extras (the `GameIndex.yaml` with the
 > SLUS-21978 fixes) from their official page: **https://teambt4.wixsite.com/teambt4projects**

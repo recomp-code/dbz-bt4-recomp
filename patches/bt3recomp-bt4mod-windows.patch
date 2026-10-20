@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/src/lib/ps2_gs_live.cpp b/ps2xRuntime/src/lib/ps2_gs_live.cpp
-index 086b77e..aa986bd 100644
+index 086b77e..13cb066 100644
 --- a/ps2xRuntime/src/lib/ps2_gs_live.cpp
 +++ b/ps2xRuntime/src/lib/ps2_gs_live.cpp
 @@ -1,5 +1,5 @@
@@ -27,7 +27,7 @@ index 086b77e..aa986bd 100644
  // [web] The GS host is the page itself (web/play_gs_host.cpp, Play!'s GS on WebGL2, on the browser's main thread):
  // the ring is plain memory of this module, shared with it. Same protocol as the POSIX ring.
  #include <cerrno>
-@@ -38,6 +47,12 @@ extern char **environ;
+@@ -38,6 +47,90 @@ extern char **environ;
  #define PS2X_GS_LIVE_RING 1
  #endif
  
@@ -36,11 +36,89 @@ index 086b77e..aa986bd 100644
 +// [fps60] the host's options menu switches 60 fps fights (ps2_stepcensus.cpp)
 +extern std::atomic<int> g_ps2VStepMode;
 +void ps2Set60Fps(bool on, const char *sitesPath);
++// [netview] online: which player this machine is (ps2_netplay.cpp)
++bool ps2NetActive();
++int  ps2NetLocalPlayer();
++
++namespace
++{
++    // [netview] Online, each machine shows only its OWN fighter full screen. BT3-Recomp's netplay makes both
++    // players' views full screen in the guest (so the simulation is identical on both sides) and marks them in
++    // the scissor's top row: player 1's view has y0 = 1, player 2's y0 = 2 (game_overrides.cpp, bt3NetViewSelect);
++    // with the split screen of an older build they are the left/right halves. Its own renderers blank the other
++    // view's SCISSOR; PCSX2's GS gets the packets before those rewrites, so the same rule runs here, on the copy
++    // that goes to the live ring: the other view's SCISSOR becomes an empty rect (x0 2047 > x1 0) and PCSX2 skips
++    // its draws (m_scissor_invalid). Full-width/HUD/post-pass scissors are never touched. PS2X_VPKEEP=1|2 forces it.
++    int netViewKeep()
++    {
++        static const int s_env = [](){ const char *e = std::getenv("PS2X_VPKEEP"); return (e && e[0]) ? std::atoi(e) : 0; }();
++        if (s_env == 1 || s_env == 2) return s_env;
++        return ps2NetActive() ? ps2NetLocalPlayer() : 0;
++    }
++
++    bool otherView(uint64_t v, int keep)
++    {
++        const uint32_t sx0 = uint32_t(v & 0x7FFu), sx1 = uint32_t((v >> 16) & 0x7FFu);
++        const uint32_t sy0 = uint32_t((v >> 32) & 0x7FFu), sy1 = uint32_t((v >> 48) & 0x7FFu);
++        if (sy1 < 400u) return false;   // only the full-height scene views
++        const bool leftVp = sx0 == 0u && sx1 > 0u && sx1 <= 255u, rightVp = sx0 >= 256u;
++        const bool p1Full = sx0 == 0u && sx1 == 511u && sy0 == 1u, p2Full = sx0 == 0u && sx1 == 511u && sy0 == 2u;
++        return keep == 1 ? (rightVp || p2Full) : (leftVp || p1Full);
++    }
++
++    // Returns the packet to send: `data` itself, or a rewritten copy in `scratch` when a SCISSOR had to go.
++    const uint8_t *netViewFilter(const uint8_t *data, uint32_t size, std::vector<uint8_t> &scratch)
++    {
++        const int keep = netViewKeep();
++        if (keep != 1 && keep != 2) return data;
++        uint8_t *out = nullptr;
++        size_t off = 0;
++        while (off + 16u <= size)
++        {
++            uint64_t lo, hi; std::memcpy(&lo, data + off, 8); std::memcpy(&hi, data + off + 8, 8);
++            const uint32_t nloop = uint32_t(lo & 0x7FFFu), flg = uint32_t((lo >> 58) & 3u);
++            uint32_t nreg = uint32_t((lo >> 60) & 0xFu); if (nreg == 0u) nreg = 16u;
++            off += 16u;
++            if (nloop == 0u) continue;
++            if (flg == 0u)
++            {   // PACKED: SCISSOR_1/2 only arrive as A+D (descriptor 0xE, address 0x40/0x41)
++                const size_t bytes = size_t(nloop) * nreg * 16u;
++                if (off + bytes > size) break;
++                bool anyAd = false;
++                for (uint32_t i = 0; i < nreg; i++) anyAd |= ((hi >> (4 * i)) & 0xFu) == 0xEu;
++                if (anyAd)
++                    for (uint32_t l = 0; l < nloop; l++)
++                        for (uint32_t i = 0; i < nreg; i++)
++                        {
++                            if (((hi >> (4 * i)) & 0xFu) != 0xEu) continue;
++                            const size_t q = off + (size_t(l) * nreg + i) * 16u;
++                            const uint8_t addr = data[q + 8];
++                            if (addr != 0x40u && addr != 0x41u) continue;
++                            uint64_t v; std::memcpy(&v, data + q, 8);
++                            if (!otherView(v, keep)) continue;
++                            if (!out) { scratch.assign(data, data + size); out = scratch.data(); }
++                            const uint64_t empty = (v & ~(0x7FFull | (0x7FFull << 16))) | 0x7FFull;   // x0 = 2047 > x1 = 0
++                            std::memcpy(out + q, &empty, 8);
++                            static std::atomic<uint32_t> s_said{0};
++                            if (s_said.fetch_add(1u) < 3u)
++                                std::fprintf(stderr, "[netview] player %d: the other player's view is not drawn (scissor x %u..%u y %u..%u)\n",
++                                             keep, uint32_t(v & 0x7FFu), uint32_t((v >> 16) & 0x7FFu), uint32_t((v >> 32) & 0x7FFu), uint32_t((v >> 48) & 0x7FFu));
++                        }
++                off += bytes;
++            }
++            else if (flg == 1u)
++                off += (size_t(nloop) * nreg + 1u) / 2u * 16u;   // REGLIST: no SCISSOR there
++            else
++                off += size_t(nloop) * 16u;                     // IMAGE
++        }
++        return out ? out : data;
++    }
++}
 +
  namespace ps2_gslive
  {
      namespace
-@@ -81,7 +96,175 @@ namespace ps2_gslive
+@@ -81,7 +174,177 @@ namespace ps2_gslive
              return (v && v[0]) ? std::string(v) : std::string("SLUS-21978");
          }
  
@@ -55,6 +133,7 @@ index 086b77e..aa986bd 100644
 +            HANDLE spaceEvent = nullptr;
 +            HANDLE readbackEvent = nullptr;
 +            HANDLE hostProcess = nullptr;
++            DWORD hostPid = 0;
 +            DWORD hostStatus = 0;
 +            bool hostExited = false;
 +            ps2live::RingHeader *header = nullptr;
@@ -141,6 +220,7 @@ index 086b77e..aa986bd 100644
 +                }
 +                CloseHandle(pi.hThread);
 +                hostProcess = pi.hProcess;
++                hostPid = pi.dwProcessId;
 +                std::fprintf(stderr, "[gslive] GS host %s pid %lu, args: %s\n", exe.string().c_str(), pi.dwProcessId,
 +                             std::filesystem::path(args).string().c_str());
 +                return true;
@@ -217,7 +297,7 @@ index 086b77e..aa986bd 100644
          struct LiveRing
          {
              int hostStatus = 0;
-@@ -149,6 +332,15 @@ namespace ps2_gslive
+@@ -149,6 +412,15 @@ namespace ps2_gslive
              }
  
              void signal() {} // the page polls once per browser frame
@@ -233,7 +313,7 @@ index 086b77e..aa986bd 100644
          };
  #elif defined(PS2X_GS_LIVE_RING)
          // shm_open mapping, events as shared words (ps2live::eventSet/eventWait), host started with posix_spawn.
-@@ -298,6 +490,21 @@ namespace ps2_gslive
+@@ -298,6 +570,21 @@ namespace ps2_gslive
                  if (!header->consumerFlags || header->consumerWaiting)
                      ps2live::eventSet(&events->data);
              }
@@ -255,7 +335,7 @@ index 086b77e..aa986bd 100644
          };
  #endif
  
-@@ -335,12 +542,7 @@ namespace ps2_gslive
+@@ -335,12 +622,7 @@ namespace ps2_gslive
                  {
                      if (!live.write(static_cast<const uint8_t *>(data), size))
                      {
@@ -269,7 +349,7 @@ index 086b77e..aa986bd 100644
                          std::fflush(stderr);
                          std::_Exit(0);
                      }
-@@ -428,7 +630,7 @@ namespace ps2_gslive
+@@ -428,7 +710,7 @@ namespace ps2_gslive
                          std::fprintf(stderr, "[gslive] GS host started (PCSX2 renderer, serial %s)\n", serial().c_str());
                      }
                      else
@@ -278,7 +358,41 @@ index 086b77e..aa986bd 100644
                  }
  #endif
                  const char *path = std::getenv("PS2X_GS_DUMP");
-@@ -590,6 +792,13 @@ namespace ps2_gslive
+@@ -523,6 +805,23 @@ namespace ps2_gslive
+ #endif
+     }
+ 
++    bool hostFocused()
++    {
++#if defined(PS2X_GS_LIVE_RING) && defined(_WIN32)
++        if (!requested())
++            return true;
++        Writer &w = writer();
++        if (!w.liveActive || w.live.hostPid == 0u)
++            return true;
++        DWORD pid = 0;
++        if (HWND fg = GetForegroundWindow())
++            GetWindowThreadProcessId(fg, &pid);
++        return pid == w.live.hostPid || pid == GetCurrentProcessId();
++#else
++        return true;
++#endif
++    }
++
+     bool remotePad(uint32_t &buttons, uint32_t &axes)
+     {
+ #if defined(PS2X_GS_LIVE_RING)
+@@ -549,7 +848,8 @@ namespace ps2_gslive
+         std::lock_guard<std::mutex> lock(w.mutex);
+         if (!w.usable())
+             return;
+-        writeTransferLocked(w, path, data, sizeBytes & ~15u);
++        static std::vector<uint8_t> s_netviewScratch;   // under w.mutex
++        writeTransferLocked(w, path, netViewFilter(data, sizeBytes & ~15u, s_netviewScratch), sizeBytes & ~15u);
+     }
+ 
+     void writeRegister(uint8_t reg, uint64_t value)
+@@ -590,6 +890,13 @@ namespace ps2_gslive
          const uint32_t qwc = bytes / 16u;
          if (qwc == 0u || !active())
              return false;
@@ -292,7 +406,7 @@ index 086b77e..aa986bd 100644
          Writer &w = writer();
  #if defined(PS2X_GS_LIVE_RING) && !defined(PS2X_GS_LIVE_WEB) // the browser page does not answer (yet)
          uint32_t seq0 = 0;
-@@ -598,28 +807,28 @@ namespace ps2_gslive
+@@ -598,28 +905,28 @@ namespace ps2_gslive
              if (!w.usable())
                  return false;
              if (w.liveActive)
@@ -327,7 +441,7 @@ index 086b77e..aa986bd 100644
          if (const char *dd = std::getenv("PS2X_READBACK_DUMP"); dd && dd[0])
          {   // [readback] raw copies for inspection: <dir>/rb_<n>.bin
              static uint32_t s_n = 0;
-@@ -691,17 +900,33 @@ namespace ps2_gslive
+@@ -691,17 +998,33 @@ namespace ps2_gslive
                      if (w.live.hostGone())
                          break;
                      w.live.header->producerWaiting = 1u;
@@ -419,10 +533,10 @@ index 0045f01..fac0c83 100644
      // the same mapping, after the data area (macOS: os_sync_wait_on_address, Linux: futex).
      // macOS limits shm names to 31 characters, so the base name is short.
 diff --git a/ps2xRuntime/src/lib/game_overrides.cpp b/ps2xRuntime/src/lib/game_overrides.cpp
-index 3c3d250..16fb07f 100644
+index 3c3d250..f561c15 100644
 --- a/ps2xRuntime/src/lib/game_overrides.cpp
 +++ b/ps2xRuntime/src/lib/game_overrides.cpp
-@@ -664,6 +664,12 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
+@@ -664,6 +664,26 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
      extern "C" int ps2xNetJumpSettledFor(uint32_t session)
      { return g_netJumpSession.load(std::memory_order_relaxed) == session && g_netJumpState.load(std::memory_order_relaxed) == 2; }
  
@@ -432,10 +546,24 @@ index 3c3d250..16fb07f 100644
 +    // (g_bt3StateLive, e.g. 0x4 = main menu); from then on PS2X_AUTOSTART stops pressing.
 +    std::atomic<bool> g_padScriptTookOver{false};
 +
++    // [autofight] Is a fight running right now? The state number alone does not say: 0x8 in the normal flow, but
++    // after the netplay jump the fight keeps character select's 0x27 (which it shares with the fight-load), and
++    // the 3D work does not separate them either (character select draws its models: ~2M VU1 pairs per 100 ms, as
++    // much as a fight). What does: the game configures the two players' views (FUN_0023e770 with mode 1 or 2,
++    // bt3NetViewSelect) only when a 2-player fight is set up. Only the test drivers (auto-start, pad scripts) ask.
++    std::atomic<bool> g_bt3SplitViews{false};
++    static bool bt3FightNow()
++    {
++        const uint32_t st = g_bt3StateLive.load(std::memory_order_relaxed);
++        if (st == 0x8u)
++            return true;
++        return (st == 0x27u || st == 0x2du) && g_bt3SplitViews.load(std::memory_order_relaxed);
++    }
++
      void writeNeutralPadPacket(uint8_t *rdram, uint32_t bufAddr, uint32_t socket)
      {
          // TEST (env PS2X_SOUNDREADY): force the sound-ready flags that FUN_0026d9a0
-@@ -698,7 +704,13 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
+@@ -698,21 +718,40 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
          uint8_t b1 = static_cast<uint8_t>((buttons >> 8) & 0xffu);
          // TEST (env PS2X_AUTOSTART): also tap START+CROSS periodically to auto-advance.
          static const bool s_autostart = [](){ const char *v = std::getenv("PS2X_AUTOSTART"); return v && v[0] && v[0] != '0'; }();
@@ -445,13 +573,35 @@ index 3c3d250..16fb07f 100644
 +        // [padscript] once a state-based script has taken over, auto-start only keeps fighting (state 0x8); menus are the script's.
 +        // PS2X_AUTOSTART_FIGHT=0: not even that (the script also drives the fight, e.g. its pause menu).
 +        static const bool s_autoFight = [](){ const char *v = std::getenv("PS2X_AUTOSTART_FIGHT"); return !(v && v[0] == '0'); }();
-+        if (s_autostart && (!g_padScriptTookOver.load(std::memory_order_relaxed) ||
-+                            (s_autoFight && g_bt3StateLive.load(std::memory_order_relaxed) == 0x8u)))
++        // PS2X_AUTOSTART_MENUS_ONLY=1: drive the menus but stand still in the fight (online tests: one side idle, so a
++        // remote input that never arrives cannot hide behind both sides pressing the same pattern).
++        static const bool s_menusOnly = [](){ const char *v = std::getenv("PS2X_AUTOSTART_MENUS_ONLY"); return v && v[0] == '1'; }();
++        const bool fightNow = bt3FightNow();
++        if (s_autostart && !(s_menusOnly && fightNow) &&
++            (!g_padScriptTookOver.load(std::memory_order_relaxed) || (s_autoFight && fightNow)))
          {
              // In a fight START would only pause it: tap attacks and directions in bursts instead, so the fight stays live and busy (effects, blur,
              // glow) for unattended captures and the packet oracle.
-@@ -713,6 +725,8 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
-                     b0 = static_cast<uint8_t>(b0 & ~0x08u); // START
+-            // The fight is on when the game's state object reads 0x8 (g_bt3StateLive, ps2_runtime.cpp status line); every
+-            // other state (menus 0x7, fight-load 0x27, ...) still gets the START+CROSS taps that drive the flow.
++            // The fight is on per bt3FightNow(); every other state (menus, fight-load, ...) still gets the START+CROSS
++            // taps that drive the flow.
+             static std::atomic<uint32_t> s_n{0};
+             const uint32_t n = s_n.fetch_add(1);
+-            if (g_bt3StateLive.load(std::memory_order_relaxed) != 0x8u)
++            // Once a fight has begun, START is never pressed again: the fight's own short states (specials, intros)
++            // do not read as fighting either, and a START there paused the fight over and over. CROSS alone still
++            // clears a pause menu ("Continuar batalla") or the end-of-fight screens.
++            static std::atomic<bool> s_fought{false};
++            if (fightNow)
++                s_fought.store(true, std::memory_order_relaxed);
++            if (!fightNow)
+             {
+                 if ((n % 180u) < 12u)
+                 {
+-                    b0 = static_cast<uint8_t>(b0 & ~0x08u); // START
++                    if (!s_fought.load(std::memory_order_relaxed))
++                        b0 = static_cast<uint8_t>(b0 & ~0x08u); // START
                      b1 = static_cast<uint8_t>(b1 & ~0x40u); // CROSS
                  }
 +                if (s_autoLeft && (n % 180u) >= 90u && (n % 180u) < 100u)
@@ -459,7 +609,7 @@ index 3c3d250..16fb07f 100644
              }
              else
              {
-@@ -724,7 +738,82 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
+@@ -724,7 +763,86 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
                  if (phase == 6u) { b1 = static_cast<uint8_t>(b1 & ~0x40u); b1 = static_cast<uint8_t>(b1 & ~0x80u); }   // CROSS+SQUARE (ki blast / rush)
              }
          }
@@ -518,18 +668,22 @@ index 3c3d250..16fb07f 100644
 +            const std::vector<Press> &script = (socket & 3u) == 0u ? s_script : s_script2;
 +            if (!s_script.empty() || !s_script2.empty())
 +            {
-+                static const long s_baseState = [](){ const char *v = std::getenv("PS2X_PAD_SCRIPT_STATE"); return (v && v[0]) ? std::strtol(v, nullptr, 0) : -1L; }();
++                // PS2X_PAD_SCRIPT_STATE=fight: the clock starts with the fight itself (bt3FightNow), whatever its state number
++                static const long s_baseState = [](){
++                    const char *v = std::getenv("PS2X_PAD_SCRIPT_STATE");
++                    if (v && std::strcmp(v, "fight") == 0) return -2L;
++                    return (v && v[0]) ? std::strtol(v, nullptr, 0) : -1L; }();
 +                static std::chrono::steady_clock::time_point s_stateT0{};
-+                if (s_baseState >= 0 && !g_padScriptTookOver.load(std::memory_order_relaxed) &&
-+                    g_bt3StateLive.load(std::memory_order_relaxed) == static_cast<uint32_t>(s_baseState))
++                if (s_baseState != -1 && !g_padScriptTookOver.load(std::memory_order_relaxed) &&
++                    (s_baseState == -2 ? fightNow : g_bt3StateLive.load(std::memory_order_relaxed) == static_cast<uint32_t>(s_baseState)))
 +                {
 +                    s_stateT0 = std::chrono::steady_clock::now();
 +                    g_padScriptTookOver.store(true, std::memory_order_relaxed);
 +                    std::fprintf(stderr, "[padscript] state 0x%lx reached at %.2f s: script clock starts\n", s_baseState,
 +                                 std::chrono::duration<double>(s_stateT0 - g_padScriptProcessStart).count());
 +                }
-+                const bool scriptLive = s_baseState < 0 || g_padScriptTookOver.load(std::memory_order_relaxed);
-+                const auto s_t0 = s_baseState >= 0 ? s_stateT0 : g_padScriptProcessStart;
++                const bool scriptLive = s_baseState == -1 || g_padScriptTookOver.load(std::memory_order_relaxed);
++                const auto s_t0 = s_baseState != -1 ? s_stateT0 : g_padScriptProcessStart;
 +                static const double s_hold = [](){ const char *h = std::getenv("PS2X_PAD_SCRIPT_HOLD"); return (h && h[0]) ? std::strtod(h, nullptr) / 1000.0 : 0.15; }();
 +                const double now = scriptLive ? std::chrono::duration<double>(std::chrono::steady_clock::now() - s_t0).count() : -1.0;
 +                for (const Press &p : script)
@@ -543,6 +697,15 @@ index 3c3d250..16fb07f 100644
          // live for the first <n> pad reads) or the g_ps2ForceSkipFrames countdown the FMV override
          // pokes to end the native movie. PS2X_FORCE_SKIP_BTNS=<hex> overrides the cleared bits.
          bool forceSkip = false;
+@@ -4499,6 +4617,8 @@ namespace
+         static const int s_env = [](){ const char *v = ::getenv("PS2X_NETVIEW");
+                                        return (v && v[0]) ? std::atoi(v) : 0; }();
+         const int s_player = s_env ? s_env : (ps2NetActive() ? ps2NetLocalPlayer() : 0);
++        if ((getRegU32(ctx, 5) == 1u || getRegU32(ctx, 5) == 2u) && !g_bt3SplitViews.exchange(true, std::memory_order_relaxed))
++            std::fprintf(stderr, "[autofight] the game set up the two players' views: fight on\n");
+         if (s_player == 1 || s_player == 2)
+         {
+             const uint32_t mode = getRegU32(ctx, 5);
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
 index ded5faa..4119bfe 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
@@ -696,3 +859,157 @@ index c086d76..3a39975 100644
          else if (kind == 'h') { g_hs[(pc - kBase) >> 2] = 4; ++nf; }   // rate assignment: value * 0.5 on every store
          else if (kind == 'j') { g_hs[(pc - kBase) >> 2] = 5; ++ni; }
          else if (kind == 'D') { g_hs[(pc - kBase) >> 2] = 6; ++ni; }   // duration assignment: value * 2 (pairs with a 'd' countdown)   // integer step: store old + (new - old) / 2 (ki drain/charge)
+diff --git a/ps2xRuntime/src/lib/ps2_netplay.cpp b/ps2xRuntime/src/lib/ps2_netplay.cpp
+index 33b15d8..5efa2d6 100644
+--- a/ps2xRuntime/src/lib/ps2_netplay.cpp
++++ b/ps2xRuntime/src/lib/ps2_netplay.cpp
+@@ -140,6 +140,12 @@ struct Net
+     SOCKET      syncListen = INVALID_SOCKET;
+     bool        envDefaults = false;   // PS2X_NET_ROLLBACK / PS2X_NET_SYNC read once; the overlay may override
+     uint32_t    desyncFrame = 0;       // [desyncdump] first frame whose confirmed hash differed (0 = none yet)
++    // [relay] PS2X_NET_RELAY=host:port + PS2X_NET_TOKEN=<32 hex>: both players "join" the online server's
++    // relay instead of each other (no open ports at home). The relay pairs the two registrations of a
++    // match token and forwards everything else untouched, so the protocol on top is unchanged.
++    bool        relay = false;
++    char        relayToken[33] = {};
++    std::chrono::steady_clock::time_point lastRelayReg{};
+     uint32_t    checkEvery = 60;       // PS2X_NET_CHECKEVERY: confirmed-state checksum interval in frames
+ };
+ 
+@@ -198,6 +204,19 @@ bool parseHostPort(const char *v, sockaddr_in &out)
+ void sendOurs(uint32_t frame)
+ {
+     if (!g.peerKnown) return;
++    if (g.relay)
++    {   // [relay] [reconnect] keep the registration fresh during the match (37 bytes a second): if this player's router
++        // changes the port, or the network blips, the relay moves the slot to the new address after 1.5 s of silence
++        // from the old one, and the match goes on instead of timing out.
++        const auto now = std::chrono::steady_clock::now();
++        if (now - g.lastRelayReg > std::chrono::seconds(1))
++        {
++            g.lastRelayReg = now;
++            char reg[37];
++            std::memcpy(reg, "RLY1", 4); std::memcpy(reg + 4, g.relayToken, 32); reg[36] = static_cast<char>('0' + g.localPlayer);
++            ::sendto(g.sock, reg, sizeof reg, 0, reinterpret_cast<sockaddr *>(&g.peer), sizeof g.peer);
++        }
++    }
+     NetPkt p{};
+     p.magic = kMagic; p.version = kVersion;
+     p.player = static_cast<uint8_t>(g.localPlayer);
+@@ -681,9 +700,19 @@ void ps2NetInit()
+     done = true;
+     const char *conn = std::getenv("PS2X_NET");
+     const char *lis  = std::getenv("PS2X_NET_LISTEN");
+-    if ((!conn || !conn[0]) && (!lis || !lis[0])) return;
++    const char *rel  = std::getenv("PS2X_NET_RELAY");
++    const char *tok  = std::getenv("PS2X_NET_TOKEN");
+     int player = 1;
+     if (const char *p = std::getenv("PS2X_NET_PLAYER")) player = (std::atoi(p) == 2) ? 2 : 1;
++    if (rel && rel[0] && tok && std::strlen(tok) == 32)
++    {   // [relay] both sides join the relay; the player number (1 = host of the match) comes from the server
++        g.relay = true;
++        std::memcpy(g.relayToken, tok, 32); g.relayToken[32] = 0;
++        std::fprintf(stderr, "[netplay] relay %s, match token %.6s..., player %d\n", rel, tok, player);
++        ps2NetJoin(rel, player);
++        return;
++    }
++    if ((!conn || !conn[0]) && (!lis || !lis[0])) return;
+     if (lis && lis[0]) ps2NetHost(std::atoi(lis), player);
+     else               ps2NetJoin(conn, player);
+ }
+@@ -700,6 +729,18 @@ static void sendHello()
+     // -- the listener learns the peer address from this. Gating sends on g.connected (which is
+     // only set BY a receive) deadlocked both sides at tx 0, waiting for each other forever.
+     if (!g.peerKnown) return;
++    if (g.relay)
++    {   // [relay] (re)register with the relay four times a second until the other player answers; the relay
++        // drops everything from an address it has not seen register (the answer "RLYA.." is ignored by pump()).
++        const auto now = std::chrono::steady_clock::now();
++        if (now - g.lastRelayReg > std::chrono::milliseconds(250))
++        {
++            g.lastRelayReg = now;
++            char reg[37];
++            std::memcpy(reg, "RLY1", 4); std::memcpy(reg + 4, g.relayToken, 32); reg[36] = static_cast<char>('0' + g.localPlayer);
++            ::sendto(g.sock, reg, sizeof reg, 0, reinterpret_cast<sockaddr *>(&g.peer), sizeof g.peer);
++        }
++    }
+     NetPkt p{};
+     p.magic = kMagic; p.version = kVersion;
+     p.player = static_cast<uint8_t>(g.localPlayer);
+@@ -765,6 +806,22 @@ uint32_t ps2NetRollbackPoll(uint32_t frameAbs, bool *mustStall)
+ void ps2NetSubmitLocal(uint32_t frameAbs, const Ps2xNetInput &in)
+ {
+     if (!g.active) return;
++    if (g.relay && !g.connected)
++    {   // [relay] [netwait] Both games stop at their FIRST pad read until the other one is there, so the lockstep starts
++        // at the same point of the boot on both machines. Connecting whenever each side happened to be ready (frame 67
++        // on one, 2 on the other) applied the same inputs to different moments of the boot, and the two machines ended
++        // up in different fights with perfectly matching inputs. PS2X_NET_WAIT_MS bounds the wait (default 120 s).
++        static const long s_waitMs = [](){ const char *v = std::getenv("PS2X_NET_WAIT_MS"); return v && v[0] ? std::atol(v) : 120000L; }();
++        const auto t0 = std::chrono::steady_clock::now();
++        std::fprintf(stderr, "[netplay] waiting for the other player at frame %u\n", frameAbs);
++        while (!g.connected && g.active &&
++               std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count() < s_waitMs)
++        {
++            sendHello(); pump();
++            std::this_thread::sleep_for(std::chrono::milliseconds(5));
++        }
++        if (!g.connected) { std::fprintf(stderr, "[netplay] the other player never came: playing offline\n"); ps2NetDisconnect("no peer"); return; }
++    }
+     if (!g.connected || !g.synced) { sendHello(); pump(); return; }   // handshake / state sync only, no frame numbering yet
+     const uint32_t frame = relFrame(frameAbs);
+     Ps2xNetInput use = in;
+diff --git a/ps2xRuntime/src/lib/pad_config.cpp b/ps2xRuntime/src/lib/pad_config.cpp
+index 65db527..bca1fc8 100644
+--- a/ps2xRuntime/src/lib/pad_config.cpp
++++ b/ps2xRuntime/src/lib/pad_config.cpp
+@@ -644,10 +644,27 @@ namespace ps2_stubs
+         axis(pkt.ry, (axes >> 24) & 0xFFu);
+     }
+ 
++    // [padfocus] The runtime reads the controllers in the background (SDL's ALLOW_BACKGROUND_EVENTS: raylib's window
++    // never has the focus), so on its own the fighter would keep moving while the player uses the launcher over the
++    // game. With the GS host drawing, the pad counts only while its window (or ours) is in front.
++    // Back + Start opens that launcher: with SELECT held, START is dropped, so the combo never pauses the game.
++    static void gateLocalPad(PadPacket &pkt)
++    {
++        if (ps2_gslive::liveActive() && !ps2_gslive::hostFocused())
++        {
++            pkt = PadPacket{};
++            return;
++        }
++        constexpr uint16_t kSelect = 0x0001u, kStart = 0x0008u;   // active low
++        if ((pkt.buttons & kSelect) == 0u)
++            pkt.buttons = static_cast<uint16_t>(pkt.buttons | kStart);
++    }
++
+     PadPacket padPollPlayer(size_t player)
+     {
+         PadPacket pkt = PadConfig::instance().poll(player);
+         mergeLivePad(pkt, player);
++        gateLocalPad(pkt);
+         return pkt;
+     }
+ 
+@@ -671,6 +688,7 @@ namespace ps2_stubs
+     {
+         PadPacket pkt = PadConfig::instance().poll(static_cast<size_t>(player));
+         mergeLivePad(pkt, static_cast<size_t>(player));
++        gateLocalPad(pkt);
+         lx = pkt.lx;
+         ly = pkt.ly;
+         rx = pkt.rx;
+diff --git a/ps2xRuntime/include/runtime/ps2_gs_live.h b/ps2xRuntime/include/runtime/ps2_gs_live.h
+index 0fb445c..67a9423 100644
+--- a/ps2xRuntime/include/runtime/ps2_gs_live.h
++++ b/ps2xRuntime/include/runtime/ps2_gs_live.h
+@@ -27,6 +27,9 @@ namespace ps2_gslive
+     // Host window state, read by the pad code: active-high libpad buttons, lx|ly<<8|rx<<16|ry<<24.
+     bool remotePad(uint32_t &buttons, uint32_t &axes);
+     bool hostMenuOpen();
++    // The GS host's window (or the runtime's own) is the one in front: the controller counts only then, so a
++    // launcher over the game or another window can be used with the pad without moving the fighter.
++    bool hostFocused();
+     // path: 1, 2 or 3. Stream order is the caller's (GifArbiter::process on the GS thread).
+     void transfer(int path, const uint8_t *data, uint32_t sizeBytes);
+     // A register the runtime's HLE stubs write straight into its GS parse: sent as an A+D packet.

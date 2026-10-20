@@ -419,7 +419,7 @@ index 0045f01..fac0c83 100644
      // the same mapping, after the data area (macOS: os_sync_wait_on_address, Linux: futex).
      // macOS limits shm names to 31 characters, so the base name is short.
 diff --git a/ps2xRuntime/src/lib/game_overrides.cpp b/ps2xRuntime/src/lib/game_overrides.cpp
-index 3c3d250..c6f5560 100644
+index 3c3d250..1925cab 100644
 --- a/ps2xRuntime/src/lib/game_overrides.cpp
 +++ b/ps2xRuntime/src/lib/game_overrides.cpp
 @@ -664,6 +664,12 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
@@ -435,7 +435,7 @@ index 3c3d250..c6f5560 100644
      void writeNeutralPadPacket(uint8_t *rdram, uint32_t bufAddr, uint32_t socket)
      {
          // TEST (env PS2X_SOUNDREADY): force the sound-ready flags that FUN_0026d9a0
-@@ -698,7 +704,10 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
+@@ -698,7 +704,13 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
          uint8_t b1 = static_cast<uint8_t>((buttons >> 8) & 0xffu);
          // TEST (env PS2X_AUTOSTART): also tap START+CROSS periodically to auto-advance.
          static const bool s_autostart = [](){ const char *v = std::getenv("PS2X_AUTOSTART"); return v && v[0] && v[0] != '0'; }();
@@ -443,11 +443,14 @@ index 3c3d250..c6f5560 100644
 +        // PS2X_AUTOSTART_LEFT=1: also tap LEFT between the START+CROSS taps (answers "Si" to the memory-card prompts).
 +        static const bool s_autoLeft = [](){ const char *v = std::getenv("PS2X_AUTOSTART_LEFT"); return v && v[0] == '1'; }();
 +        // [padscript] once a state-based script has taken over, auto-start only keeps fighting (state 0x8); menus are the script's.
-+        if (s_autostart && (!g_padScriptTookOver.load(std::memory_order_relaxed) || g_bt3StateLive.load(std::memory_order_relaxed) == 0x8u))
++        // PS2X_AUTOSTART_FIGHT=0: not even that (the script also drives the fight, e.g. its pause menu).
++        static const bool s_autoFight = [](){ const char *v = std::getenv("PS2X_AUTOSTART_FIGHT"); return !(v && v[0] == '0'); }();
++        if (s_autostart && (!g_padScriptTookOver.load(std::memory_order_relaxed) ||
++                            (s_autoFight && g_bt3StateLive.load(std::memory_order_relaxed) == 0x8u)))
          {
              // In a fight START would only pause it: tap attacks and directions in bursts instead, so the fight stays live and busy (effects, blur,
              // glow) for unattended captures and the packet oracle.
-@@ -713,6 +722,8 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
+@@ -713,6 +725,8 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
                      b0 = static_cast<uint8_t>(b0 & ~0x08u); // START
                      b1 = static_cast<uint8_t>(b1 & ~0x40u); // CROSS
                  }
@@ -456,7 +459,7 @@ index 3c3d250..c6f5560 100644
              }
              else
              {
-@@ -724,6 +735,79 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
+@@ -724,6 +738,79 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
                  if (phase == 6u) { b1 = static_cast<uint8_t>(b1 & ~0x40u); b1 = static_cast<uint8_t>(b1 & ~0x80u); }   // CROSS+SQUARE (ki blast / rush)
              }
          }
@@ -582,3 +585,18 @@ index 403aee4..4300093 100644
                      if (s_bytes - s_lastHdr > uint32_t(s_devRate) * 2u) { s_lastHdr = s_bytes; hdr(); std::fflush(s_wav); }
                  }
              }
+diff --git a/games/bt3/fps60_sites.txt b/games/bt3/fps60_sites.txt
+index f718331..285b095 100644
+--- a/games/bt3/fps60_sites.txt
++++ b/games/bt3/fps60_sites.txt
+@@ -144,7 +144,9 @@
+ 0x1eebb8 u
+ 0x1f6784 u
+ 0x20425c u
+-0x2167a8 u
++# 0x2167a8 u -- removed for the BT4 mod: in its pause menu this store is the command list's loop index (0..4 twice a
++#   frame on 0x1917160), not a per-frame counter; paced, the tabs flickered and could not be selected at 60 fps.
++#   It never runs during a fight.
+ 0x216f38 u
+ 0x22404c u
+ 0x22d0fc u

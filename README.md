@@ -24,7 +24,7 @@ with `windows/record_video.ps1` + `windows/mux_video.ps1`.
 
 ## Download and play (Windows, nothing to compile)
 
-**[⬇ DBZ_BT4_Windows.zip](https://github.com/recomp-code/dbz-bt4-recomp/releases/latest/download/DBZ_BT4_Windows.zip)** (92 MB, from the [latest release](https://github.com/recomp-code/dbz-bt4-recomp/releases/latest))
+**[⬇ DBZ_BT4_Windows.zip](https://github.com/recomp-code/dbz-bt4-recomp/releases/latest/download/DBZ_BT4_Windows.zip)** (96 MB, from the [latest release](https://github.com/recomp-code/dbz-bt4-recomp/releases/latest))
 
 1. Unzip it in a folder you can write to (Desktop, Documents, Downloads; not Program Files).
 2. Open `DBZ_BT4.exe`, press **Seleccionar ISO...** and pick your own image of the mod: `SLUS-219.78`, Beta 14 Rev2.

@@ -28,15 +28,22 @@ Get-ChildItem $gs -File | Where-Object { $_.Extension -in '.exe', '.dll' -and $_
     Copy-Item -Destination "$dist\gshost"
 Copy-Item -Recurse "$gs\resources" "$dist\gshost\resources"
 New-Item -ItemType File "$dist\gshost\portable.ini" | Out-Null
-Copy-Item "$gs\dbz.ini", "$gs\dbz_dlss.ini" "$dist\gshost"
+# presets from the repository (gshost\*.ini on this PC are rewritten by the in-game menu)
+$pr = "$R\dbz-bt4-recomp\windows\gshost"
+Copy-Item "$pr\dbz.ini", "$pr\dbz_dlss.ini" "$dist\gshost"
 # 3x preset for mid-range GPUs (texture offset of the 3x row of UserHacks_TCOffsetByScale)
-(Get-Content "$gs\dbz.ini") -replace '^upscale_multiplier = 6', 'upscale_multiplier = 3' `
+(Get-Content "$pr\dbz.ini") -replace '^upscale_multiplier = 6', 'upscale_multiplier = 3' `
     -replace '^UserHacks_TCOffset([XY]) = 500', 'UserHacks_TCOffset$1 = 425' `
     -replace '^; Windows / Vulkan\. 6x = 3840x2688 interno \(supermuestreo en 1440p\)\.', '; Windows / Vulkan. Preset 3x = 1536x1344 interno (equilibrado).' |
     Set-Content "$dist\gshost\dbz_3x.ini" -Encoding ascii
 # keep the pristine presets so the launcher can reset them (the host rewrites the ini when F1 options change)
 New-Item -ItemType Directory "$dist\gshost\presets" | Out-Null
 Copy-Item "$dist\gshost\dbz*.ini" "$dist\gshost\presets"
+# DLSS 5 preset (Direct3D 12 + DLSS, the neural pass on top) and its ReShade.ini; the launcher builds gshost_dlss5\ from
+# gshost\ plus DLSS 5 Swapper's ReShade / RenoDX DLSS 5 / nvngx_dlssnr.dll, none of which ship here.
+(Get-Content "$pr\dbz_dlss.ini") -replace '^Renderer = 14', 'Renderer = 15' | Set-Content "$dist\gshost\presets\dbz_dlss_dx12.ini" -Encoding ascii
+Get-Content "$R\gshost_hooktest\ReShade.ini" | Where-Object { $_ -notmatch '^IntermediateCachePath=' } |
+    Set-Content "$dist\gshost\presets\ReShade.ini" -Encoding ascii
 
 # launcher
 & "$PSScriptRoot\build_launcher.ps1" -Out "$dist\DBZ_BT4.exe"

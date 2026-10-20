@@ -30,7 +30,9 @@ with `windows/record_video.ps1` + `windows/mux_video.ps1`.
 2. Open `DBZ_BT4.exe`, press **Seleccionar ISO...** and pick your own image of the mod: `SLUS-219.78`, Beta 14 Rev2.
    Only the first time. Another version of the mod does not work: the game was recompiled for that one (the launcher
    checks the ELF's SHA-256).
-3. Pick the quality (6x native, 3x, or 2x + DLSS / FSR), 60 fps fights on or off, and press **JUGAR**.
+3. Press **JUGAR**. Everything starts on: 60 fps fights, fullscreen and the best quality for your GPU (NVIDIA RTX:
+   DLSS, or "DLSS 5" when [DLSS 5 Swapper](#dlss-5-dlss-neural-rendering-experimental) is installed; other GPUs: 3x native).
+   The launcher lets you change each one (6x / 3x native, 2x + DLSS / FSR, DLSS 5) and remembers it.
 
 Needs Windows 10/11 64-bit and a GPU with Vulkan (DLSS on NVIDIA RTX, FSR on the rest). Xbox-style controllers and the
 keyboard work out of the box. **Hold START for 1.5 s** (or Back+Start, or F1) for the options menu: internal resolution,
@@ -97,7 +99,7 @@ python games\bt3\setup.py games\bt3\work\SLUS_219.78 --stages 3-3 --jobs 20 --no
 Play with `windows\Jugar_DBZ.cmd` (30 fps), `Jugar_DBZ.cmd 60` / `Jugar_DBZ_60fps.cmd` (60 fps fights) or
 `Jugar_DBZ_DLSS.cmd` (2x + DLSS); `set DBZ_WINDOW=1` for a window. F1 in the game window opens the GS options
 (internal resolution, DLSS / FSR 1, sharpness, 60 fps fights; also Back+Start or holding START 1.5 s on a controller).
-The 60 fps switch goes through the live ring: the host writes `fps60Request` and the game, at its next VSync, calls
+The menu saves it as `DbzFps60` in its ini and the launcher takes it as the next start's default. The 60 fps switch goes through the live ring: the host writes `fps60Request` and the game, at its next VSync, calls
 BT3-Recomp's `ps2Set60Fps` and publishes its mode in `gameFps60` (two words in the padding of the header's third cache
 line, so the layout and older builds are unaffected; `windows/fps60_ring_test.ps1` drives it without the menu).
 paraLLEl-GS is off on Windows (`PS2X_DISABLE_PGS=ON` by default), so the
@@ -134,7 +136,10 @@ bias-current-colour mask where no good match exists, in Vulkan and D3D12; `PS2X_
 
 On an NVIDIA RTX card the DLSS output can go through NVIDIA's neural rendering pass with ReShade and the RenoDX
 "DLSS 5" add-on (third-party, not included here), exactly as in the NBA Street V3 port: Direct3D 12, 2x internal + DLSS,
-then the neural pass. `windows\Jugar_DBZ_DLSS5.cmd` (`... 60` for 60 fps fights) runs the game with a test copy of the
+then the neural pass. In the zip it is the launcher's "DLSS 5" quality: when DLSS 5 Swapper is installed, the
+launcher builds `gshost_dlss5\` itself from `gshost\` plus Swapper's ReShade (`ReShade64.dll` as `dxgi.dll`), the RenoDX
+add-on and `nvngx_dlssnr.dll` (none of them ship in the zip), with `presets\ReShade.ini` and `presets\dbz_dlss_dx12.ini`.
+From the development tree, `windows\Jugar_DBZ_DLSS5.cmd` (`... 60` for 60 fps fights) runs the game with a test copy of the
 host, `gshost_hooktest\` = `gshost\` + ReShade's `dxgi.dll`, `renodx-dlss5.addon64`, its `ReShade.ini`,
 `nvngx_dlssnr.dll` (e.g. from DLSS 5 Swapper) and `dbz_dlss_dx12.ini` (`dbz_dlss.ini` with `Renderer = 15`). In game: F6
 toggles the pass, Home opens ReShade. DLSS, and so the pass, only runs while the window is larger than the 2x image

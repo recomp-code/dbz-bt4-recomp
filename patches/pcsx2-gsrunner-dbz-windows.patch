@@ -139,7 +139,7 @@ index 0045f01..fac0c83 100644
      // the same mapping, after the data area (macOS: os_sync_wait_on_address, Linux: futex).
      // macOS limits shm names to 31 characters, so the base name is short.
 diff --git a/pcsx2-gsrunner/Main.cpp b/pcsx2-gsrunner/Main.cpp
-index 3b93a4a..1bb200c 100644
+index 3b93a4a..737249e 100644
 --- a/pcsx2-gsrunner/Main.cpp
 +++ b/pcsx2-gsrunner/Main.cpp
 @@ -1397,6 +1397,7 @@ namespace
@@ -168,7 +168,27 @@ index 3b93a4a..1bb200c 100644
  		{"Mostrar FPS", {"No", "Si"}, s_settings_interface.GetBoolValue("EmuCore/GS", "OsdShowFPS", false) ? 1 : 0},
  		{"Texturas HD (packs PCSX2)", {"Desactivadas", "Activadas", "Activadas + volcar originales"},
  			!s_settings_interface.GetBoolValue("EmuCore/GS", "LoadTextureReplacements", false) ? 0 :
-@@ -1604,6 +1609,15 @@ static void LiveMenuApply(int item)
+@@ -1505,7 +1510,7 @@ static void LiveMenuSave()
+ 	// are kept, so changing an option never drops them. The first comment line is kept as the file's title.
+ 	static constexpr const char* kManaged[] = {"Renderer", "upscale_multiplier", "MaxAnisotropy", "filter", "fxaa", "CASMode",
+ 		"CASSharpness", "NbaUpscaler", "NbaUpscalerSharpness", "ScreenshotSize", "AspectRatio", "OsdShowFPS",
+-		"LoadTextureReplacements", "LoadTextureReplacementsAsync", "DumpReplaceableTextures"};
++		"LoadTextureReplacements", "LoadTextureReplacementsAsync", "DumpReplaceableTextures", "DbzFps60"};
+ 	std::vector<std::string> kept;
+ 	std::string title = "; Opciones graficas de " + LiveWindowTitle() + " (menu F1 / Back+Start / mantener START). Se reescribe al cambiar.";
+ 	if (std::FILE* in = std::fopen(s_live_ini_path.c_str(), "r"))
+@@ -1557,6 +1562,10 @@ static void LiveMenuSave()
+ 		std::fprintf(fp, "LoadTextureReplacements = %s\n", s_settings_interface.GetBoolValue("EmuCore/GS", "LoadTextureReplacements", false) ? "true" : "false");
+ 		std::fprintf(fp, "LoadTextureReplacementsAsync = true\n");
+ 		std::fprintf(fp, "DumpReplaceableTextures = %s\n", s_settings_interface.GetBoolValue("EmuCore/GS", "DumpReplaceableTextures", false) ? "true" : "false");
++		// 60 fps fights (games with the switch): the menu's last choice, else the game's mode. The DBZ launcher reads it
++		// back when the game exits, so a change made in the menu is the next start's default.
++		if (const u32 mode = GSDumpReplayer::GetLiveFps60(); mode != 0u)
++			std::fprintf(fp, "DbzFps60 = %s\n", (s_menu_fps60 >= 0 ? s_menu_fps60 == 1 : mode == 2u) ? "true" : "false");
+ 		for (const std::string& l : kept)
+ 			std::fprintf(fp, "%s\n", l.c_str());
+ 		std::fclose(fp);
+@@ -1604,6 +1613,16 @@ static void LiveMenuApply(int item)
  			if ((index == 1) != s_fullscreen)
  				LivePlatformToggleFullscreen();
  			return;
@@ -180,11 +200,12 @@ index 3b93a4a..1bb200c 100644
 +			}
 +			s_menu_fps60 = index;
 +			GSDumpReplayer::RequestLiveFps60(index == 1);
++			LiveMenuSave();
 +			return;
  		case MENU_FPS:
  			s_settings_interface.SetBoolValue("EmuCore/GS", "OsdShowFPS", index == 1);
  			break;
-@@ -1622,6 +1636,7 @@ static void LiveMenuDo(LiveMenuAction action)
+@@ -1622,6 +1641,7 @@ static void LiveMenuDo(LiveMenuAction action)
  	{
  		s_menu_open.store(action == LiveMenuAction::Toggle ? !open : false);
  		s_menu[MENU_FULLSCREEN].index = s_fullscreen ? 1 : 0;

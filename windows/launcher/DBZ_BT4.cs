@@ -107,7 +107,8 @@ namespace DbzBt4
         readonly ComboBox quality;
         readonly CheckBox fps60, fullscreen;
 
-        static readonly string[] QualityIni = { "dbz.ini", "dbz_3x.ini", "dbz_dlss.ini" };
+        static readonly string[] QualityIni = { "dbz.ini", "dbz_3x.ini", "dbz_dlss.ini", "dbz_dlss_dx12.ini" };
+        const int QualityDlss = 2, QualityDlss5 = 3;
 
         Launcher()
         {
@@ -159,7 +160,10 @@ namespace DbzBt4
             quality.DropDownStyle = ComboBoxStyle.DropDownList;
             quality.Items.Add("Maxima - 6x nativo (GPU potente: RTX 3070 / RX 6800 o mejor)");
             quality.Items.Add("Equilibrada - 3x nativo");
-            quality.Items.Add("DLSS / FSR - 2x reescalado a tu pantalla (GPU modesta)");
+            quality.Items.Add("DLSS / FSR - 2x reescalado a tu pantalla (NVIDIA RTX: DLSS; otras: FSR)");
+            quality.Items.Add(Dlss5Payload() != null
+                ? "DLSS 5 - DLSS + pase neural de NVIDIA (experimental, RTX)"
+                : "DLSS 5 - necesita DLSS 5 Swapper instalado (RTX)");
             quality.SetBounds(86, 25, 428, 24);
             opts.Controls.Add(quality);
 
@@ -176,7 +180,7 @@ namespace DbzBt4
             Label help = new Label();
             help.Text = "Mando XInput (Xbox): A=Cruz, B=Circulo, X=Cuadrado, Y=Triangulo.  Teclado: flechas, WASD = stick,\n" +
                         "Z/X/C/V = Cuadrado/Cruz/Circulo/Triangulo, Q/E = L1/R1, 1/3 = L2/R2, Enter = START.\n" +
-                        "F1 = opciones graficas (resolucion, DLSS/FSR, nitidez). Cerrar la ventana = salir.";
+                        "Mantener START 1,5 s (o F1) = menu: resolucion, DLSS/FSR, 60 fps, nitidez... Se guarda.";
             help.SetBounds(18, 266, 530, 56);
             Controls.Add(help);
 
@@ -204,10 +208,37 @@ namespace DbzBt4
             RefreshState();
         }
 
+        // DLSS 5 Swapper's files (ReShade, the RenoDX DLSS 5 add-on, nvngx_dlssnr.dll), or null when it is not installed.
+        static string Dlss5Payload()
+        {
+            string p = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                                    @"Programs\DLSS 5 Swapper\resources\payload");
+            return File.Exists(Path.Combine(p, @"reshade-vulkan\ReShade64.dll")) && File.Exists(Path.Combine(p, "renodx-dlss5.addon64")) &&
+                   File.Exists(Path.Combine(p, @"streamline\nvngx_dlssnr.dll")) ? p : null;
+        }
+
+        // First start: everything on. NVIDIA RTX -> DLSS 5 (with DLSS 5 Swapper) or DLSS; other GPUs -> 3x native.
+        int DefaultQuality()
+        {
+            string gpu = "";
+            try
+            {
+                using (System.Management.ManagementObjectSearcher q =
+                       new System.Management.ManagementObjectSearcher("SELECT Name FROM Win32_VideoController"))
+                    foreach (System.Management.ManagementObject o in q.Get())
+                        gpu += " " + o["Name"];
+            }
+            catch { }
+            if (gpu.IndexOf("RTX", StringComparison.OrdinalIgnoreCase) >= 0)
+                return Dlss5Payload() != null ? QualityDlss5 : QualityDlss;
+            return 1;
+        }
+
         void LoadConfig()
         {
-            quality.SelectedIndex = 0;
+            quality.SelectedIndex = DefaultQuality();
             fullscreen.Checked = true;
+            fps60.Checked = true;
             if (!File.Exists(cfgPath)) return;
             foreach (string line in File.ReadAllLines(cfgPath, Encoding.UTF8))
             {
@@ -314,36 +345,114 @@ namespace DbzBt4
             }
         }
 
+        static void CopyIfChanged(string src, string dst)
+        {
+            FileInfo a = new FileInfo(src), b = new FileInfo(dst);
+            if (!b.Exists || a.Length != b.Length || a.LastWriteTimeUtc > b.LastWriteTimeUtc)
+                File.Copy(src, dst, true);
+        }
+
+        static void CopyTree(string src, string dst)
+        {
+            Directory.CreateDirectory(dst);
+            foreach (string f in Directory.GetFiles(src))
+                CopyIfChanged(f, Path.Combine(dst, Path.GetFileName(f)));
+            foreach (string d in Directory.GetDirectories(src))
+                CopyTree(d, Path.Combine(dst, Path.GetFileName(d)));
+        }
+
+        // DLSS 5: a copy of gshost\ with ReShade (as dxgi.dll), the RenoDX DLSS 5 add-on and NVIDIA's nvngx_dlssnr.dll from
+        // DLSS 5 Swapper, so the normal host never loads ReShade. Kept up to date on every start (only changed files copy).
+        string PrepareDlss5Host()
+        {
+            string payload = Dlss5Payload();
+            if (payload == null) return null;
+            string dir = Path.Combine(root, "gshost_dlss5");
+            Directory.CreateDirectory(dir);
+            foreach (string f in Directory.GetFiles(gshostDir))
+            {
+                string ext = Path.GetExtension(f).ToLowerInvariant();
+                if (ext == ".exe" || ext == ".dll")
+                    CopyIfChanged(f, Path.Combine(dir, Path.GetFileName(f)));
+            }
+            CopyTree(Path.Combine(gshostDir, "resources"), Path.Combine(dir, "resources"));
+            if (!File.Exists(Path.Combine(dir, "portable.ini"))) File.WriteAllText(Path.Combine(dir, "portable.ini"), "");
+            CopyIfChanged(Path.Combine(payload, @"reshade-vulkan\ReShade64.dll"), Path.Combine(dir, "dxgi.dll"));
+            CopyIfChanged(Path.Combine(payload, "renodx-dlss5.addon64"), Path.Combine(dir, "renodx-dlss5.addon64"));
+            CopyIfChanged(Path.Combine(payload, @"streamline\nvngx_dlssnr.dll"), Path.Combine(dir, "nvngx_dlssnr.dll"));
+            string presets = Path.Combine(gshostDir, "presets");
+            foreach (string n in new string[] { "dbz_dlss_dx12.ini", "ReShade.ini" })
+                if (!File.Exists(Path.Combine(dir, n)) && File.Exists(Path.Combine(presets, n)))
+                    File.Copy(Path.Combine(presets, n), Path.Combine(dir, n));
+            return dir;
+        }
+
+        // The menu inside the game saves "DbzFps60 = true/false" in its ini: that becomes the next start's default.
+        void ReadBackFps60(string iniPath)
+        {
+            try
+            {
+                foreach (string line in File.ReadAllLines(iniPath))
+                {
+                    string l = line.Replace(" ", "");
+                    if (l.StartsWith("DbzFps60=", StringComparison.OrdinalIgnoreCase))
+                    {
+                        fps60.Checked = l.EndsWith("true", StringComparison.OrdinalIgnoreCase);
+                        SaveConfig();
+                    }
+                }
+            }
+            catch { }
+        }
+
         void Play()
         {
             if (!GameReady()) { RefreshState(); return; }
+            int q = quality.SelectedIndex;
+            string hostDir = gshostDir;
+            if (q == QualityDlss5)
+            {
+                try { hostDir = PrepareDlss5Host(); }
+                catch (Exception ex) { hostDir = null; MessageBox.Show(this, "No pude preparar DLSS 5: " + ex.Message, "DLSS 5"); }
+                if (hostDir == null)
+                {
+                    MessageBox.Show(this, "DLSS 5 necesita DLSS 5 Swapper instalado y una NVIDIA RTX. Juego con DLSS normal.", "DLSS 5",
+                                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    q = QualityDlss;
+                    hostDir = gshostDir;
+                }
+            }
             SaveConfig();
             string runner = Path.Combine(runtimeDir, "ps2EntryRunner.exe");
-            string ini = QualityIni[quality.SelectedIndex];
-            string iniPath = Path.Combine(gshostDir, ini);
+            string ini = QualityIni[q];
+            string iniPath = Path.Combine(hostDir, ini);
             string preset = Path.Combine(Path.Combine(gshostDir, "presets"), ini);
             if (!File.Exists(iniPath) && File.Exists(preset)) File.Copy(preset, iniPath);
             string logs = Path.Combine(root, "logs");
             Directory.CreateDirectory(logs);
+            // window mode: 16:9, up to 1920x1080 and 90% of the screen (DLSS only runs while the window is larger than
+            // the 2x image, 1024x896)
+            Rectangle wa = Screen.PrimaryScreen.WorkingArea;
+            int ww = Math.Min(1920, wa.Width * 9 / 10), wh = ww * 9 / 16;
+            if (wh > wa.Height * 9 / 10) { wh = wa.Height * 9 / 10; ww = wh * 16 / 9; }
 
             ProcessStartInfo si = new ProcessStartInfo(runner, "\"" + Path.Combine(dataDir, "SLUS_216.78") + "\"");
             si.UseShellExecute = false;
             si.WorkingDirectory = runtimeDir;
             si.EnvironmentVariables["PS2X_CD_IMAGE"] = isoPath;
             si.EnvironmentVariables["PS2X_GS_LIVE"] = "1";
-            // the runtime finds ..\gshost\pcsx2-gsrunner.exe by itself; the ini is relative to gshost\ (the host's directory)
-            si.EnvironmentVariables["PS2X_GSHOST_ARGS"] = "-renderer vulkan -ini " + ini + (fullscreen.Checked ? " -fullscreen" : "");
+            // without PS2X_GSHOST the runtime finds ..\gshost\pcsx2-gsrunner.exe; the ini is relative to the host's directory
+            if (hostDir != gshostDir)
+                si.EnvironmentVariables["PS2X_GSHOST"] = Path.Combine(hostDir, "pcsx2-gsrunner.exe");
+            si.EnvironmentVariables["PS2X_GSHOST_ARGS"] = (q == QualityDlss5 ? "-renderer dx12" : "-renderer vulkan") + " -ini " + ini +
+                                                          (fullscreen.Checked ? " -fullscreen" : "");
             si.EnvironmentVariables["PS2X_LIVE_SERIAL"] = "SLUS-21978";
             si.EnvironmentVariables["PS2X_LIVE_TITLE"] = "Dragon Ball Z Budokai Tenkaichi 4";
-            si.EnvironmentVariables["PS2X_HOST_WINDOW"] = "1280x720";
+            si.EnvironmentVariables["PS2X_HOST_WINDOW"] = ww + "x" + wh;
             si.EnvironmentVariables["PS2X_LOGFILE"] = Path.Combine(logs, "juego.log");
-            if (fps60.Checked)
-            {
-                si.EnvironmentVariables["PS2X_FPS60"] = "1";
-                si.EnvironmentVariables["PS2X_HALFSTEP"] = Path.Combine(runtimeDir, "fps60_sites.txt");
-            }
-            else
-                si.EnvironmentVariables["PS2X_FPS60"] = "0";
+            // the fps60 rules file goes along in both cases: the in-game menu can switch 60 fps on at any time
+            si.EnvironmentVariables["PS2X_HALFSTEP"] = Path.Combine(runtimeDir, "fps60_sites.txt");
+            si.EnvironmentVariables["PS2X_FPS60"] = fps60.Checked ? "1" : "0";
 
             Process p;
             try { p = Process.Start(si); }
@@ -359,13 +468,14 @@ namespace DbzBt4
                 int code = p.ExitCode;
                 BeginInvoke((MethodInvoker)delegate
                 {
+                    ReadBackFps60(iniPath);
                     if (direct && code == 0) { Close(); return; }
                     direct = false;
                     Show();
                     Activate();
                     if (code != 0)
                         MessageBox.Show(this, "El juego se cerro con el codigo " + code + ".\nRegistro: " + Path.Combine(logs, "juego.log") +
-                                        "\nRegistro del GS: " + Path.Combine(gshostDir, "logs\\emulog.txt") +
+                                        "\nRegistro del GS: " + Path.Combine(hostDir, "logs\\emulog.txt") +
                                         "\n\nSi la ventana no llego a abrir: actualiza el driver de la tarjeta grafica (hace falta Vulkan).",
                                         "DBZ BT4", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 });
@@ -373,7 +483,6 @@ namespace DbzBt4
             t.IsBackground = true;
             t.Start();
         }
-
         // DBZ_BT4.exe --jugar: starts the game straight away with the saved options (for a desktop shortcut) and exits
         // with it; the window only shows up when the ISO still has to be chosen or the game failed.
         bool direct;

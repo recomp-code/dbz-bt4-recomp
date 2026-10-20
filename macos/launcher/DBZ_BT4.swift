@@ -343,7 +343,8 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if CGFloat(wh) > vf.height * 0.85 { wh = Int(vf.height * 0.85); ww = wh * 16 / 9 }
 
         let p = Process()
-        p.executableURL = paths.macos.appendingPathComponent("ps2EntryRunner")
+        // the runner lives in a helper app (LSUIElement): it has no window of its own, so no Dock icon either
+        p.executableURL = paths.bundle.bundleURL.appendingPathComponent("Contents/Helpers/Game.app/Contents/MacOS/ps2EntryRunner")
         p.arguments = [paths.elf.path]
         p.currentDirectoryURL = paths.runtime
         var env = ProcessInfo.processInfo.environment
@@ -372,10 +373,13 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         game = p
         window.orderOut(nil)
+        // while the game runs, its window (PCSX2) is the only Dock icon
+        NSApp.setActivationPolicy(.accessory)
     }
 
     func gameEnded(_ p: Process, ini: URL, log: URL, seconds: TimeInterval) {
         game = nil
+        NSApp.setActivationPolicy(.regular)
         // the in-game menu saves "DbzFps60 = true/false" in its ini: that becomes the next start's default
         if let v = iniValue(ini, "DbzFps60") { fps60.state = v.lowercased() == "true" ? .on : .off; saveConfig() }
         let code = p.terminationStatus

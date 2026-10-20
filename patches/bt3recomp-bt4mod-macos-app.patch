@@ -30,3 +30,39 @@ index d5aa00b..66c7551 100644
                          cur.clear();
                          inArg = false;
                      }
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 8fbc98c..dfd0969 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -50,6 +50,21 @@ extern "C" int ps2xSchedTraceOn();               // PS2X_SCHEDTRACE window (defi
+ #include "ps2_stubs.h"
+ #include "ps2_syscalls.h"
+ #include "game_overrides.h"
++#if defined(__APPLE__)
++#include <objc/message.h>
++#include <objc/runtime.h>
++// [gslive] macOS: the window library turns the process into a regular app (Dock icon), but with the PCSX2 GS host
++// drawing the game this process has no visible window: an accessory app keeps everything working without the icon.
++static void ps2xMacHideDockIcon()
++{
++    Class nsApp = objc_getClass("NSApplication");
++    if (!nsApp)
++        return;
++    id app = ((id(*)(Class, SEL))objc_msgSend)(nsApp, sel_registerName("sharedApplication"));
++    if (app)
++        ((void (*)(id, SEL, long))objc_msgSend)(app, sel_registerName("setActivationPolicy:"), 1L); // Accessory
++}
++#endif
+ #include "Kernel/Stubs/Pad.h"        // [hstate]/[fightprobe]: ps2_stubs::getPadDebugSnapshot()
+ #include "Kernel/Stubs/MemoryCard.h" // [hstate]: ps2_stubs::getMemoryCardDebugSnapshot()
+ #include "Kernel/Syscalls/Helpers/Path.h" // [r3000] getConfiguredCdRoot() for the IRX paths
+@@ -1585,6 +1600,9 @@ bool PS2Runtime::initialize(const char *title)
+         {   // [gslive] PCSX2's GS host draws the game in its own window (it also takes the keyboard and the gamepad): this
+             // window only keeps the GL context, audio and pad polling alive, so it stays hidden. Start the host now.
+             bt3SetWindowState(FLAG_WINDOW_HIDDEN);
++#if defined(__APPLE__)
++            ps2xMacHideDockIcon();
++#endif
+             std::fprintf(stderr, "[gslive] runtime window hidden, PCSX2 GS host %s\n", ps2_gslive::liveActive() ? "running" : "NOT available");
+         }
+         {   // [winlog] what we asked for vs what the framework reports vs the REAL client area. The SDL

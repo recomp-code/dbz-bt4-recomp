@@ -1,7 +1,8 @@
 #!/bin/bash
 # Builds the ready-to-play Mac package: DBZ_BT4.app (and DBZ_BT4_Mac.zip next to it). Like windows/make_dist.ps1 it has
 # no ISO, ELF or disc data: the app copies the ELF out of the player's ISO the first time.
-#   Contents/MacOS/      DBZ_BT4 (launcher), ps2EntryRunner (the recompiled game), pcsx2-gsrunner (PCSX2's GS on Metal)
+#   Contents/MacOS/      DBZ_BT4 (launcher), pcsx2-gsrunner (PCSX2's GS on Metal)
+#   Contents/Helpers/    Game.app: ps2EntryRunner (the recompiled game), a UI element (no Dock icon)
 #   Contents/Frameworks/ the GS host's dylibs (SDL3, freetype, png, webp...), rewritten to load from here
 #   Contents/Resources/  PCSX2's resources (shaders, fonts, GameIndex.yaml), runtime/ (assets, fps60_sites.txt,
 #                        settings.toml), presets/ (one ini per launcher quality), AppIcon.icns
@@ -26,10 +27,27 @@ C="$APP/Contents"
 sed "s/@VERSION@/$VERSION/g" "$HERE/Info.plist" > "$C/Info.plist"
 
 # executables
+# the runner goes in a helper app with LSUIElement: no Dock icon for a process without a window of its own
+G="$C/Helpers/Game.app/Contents/MacOS"
+mkdir -p "$G"
+cat > "$C/Helpers/Game.app/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleExecutable</key><string>ps2EntryRunner</string>
+	<key>CFBundleIdentifier</key><string>io.github.recomp-code.dbz-bt4.game</string>
+	<key>CFBundleName</key><string>DBZ BT4</string>
+	<key>CFBundlePackageType</key><string>APPL</string>
+	<key>LSMinimumSystemVersion</key><string>14.0</string>
+	<key>LSUIElement</key><true/>
+</dict>
+</plist>
+PLIST
 "$HERE/build_launcher.sh" "$C/MacOS/DBZ_BT4"
-cp "$RUNNER/ps2EntryRunner" "$C/MacOS/"
+cp "$RUNNER/ps2EntryRunner" "$G/"
 cp "$GSHOST" "$C/MacOS/"
-strip -x "$C/MacOS/ps2EntryRunner" "$C/MacOS/pcsx2-gsrunner"
+strip -x "$G/ps2EntryRunner" "$C/MacOS/pcsx2-gsrunner"
 
 # dylibs: everything outside the system, recursively, loaded from Contents/Frameworks
 fix_refs() {   # fix_refs <binary>: point its non-system dylib references at Frameworks/
@@ -40,7 +58,7 @@ fix_refs() {   # fix_refs <binary>: point its non-system dylib references at Fra
 # copy each referenced install name (the name the binaries ask for, e.g. libSDL3.0.dylib) until nothing new shows up
 while :; do
     added=0
-    for bin in "$C/MacOS/ps2EntryRunner" "$C/MacOS/pcsx2-gsrunner" "$C"/Frameworks/*.dylib; do
+    for bin in "$G/ps2EntryRunner" "$C/MacOS/pcsx2-gsrunner" "$C"/Frameworks/*.dylib; do
         [ -f "$bin" ] || continue
         for dep in $(otool -L "$bin" | tail -n +2 | awk '{print $1}' | grep -E '^/(opt|usr/local|Users)/'); do
             name="$(basename "$dep")"
@@ -54,10 +72,10 @@ while :; do
     done
     [ $added = 0 ] && break
 done
-for bin in "$C/MacOS/ps2EntryRunner" "$C/MacOS/pcsx2-gsrunner" "$C"/Frameworks/*.dylib; do
+for bin in "$G/ps2EntryRunner" "$C/MacOS/pcsx2-gsrunner" "$C"/Frameworks/*.dylib; do
     [ -f "$bin" ] && fix_refs "$bin"
 done
-if otool -L "$C/MacOS/"* "$C"/Frameworks/*.dylib 2>/dev/null | grep -E '^\s/(opt|usr/local|Users)/'; then
+if otool -L "$C/MacOS/"* "$G/"* "$C"/Frameworks/*.dylib 2>/dev/null | grep -E '^\s/(opt|usr/local|Users)/'; then
     echo "a binary still loads a library from this Mac (above)" >&2; exit 1
 fi
 
@@ -88,7 +106,8 @@ cp "$HERE/LEEME.txt" "$OUT/LEEME.txt"
 
 # ad-hoc signature, inside out (Apple Silicon refuses unsigned code)
 codesign --force -s - "$C"/Frameworks/*.dylib
-codesign --force -s - "$C/MacOS/ps2EntryRunner" "$C/MacOS/pcsx2-gsrunner"
+codesign --force -s - "$G/ps2EntryRunner" "$C/MacOS/pcsx2-gsrunner"
+codesign --force -s - "$C/Helpers/Game.app"
 codesign --force -s - "$APP"
 codesign --verify --deep --strict "$APP"
 

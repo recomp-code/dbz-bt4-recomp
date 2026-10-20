@@ -1,0 +1,37 @@
+Dragon Ball Z Budokai Tenkaichi 4 (mod de Team BT4, Beta 14 Rev2) - Windows
+============================================================================
+
+Como jugar
+----------
+1. Descomprime el .zip en una carpeta donde puedas escribir (Escritorio, Documentos, Descargas...).
+   No lo pongas en "Archivos de programa".
+2. Abre DBZ_BT4.exe.
+3. Pulsa "Seleccionar ISO..." y elige tu ISO del mod: SLUS-219.78, Beta 14 Rev2 (DBZBT4B14REV2).
+   Solo se hace la primera vez. Otra version del mod no sirve: el juego esta recompilado para esa.
+4. Elige la calidad y pulsa JUGAR.
+
+Este paquete NO incluye el juego: necesitas tu propia ISO. El mod es de Team BT4:
+https://teambt4.wixsite.com/teambt4projects
+
+Requisitos
+----------
+- Windows 10 u 11 de 64 bits.
+- Tarjeta grafica con Vulkan y el driver al dia (NVIDIA GTX 900 / AMD RX 400 / Intel Arc o mas nuevas).
+- Calidad "Maxima" (6x): GPU potente (RTX 3070 / RX 6800 o mejor).
+  "Equilibrada" (3x): GPU de gama media.  "DLSS / FSR" (2x reescalado): GPU modesta;
+  DLSS en NVIDIA RTX, FSR en las demas.
+
+Controles
+---------
+Mando XInput (Xbox o compatible): A = Cruz, B = Circulo, X = Cuadrado, Y = Triangulo.
+Teclado: flechas = cruceta, WASD = stick izquierdo, Z/X/C/V = Cuadrado/Cruz/Circulo/Triangulo,
+         Q/E = L1/R1, 1/3 = L2/R2, Enter = START, Retroceso = SELECT.
+F1 (o Back+Start, o mantener START) = opciones graficas: resolucion interna, DLSS / FSR, nitidez.
+Alt+Enter o F11 = pantalla completa / ventana.  Cerrar la ventana = salir.
+
+Codigo para desbloquear todo (en el menu principal): manten L1+R1 y pulsa
+Abajo, Derecha, Triangulo, Abajo, Izquierda, Triangulo, Arriba.
+
+Partidas guardadas: runtime\savedata\.  Registros si algo falla: logs\juego.log y gshost\logs\emulog.txt.
+
+Codigo fuente y como compilarlo: https://github.com/recomp-code/dbz-bt4-recomp

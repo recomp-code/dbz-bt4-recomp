@@ -19,6 +19,23 @@ Zamas, Toppo, Jiren, Hit, Cabba, Caulifla, Kale...), the new stages (Tournament 
 Red Ribbon base, Muscle Tower, Baba's palace, Space...) and fights on the Tournament of Power stage. Recorded unattended
 with `windows/record_video.ps1` + `windows/mux_video.ps1`.
 
+## Download and play (Windows, nothing to compile)
+
+**[⬇ DBZ_BT4_Windows.zip](https://github.com/recomp-code/dbz-bt4-recomp/raw/main/download/DBZ_BT4_Windows.zip)** (92 MB)
+
+1. Unzip it in a folder you can write to (Desktop, Documents, Downloads; not Program Files).
+2. Open `DBZ_BT4.exe`, press **Seleccionar ISO...** and pick your own image of the mod: `SLUS-219.78`, Beta 14 Rev2.
+   Only the first time. Another version of the mod does not work: the game was recompiled for that one (the launcher
+   checks the ELF's SHA-256).
+3. Pick the quality (6x native, 3x, or 2x + DLSS / FSR), 60 fps fights on or off, and press **JUGAR**.
+
+Needs Windows 10/11 64-bit and a GPU with Vulkan (DLSS on NVIDIA RTX, FSR on the rest). Xbox-style controllers and the
+keyboard work out of the box; F1 opens the graphics options. `DBZ_BT4.exe --jugar` starts straight away with the saved
+options (for a desktop shortcut). The zip has the recompiled runner and PCSX2's GS host, **not the disc**: the launcher
+copies the ELF and the IRX modules out of your ISO into `runtime\data\` and the game streams everything else from the ISO.
+Built with `windows/make_dist.ps1`; the launcher's source is `windows/launcher/DBZ_BT4.cs` (`windows/build_launcher.ps1`,
+the C# compiler that ships with Windows).
+
 > **The mod is the work of Team BT4.** Get it, its updates and the PCSX2 extras (the `GameIndex.yaml` with the
 > SLUS-21978 fixes) from their official page: **https://teambt4.wixsite.com/teambt4projects**
 > ([download section](https://teambt4.wixsite.com/teambt4projects/descarga)).
@@ -29,8 +46,9 @@ with `windows/record_video.ps1` + `windows/mux_video.ps1`.
 - Native macOS, our own recompilation with PCSX2's GS (`pcsx2-gsrunner`): experimental.
 - **Browser** (WebAssembly): the web runtime from [street-recomp-v3](https://github.com/recomp-code/street-recomp-v3) with Play!'s GS on WebGL2.
 
-**This repository contains no game code or data.** Bring your own disc image. The game's code is generated
-from your ELF at build time.
+**This repository contains no game data.** Bring your own disc image. The sources and patches contain no game code
+either: building generates it from your ELF. The one exception is the ready-to-play Windows zip in `download/`, whose
+runner holds the game's code already recompiled from the Beta 14 Rev2 ELF (no ISO, ELF or disc files are in it).
 
 ## Status (2026-10-18)
 

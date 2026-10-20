@@ -1,5 +1,5 @@
 diff --git a/pcsx2/GSDumpReplayer.cpp b/pcsx2/GSDumpReplayer.cpp
-index 2259b89..390530f 100644
+index 2259b89..f99475d 100644
 --- a/pcsx2/GSDumpReplayer.cpp
 +++ b/pcsx2/GSDumpReplayer.cpp
 @@ -119,6 +119,7 @@ namespace
@@ -45,11 +45,63 @@ index 2259b89..390530f 100644
  	if (!s_live_ring_suffix.empty())
  	{
  		const DWORD pid = static_cast<DWORD>(std::wcstoul(s_live_ring_suffix.c_str(), nullptr, 10));
+@@ -1140,6 +1162,23 @@ void GSDumpReplayer::SetLivePad(u32 buttons, u32 axes)
+ #endif
+ }
+ 
++u32 GSDumpReplayer::GetLiveFps60()
++{
++#ifdef PS2X_LIVE_RING
++	return s_live.header ? s_live.header->gameFps60 : 0u;
++#else
++	return 0u;
++#endif
++}
++
++void GSDumpReplayer::RequestLiveFps60(bool on)
++{
++#ifdef PS2X_LIVE_RING
++	if (s_live.header)
++		s_live.header->fps60Request = on ? 2u : 1u;
++#endif
++}
++
+ void GSDumpReplayer::SetLiveMenuOpen(bool open)
+ {
+ #ifdef PS2X_LIVE_RING
+diff --git a/pcsx2/GSDumpReplayer.h b/pcsx2/GSDumpReplayer.h
+index 1db531a..2429598 100644
+--- a/pcsx2/GSDumpReplayer.h
++++ b/pcsx2/GSDumpReplayer.h
+@@ -45,6 +45,9 @@ namespace GSDumpReplayer
+ 	void SetLiveMenuOpen(bool open);
+ 	/// Pad state published back to the game (the host window has the keyboard focus).
+ 	void SetLivePad(u32 buttons, u32 axes);
++	/// 60 fps fights (DBZ BT4): the game's mode, 0 = the game has no switch, 1 = 30 fps, 2 = 60 fps.
++	u32 GetLiveFps60();
++	void RequestLiveFps60(bool on);
+ 	void SetLiveQuit();
+ 	/// Writes a minimal dump (header + registers, no packets) to boot the replayer with.
+ 	bool WriteLiveBootDump(const std::string& path, Error* error);
 diff --git a/pcsx2/Ps2LiveRing.h b/pcsx2/Ps2LiveRing.h
-index 0045f01..e756232 100644
+index 0045f01..fac0c83 100644
 --- a/pcsx2/Ps2LiveRing.h
 +++ b/pcsx2/Ps2LiveRing.h
-@@ -67,7 +67,35 @@ namespace ps2live
+@@ -53,7 +53,13 @@ namespace ps2live
+         volatile uint32_t consumerWaiting; // host blocked on the data event
+         volatile uint32_t producerFlags;
+         volatile uint32_t producerWaiting; // game blocked on the space event (ring full)
++        // 60 fps fights from the host's options menu (DBZ BT4 / BT3-Recomp): the game publishes its mode in gameFps60
++        // (0 = no switch, e.g. an older runtime; 1 = 30 fps; 2 = 60 fps), the menu writes 1 or 2 into fps60Request and
++        // the game clears it once applied. Both fit in the padding of this cache line: the layout is unchanged.
++        volatile uint32_t gameFps60;
++        volatile uint32_t fps60Request;
+     };
++    static_assert(sizeof(RingHeader) == 192, "the ring header layout is shared with older builds");
+ 
+     // Object names for one game instance: base name + "_" + suffix (the game's process id, passed
+     // to the host as "-livering <suffix>"), so several instances never share a ring.
+@@ -67,7 +73,35 @@ namespace ps2live
          return reinterpret_cast<uint8_t *>(header) + sizeof(RingHeader);
      }
  
@@ -86,3 +138,57 @@ index 0045f01..e756232 100644
      // POSIX: the ring is a shm_open object and the two Windows auto-reset events are words in
      // the same mapping, after the data area (macOS: os_sync_wait_on_address, Linux: futex).
      // macOS limits shm names to 31 characters, so the base name is short.
+diff --git a/pcsx2-gsrunner/Main.cpp b/pcsx2-gsrunner/Main.cpp
+index 3b93a4a..1bb200c 100644
+--- a/pcsx2-gsrunner/Main.cpp
++++ b/pcsx2-gsrunner/Main.cpp
+@@ -1397,6 +1397,7 @@ namespace
+ 		MENU_UPSCALER,
+ 		MENU_ASPECT,
+ 		MENU_FULLSCREEN,
++		MENU_FPS60,
+ 		MENU_FPS,
+ 		MENU_TEXTURES,
+ 		MENU_CLOSE,
+@@ -1416,6 +1417,8 @@ namespace
+ 	// The renderer can not be switched while the live window is open (the swap chain is tied to
+ 	// it): the choice is saved and used on the next start.
+ 	int s_menu_pending_renderer = -1;
++	// 60 fps fights: the last choice sent to the game (-1 = none yet); the game publishes its mode a little later.
++	int s_menu_fps60 = -1;
+ 
+ 	std::atomic<bool> s_menu_open{false};
+ 	int s_menu_selected = 0;
+@@ -1472,6 +1475,8 @@ static void LiveMenuInit()
+ #endif
+ 		{"Relacion de aspecto", {"Automatica (4:3)", "4:3", "16:9 (estirada)", "Llenar ventana"}, aspect_index},
+ 		{"Pantalla completa", {"No", "Si"}, s_fullscreen ? 1 : 0},
++		// the game's own switch (DBZ BT4: BT3-Recomp's 60 fps fights), applied at once through the ring
++		{"Peleas a 60 fps", {"No", "Si"}, GSDumpReplayer::GetLiveFps60() == 2u ? 1 : 0},
+ 		{"Mostrar FPS", {"No", "Si"}, s_settings_interface.GetBoolValue("EmuCore/GS", "OsdShowFPS", false) ? 1 : 0},
+ 		{"Texturas HD (packs PCSX2)", {"Desactivadas", "Activadas", "Activadas + volcar originales"},
+ 			!s_settings_interface.GetBoolValue("EmuCore/GS", "LoadTextureReplacements", false) ? 0 :
+@@ -1604,6 +1609,15 @@ static void LiveMenuApply(int item)
+ 			if ((index == 1) != s_fullscreen)
+ 				LivePlatformToggleFullscreen();
+ 			return;
++		case MENU_FPS60:
++			if (GSDumpReplayer::GetLiveFps60() == 0u)
++			{
++				s_menu[item].index = 0; // this game has no 60 fps switch
++				return;
++			}
++			s_menu_fps60 = index;
++			GSDumpReplayer::RequestLiveFps60(index == 1);
++			return;
+ 		case MENU_FPS:
+ 			s_settings_interface.SetBoolValue("EmuCore/GS", "OsdShowFPS", index == 1);
+ 			break;
+@@ -1622,6 +1636,7 @@ static void LiveMenuDo(LiveMenuAction action)
+ 	{
+ 		s_menu_open.store(action == LiveMenuAction::Toggle ? !open : false);
+ 		s_menu[MENU_FULLSCREEN].index = s_fullscreen ? 1 : 0;
++		s_menu[MENU_FPS60].index = s_menu_fps60 >= 0 ? s_menu_fps60 : (GSDumpReplayer::GetLiveFps60() == 2u ? 1 : 0);
+ 		GSDumpReplayer::SetLiveMenuOpen(s_menu_open.load());
+ 		LiveMenuPublish();
+ 		return;

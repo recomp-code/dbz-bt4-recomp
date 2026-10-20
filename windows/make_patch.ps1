@@ -24,13 +24,13 @@ Write-Diff 'C:/DBZBT4Recomp/tmp_base' 'C:/DBZBT4Recomp/bt3mod' $rt "$R\patches\b
 $ok1 = $LASTEXITCODE -eq 0
 & $g -C "$R\bt3mod" worktree remove --force $base
 
-# 2. Host (PCSX2): los dos archivos de la NBA con el parche DBZ aplicado, contra los de C:\DBZBT4Recomp\pcsx2
+# 2. Host (PCSX2): los archivos de la NBA con el parche DBZ aplicado, contra los de C:\DBZBT4Recomp\pcsx2
 $hb = "$R\tmp_host"
-$hf = @('pcsx2/GSDumpReplayer.cpp', 'pcsx2/Ps2LiveRing.h')
+$hf = @('pcsx2/GSDumpReplayer.cpp', 'pcsx2/GSDumpReplayer.h', 'pcsx2/Ps2LiveRing.h', 'pcsx2-gsrunner/Main.cpp')
 Remove-Item -Recurse -Force $hb -ErrorAction SilentlyContinue
 foreach ($rel in $hf) { $d = Join-Path $hb $rel; New-Item -ItemType Directory -Force (Split-Path $d) | Out-Null; Copy-Item "C:\NBAStreetRecomp\pcsx2\$rel" $d }
 & $g -C $hb init -q
-& $g -C $hb apply --include=pcsx2/GSDumpReplayer.cpp --include=pcsx2/Ps2LiveRing.h "$R\dbz-bt4-recomp\patches\pcsx2-gsrunner-live-dbz.patch"
+& $g -C $hb apply --include=pcsx2/GSDumpReplayer.cpp --include=pcsx2/Ps2LiveRing.h --include=pcsx2-gsrunner/Main.cpp "$R\dbz-bt4-recomp\patches\pcsx2-gsrunner-live-dbz.patch"
 if ($LASTEXITCODE -ne 0) { throw "no aplica pcsx2-gsrunner-live-dbz.patch sobre la NBA" }
 Write-Diff 'C:/DBZBT4Recomp/tmp_host' 'C:/DBZBT4Recomp/pcsx2' $hf "$R\patches\pcsx2-gsrunner-dbz-windows.patch"
 & $g -C $hb apply --check "$R\patches\pcsx2-gsrunner-dbz-windows.patch"

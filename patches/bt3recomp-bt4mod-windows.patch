@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/src/lib/ps2_gs_live.cpp b/ps2xRuntime/src/lib/ps2_gs_live.cpp
-index 086b77e..2dfa277 100644
+index 086b77e..aa986bd 100644
 --- a/ps2xRuntime/src/lib/ps2_gs_live.cpp
 +++ b/ps2xRuntime/src/lib/ps2_gs_live.cpp
 @@ -1,5 +1,5 @@
@@ -27,17 +27,20 @@ index 086b77e..2dfa277 100644
  // [web] The GS host is the page itself (web/play_gs_host.cpp, Play!'s GS on WebGL2, on the browser's main thread):
  // the ring is plain memory of this module, shared with it. Same protocol as the POSIX ring.
  #include <cerrno>
-@@ -38,6 +47,9 @@ extern char **environ;
+@@ -38,6 +47,12 @@ extern char **environ;
  #define PS2X_GS_LIVE_RING 1
  #endif
  
 +// [avsync] ps2_host_audio.cpp: bytes written to PS2X_WAVCAP so far.
 +extern std::atomic<uint64_t> g_ps2WavcapBytes;
++// [fps60] the host's options menu switches 60 fps fights (ps2_stepcensus.cpp)
++extern std::atomic<int> g_ps2VStepMode;
++void ps2Set60Fps(bool on, const char *sitesPath);
 +
  namespace ps2_gslive
  {
      namespace
-@@ -81,7 +93,175 @@ namespace ps2_gslive
+@@ -81,7 +96,175 @@ namespace ps2_gslive
              return (v && v[0]) ? std::string(v) : std::string("SLUS-21978");
          }
  
@@ -214,7 +217,7 @@ index 086b77e..2dfa277 100644
          struct LiveRing
          {
              int hostStatus = 0;
-@@ -149,6 +329,15 @@ namespace ps2_gslive
+@@ -149,6 +332,15 @@ namespace ps2_gslive
              }
  
              void signal() {} // the page polls once per browser frame
@@ -230,7 +233,7 @@ index 086b77e..2dfa277 100644
          };
  #elif defined(PS2X_GS_LIVE_RING)
          // shm_open mapping, events as shared words (ps2live::eventSet/eventWait), host started with posix_spawn.
-@@ -298,6 +487,21 @@ namespace ps2_gslive
+@@ -298,6 +490,21 @@ namespace ps2_gslive
                  if (!header->consumerFlags || header->consumerWaiting)
                      ps2live::eventSet(&events->data);
              }
@@ -252,7 +255,7 @@ index 086b77e..2dfa277 100644
          };
  #endif
  
-@@ -335,12 +539,7 @@ namespace ps2_gslive
+@@ -335,12 +542,7 @@ namespace ps2_gslive
                  {
                      if (!live.write(static_cast<const uint8_t *>(data), size))
                      {
@@ -266,7 +269,7 @@ index 086b77e..2dfa277 100644
                          std::fflush(stderr);
                          std::_Exit(0);
                      }
-@@ -428,7 +627,7 @@ namespace ps2_gslive
+@@ -428,7 +630,7 @@ namespace ps2_gslive
                          std::fprintf(stderr, "[gslive] GS host started (PCSX2 renderer, serial %s)\n", serial().c_str());
                      }
                      else
@@ -275,7 +278,7 @@ index 086b77e..2dfa277 100644
                  }
  #endif
                  const char *path = std::getenv("PS2X_GS_DUMP");
-@@ -590,6 +789,13 @@ namespace ps2_gslive
+@@ -590,6 +792,13 @@ namespace ps2_gslive
          const uint32_t qwc = bytes / 16u;
          if (qwc == 0u || !active())
              return false;
@@ -289,7 +292,7 @@ index 086b77e..2dfa277 100644
          Writer &w = writer();
  #if defined(PS2X_GS_LIVE_RING) && !defined(PS2X_GS_LIVE_WEB) // the browser page does not answer (yet)
          uint32_t seq0 = 0;
-@@ -598,28 +804,28 @@ namespace ps2_gslive
+@@ -598,28 +807,28 @@ namespace ps2_gslive
              if (!w.usable())
                  return false;
              if (w.liveActive)
@@ -324,7 +327,7 @@ index 086b77e..2dfa277 100644
          if (const char *dd = std::getenv("PS2X_READBACK_DUMP"); dd && dd[0])
          {   // [readback] raw copies for inspection: <dir>/rb_<n>.bin
              static uint32_t s_n = 0;
-@@ -691,9 +897,9 @@ namespace ps2_gslive
+@@ -691,17 +900,33 @@ namespace ps2_gslive
                      if (w.live.hostGone())
                          break;
                      w.live.header->producerWaiting = 1u;
@@ -336,7 +339,18 @@ index 086b77e..2dfa277 100644
                      w.live.header->producerWaiting = 0u;
                  }
                  w.lagWaitNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
-@@ -702,6 +908,12 @@ namespace ps2_gslive
+             }
++            // [fps60] the host menu's "Peleas a 60 fps": apply its request (it takes effect at once, mid-fight too)
++            // and publish the current mode so the menu shows it.
++            ps2live::RingHeader *h = w.live.header;
++            if (const uint32_t req = h->fps60Request; req == 1u || req == 2u)
++            {
++                h->fps60Request = 0u;
++                std::fprintf(stderr, "[fps60] host menu: %s\n", req == 2u ? "60 fps" : "30 fps");
++                ps2Set60Fps(req == 2u, nullptr);
++            }
++            h->gameFps60 = g_ps2VStepMode.load(std::memory_order_relaxed) ? 2u : 1u;
+         }
  #endif
          if (w.file && w.frames % 600u == 0u)
              std::fflush(w.file);
@@ -350,10 +364,24 @@ index 086b77e..2dfa277 100644
          ++w.statFrames;
          // PS2X_GS_DUMP_UNTIL=<file>: the dump is closed at the first frame after that file appears (test scripts cut a
 diff --git a/ps2xRuntime/src/lib/ps2_live_ring.h b/ps2xRuntime/src/lib/ps2_live_ring.h
-index 0045f01..e756232 100644
+index 0045f01..fac0c83 100644
 --- a/ps2xRuntime/src/lib/ps2_live_ring.h
 +++ b/ps2xRuntime/src/lib/ps2_live_ring.h
-@@ -67,7 +67,35 @@ namespace ps2live
+@@ -53,7 +53,13 @@ namespace ps2live
+         volatile uint32_t consumerWaiting; // host blocked on the data event
+         volatile uint32_t producerFlags;
+         volatile uint32_t producerWaiting; // game blocked on the space event (ring full)
++        // 60 fps fights from the host's options menu (DBZ BT4 / BT3-Recomp): the game publishes its mode in gameFps60
++        // (0 = no switch, e.g. an older runtime; 1 = 30 fps; 2 = 60 fps), the menu writes 1 or 2 into fps60Request and
++        // the game clears it once applied. Both fit in the padding of this cache line: the layout is unchanged.
++        volatile uint32_t gameFps60;
++        volatile uint32_t fps60Request;
+     };
++    static_assert(sizeof(RingHeader) == 192, "the ring header layout is shared with older builds");
+ 
+     // Object names for one game instance: base name + "_" + suffix (the game's process id, passed
+     // to the host as "-livering <suffix>"), so several instances never share a ring.
+@@ -67,7 +73,35 @@ namespace ps2live
          return reinterpret_cast<uint8_t *>(header) + sizeof(RingHeader);
      }
  

@@ -19,7 +19,7 @@ set R=C:\DBZBT4Recomp
 if "%DBZ_ISO%"=="" set DBZ_ISO=%USERPROFILE%\Documents\PS2_NTSC\SLUS_219.78.DBZBT4B14REV2.iso
 set PS2X_CD_IMAGE=%DBZ_ISO%
 set PS2X_GS_LIVE=1
-set PS2X_GSHOST=%R%\gshost\pcsx2-gsrunner.exe
+if "%PS2X_GSHOST%"=="" set PS2X_GSHOST=%R%\gshost\pcsx2-gsrunner.exe
 set PS2X_LIVE_SERIAL=SLUS-21978
 set PS2X_LIVE_TITLE=Dragon Ball Z Budokai Tenkaichi 4
 rem DBZ_INI: dbz.ini (6x nativo, por defecto) o dbz_dlss.ini (2x + DLSS), ambos en gshost\.

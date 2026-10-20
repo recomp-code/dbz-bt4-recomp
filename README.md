@@ -24,7 +24,7 @@ with `windows/record_video.ps1` + `windows/mux_video.ps1`.
 
 ## Download and play (Windows, nothing to compile)
 
-**[⬇ DBZ_BT4_Windows.zip](https://github.com/recomp-code/dbz-bt4-recomp/releases/download/v1.0-windows/DBZ_BT4_Windows.zip)** (92 MB, [release v1.0-windows](https://github.com/recomp-code/dbz-bt4-recomp/releases/tag/v1.0-windows); same file in `download/`)
+**[⬇ DBZ_BT4_Windows.zip](https://github.com/recomp-code/dbz-bt4-recomp/releases/latest/download/DBZ_BT4_Windows.zip)** (92 MB, from the [latest release](https://github.com/recomp-code/dbz-bt4-recomp/releases/latest))
 
 1. Unzip it in a folder you can write to (Desktop, Documents, Downloads; not Program Files).
 2. Open `DBZ_BT4.exe`, press **Seleccionar ISO...** and pick your own image of the mod: `SLUS-219.78`, Beta 14 Rev2.
@@ -33,7 +33,9 @@ with `windows/record_video.ps1` + `windows/mux_video.ps1`.
 3. Pick the quality (6x native, 3x, or 2x + DLSS / FSR), 60 fps fights on or off, and press **JUGAR**.
 
 Needs Windows 10/11 64-bit and a GPU with Vulkan (DLSS on NVIDIA RTX, FSR on the rest). Xbox-style controllers and the
-keyboard work out of the box; F1 opens the graphics options. `DBZ_BT4.exe --jugar` starts straight away with the saved
+keyboard work out of the box. **Hold START for 1.5 s** (or Back+Start, or F1) for the options menu: internal resolution,
+DLSS / FSR, sharpness, anisotropic filtering, aspect ratio, fullscreen, FPS counter and **60 fps fights** (switched at
+once, mid-fight too; the launcher's checkbox sets the starting value). `DBZ_BT4.exe --jugar` starts straight away with the saved
 options (for a desktop shortcut). The zip has the recompiled runner and PCSX2's GS host, **not the disc**: the launcher
 copies the ELF and the IRX modules out of your ISO into `runtime\data\` and the game streams everything else from the ISO.
 Built with `windows/make_dist.ps1`; the launcher's source is `windows/launcher/DBZ_BT4.cs` (`windows/build_launcher.ps1`,
@@ -50,7 +52,7 @@ the C# compiler that ships with Windows).
 - **Browser** (WebAssembly): the web runtime from [street-recomp-v3](https://github.com/recomp-code/street-recomp-v3) with Play!'s GS on WebGL2.
 
 **This repository contains no game data.** Bring your own disc image. The sources and patches contain no game code
-either: building generates it from your ELF. The one exception is the ready-to-play Windows zip in `download/`, whose
+either: building generates it from your ELF. The one exception is the ready-to-play Windows zip in the releases, whose
 runner holds the game's code already recompiled from the Beta 14 Rev2 ELF (no ISO, ELF or disc files are in it).
 
 ## Status (2026-10-18)
@@ -94,7 +96,11 @@ python games\bt3\setup.py games\bt3\work\SLUS_219.78 --stages 3-3 --jobs 20 --no
 
 Play with `windows\Jugar_DBZ.cmd` (30 fps), `Jugar_DBZ.cmd 60` / `Jugar_DBZ_60fps.cmd` (60 fps fights) or
 `Jugar_DBZ_DLSS.cmd` (2x + DLSS); `set DBZ_WINDOW=1` for a window. F1 in the game window opens the GS options
-(internal resolution, DLSS / FSR 1, sharpness). paraLLEl-GS is off on Windows (`PS2X_DISABLE_PGS=ON` by default), so the
+(internal resolution, DLSS / FSR 1, sharpness, 60 fps fights; also Back+Start or holding START 1.5 s on a controller).
+The 60 fps switch goes through the live ring: the host writes `fps60Request` and the game, at its next VSync, calls
+BT3-Recomp's `ps2Set60Fps` and publishes its mode in `gameFps60` (two words in the padding of the header's third cache
+line, so the layout and older builds are unaffected; `windows/fps60_ring_test.ps1` drives it without the menu).
+paraLLEl-GS is off on Windows (`PS2X_DISABLE_PGS=ON` by default), so the
 Granite submodules are not needed.
 
 What the Windows patches change:
@@ -124,6 +130,16 @@ bias-current-colour mask where no good match exists, in Vulkan and D3D12; `PS2X_
 `PS2X_DLSS_PRESET`. Measured on an RTX 4090: 6x native fights 2-5 ms of GPU per frame at 30 and 60 fps; the DLSS preset
 (2x, 1024x896 -> 2400x1350) 4-10 ms. `nvngx_dlss.dll` 310.9.1 next to the host (DLSS Swapper can replace it).
 
+### "DLSS 5" (DLSS Neural Rendering, experimental)
+
+On an NVIDIA RTX card the DLSS output can go through NVIDIA's neural rendering pass with ReShade and the RenoDX
+"DLSS 5" add-on (third-party, not included here), exactly as in the NBA Street V3 port: Direct3D 12, 2x internal + DLSS,
+then the neural pass. `windows\Jugar_DBZ_DLSS5.cmd` (`... 60` for 60 fps fights) runs the game with a test copy of the
+host, `gshost_hooktest\` = `gshost\` + ReShade's `dxgi.dll`, `renodx-dlss5.addon64`, its `ReShade.ini`,
+`nvngx_dlssnr.dll` (e.g. from DLSS 5 Swapper) and `dbz_dlss_dx12.ini` (`dbz_dlss.ini` with `Renderer = 15`). In game: F6
+toggles the pass, Home opens ReShade. DLSS, and so the pass, only runs while the window is larger than the 2x image
+(1024x896): the launcher opens a 1920x1080 window or fullscreen. Measured on an RTX 4090: the pass evaluates on every
+presented frame (`nr[evals]` = presents in `ReShade.log`), 59 fps in menus and 30 / 60 in fights.
 ## Native macOS with BT3-Recomp (playable)
 
 The mod ELF has the same layout as BT3 USA (SLUS-216.78): 98.5% of BT3-Recomp's function starts match. The mod adds about 6 KB of code at the end of `BIN/DBZP.BIN` and patches roughly 70 jumps into the game.

@@ -10,9 +10,30 @@ Como jugar
        Privacidad y seguridad y, abajo del todo, pulsa "Abrir igualmente" junto a DBZ_BT4.
      - macOS 14: clic derecho (o Ctrl+clic) en DBZ_BT4.app > Abrir > Abrir.
    O en Terminal:  xattr -dr com.apple.quarantine /Applications/DBZ_BT4.app
-3. Pulsa "Seleccionar ISO..." y elige tu ISO del mod: SLUS-219.78, Beta 14 Rev2 (DBZBT4B14REV2).
+3. Pulsa "Seleccionar ISO" y elige tu ISO del mod: SLUS-219.78, Beta 14 Rev2 (DBZBT4B14REV2).
    Solo se hace la primera vez. Otra version del mod no sirve: el juego esta recompilado para esa.
-4. Elige la calidad y pulsa JUGAR.
+4. Elige la calidad y pulsa JUGAR (pestana BIBLIOTECA).
+
+Jugar en linea
+--------------
+1. En el launcher, pestana EN LINEA: crea una cuenta (usuario y contrasena) o entra con la tuya.
+   Una cuenta sirve para siempre; en este Mac queda guardada la sesion, cifrada con una clave de tu Llavero,
+   nunca la contrasena.
+2. Ahi ves quien esta conectado. Para jugar con alguien:
+   - pulsa "Invitar" en su nombre (o en tu lista de amigos, a la izquierda); cuando acepte, empieza la pelea;
+   - o activa "Buscar partida" para que otros vean que quieres jugar;
+   - o crea una sala ("+ Nueva sala"), con contrasena si quieres, de 2 a 4 jugadores: pelean por turnos.
+   - "Buscar jugador por nombre" encuentra a cualquiera, aunque no este conectado; la estrella lo anade a amigos.
+3. Al aceptar, los dos juegos se abren solos y conectados. Cada uno ve su propio luchador a pantalla completa.
+   No hay que abrir puertos en el router: todo pasa por el servidor.
+4. Durante la partida, Back + Start en el mando (o Shift+Tab en el teclado) abre el launcher encima del juego
+   para ver quien esta en linea, responder una invitacion o hablar en la sala. B (o Back + Start) vuelve al juego.
+   Mientras el launcher (u otra ventana) esta delante, el mando no mueve a tu luchador.
+5. Si te invitan mientras juegas solo, el aviso aparece encima del juego: A acepta (se cierra tu partida actual,
+   lo que no hayas guardado se pierde), B dice "ahora no".
+Los dos jugadores tienen que tener la misma version del juego (el launcher avisa si no); Mac y Windows pueden
+jugar juntos si la tienen.
+Si la pelea va a tirones porque estais lejos, sube "Retraso de controles" en AJUSTES (manda el de quien invita).
 
 Este paquete NO incluye el juego: necesitas tu propia ISO. El mod es de Team BT4:
 https://teambt4.wixsite.com/teambt4projects
@@ -36,6 +57,6 @@ Codigo para desbloquear todo (en el menu principal): manten L1+R1 y pulsa
 Abajo, Derecha, Triangulo, Abajo, Izquierda, Triangulo, Arriba.
 
 Partidas guardadas, opciones y registros: ~/Library/Application Support/DBZ_BT4
-(boton "Partidas y registros..." del launcher). Si algo falla: logs/juego.log.
+("Abrir carpeta" en Partidas y registros, en el launcher). Si algo falla: logs/juego.log.
 
 Codigo fuente y como compilarlo: https://github.com/recomp-code/dbz-bt4-recomp

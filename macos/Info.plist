@@ -14,14 +14,5 @@
 	<key>LSApplicationCategoryType</key><string>public.app-category.action-games</string>
 	<key>NSHighResolutionCapable</key><true/>
 	<key>NSPrincipalClass</key><string>NSApplication</string>
-	<key>CFBundleDocumentTypes</key>
-	<array>
-		<dict>
-			<key>CFBundleTypeName</key><string>PS2 disc image</string>
-			<key>CFBundleTypeRole</key><string>Viewer</string>
-			<key>LSHandlerRank</key><string>None</string>
-			<key>CFBundleTypeExtensions</key><array><string>iso</string></array>
-		</dict>
-	</array>
 </dict>
 </plist>

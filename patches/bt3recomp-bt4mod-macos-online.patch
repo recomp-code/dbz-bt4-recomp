@@ -1,0 +1,54 @@
+macOS, on top of bt3recomp-bt4mod-windows.patch + bt3recomp-bt4mod-macos-app.patch: online play's [padfocus]
+(ps2_gs_live.cpp hostFocused): the controller counts only while the game's window is in front, asked to NSWorkspace.
+
+diff --git a/ps2xRuntime/src/lib/ps2_gs_live.cpp b/ps2xRuntime/src/lib/ps2_gs_live.cpp
+index ea1f161..cc444e8 100644
+--- a/ps2xRuntime/src/lib/ps2_gs_live.cpp
++++ b/ps2xRuntime/src/lib/ps2_gs_live.cpp
+@@ -38,6 +38,12 @@ bool ps2xWebStartGsHost(ps2live::RingHeader *header);
+ #include <cerrno>
+ #include <fcntl.h>
+ #include <signal.h>
++#if defined(__APPLE__)
++#include <objc/message.h>
++#include <objc/runtime.h>
++extern "C" void *objc_autoreleasePoolPush(void);
++extern "C" void objc_autoreleasePoolPop(void *);
++#endif
+ #include <spawn.h>
+ #include <sys/mman.h>
+ #include <sys/stat.h>
+@@ -827,6 +833,33 @@ namespace ps2_gslive
+         if (HWND fg = GetForegroundWindow())
+             GetWindowThreadProcessId(fg, &pid);
+         return pid == w.live.hostPid || pid == GetCurrentProcessId();
++#elif defined(PS2X_GS_LIVE_RING) && defined(__APPLE__)
++        // macOS: the frontmost application (NSWorkspace, through the Objective-C runtime: this file stays C++). Asked at
++        // most every 100 ms: the pad is polled every frame and the answer only changes when the player switches apps.
++        if (!requested())
++            return true;
++        Writer &w = writer();
++        if (!w.liveActive || w.live.hostPid == 0)
++            return true;
++        using Clock = std::chrono::steady_clock;
++        static Clock::time_point s_at{};
++        static bool s_front = true;
++        const Clock::time_point now = Clock::now();
++        if (now - s_at < std::chrono::milliseconds(100))
++            return s_front;
++        s_at = now;
++        void *pool = objc_autoreleasePoolPush();
++        int pid = -1;
++        if (Class ws = objc_getClass("NSWorkspace"))
++            if (id shared = ((id(*)(Class, SEL))objc_msgSend)(ws, sel_registerName("sharedWorkspace")))
++                if (id app = ((id(*)(id, SEL))objc_msgSend)(shared, sel_registerName("frontmostApplication")))
++                    pid = ((int (*)(id, SEL))objc_msgSend)(app, sel_registerName("processIdentifier"));
++        objc_autoreleasePoolPop(pool);
++        const bool front = pid < 0 || pid == w.live.hostPid || pid == getpid();   // unknown: count the pad
++        if (front != s_front)
++            std::fprintf(stderr, "[padfocus] the game is %s (front app pid %d)\n", front ? "in front" : "behind another window", pid);
++        s_front = front;
++        return front;
+ #else
+         return true;
+ #endif

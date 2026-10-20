@@ -1,5 +1,12 @@
 #!/bin/bash
-# build_launcher.sh <out>: compiles the Mac launcher (launcher/DBZ_BT4.swift) with the Xcode command line tools' swiftc.
-set -e
-cd "$(dirname "$0")"
-swiftc -O -target arm64-apple-macos14.0 -o "${1:-DBZ_BT4}" launcher/DBZ_BT4.swift
+# build_launcher.sh <out> [server]: the Recomp launcher (Go + Wails: recomp-code/recomp-online, launcher/) for macOS,
+# with the online server built in. RECOMP_ONLINE = that repository's checkout.
+set -euo pipefail
+SRC="${RECOMP_ONLINE:-$HOME/NBAStreetRecomp/recomp-online}/launcher"
+SERVER="${2:-https://nbas3.xellrecomp.party}"
+OUT="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+cd "$SRC"
+CGO_LDFLAGS="-framework UniformTypeIdentifiers" MACOSX_DEPLOYMENT_TARGET=14.0 GOTOOLCHAIN=local \
+    go build -tags desktop,production -trimpath -ldflags "-s -w -X main.defaultServer=$SERVER" -o "$OUT" . 2>&1 |
+    { grep -v -e 'deprecated' -e 'note:' -e 'WailsContext' -e '^ ' -e 'duplicate libraries' -e '^#' || true; }
+test -x "$OUT"

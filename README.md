@@ -103,7 +103,11 @@ work. Saves, options and logs live in `~/Library/Application Support/DBZ_BT4` (t
 `open -a DBZ_BT4 --args --jugar` starts straight away with the saved options. The app holds the recompiled runner,
 PCSX2's GS host and its libraries, **not the disc**: the launcher copies the ELF and the IRX modules out of your ISO and
 the game streams everything else from it. Built with `macos/make_dist.sh` (see [the `macos/` folder](#layout)); the
-launcher's source is `macos/launcher/DBZ_BT4.swift`.
+launcher is the same Recomp launcher as on Windows ([recomp-code/recomp-online](https://github.com/recomp-code/recomp-online)
+`launcher/`, Go + Wails on WebKit), with the same [online play](#play-online): the session is kept encrypted with a key
+in your Keychain, **Shift+Tab** or **Back + Start** brings the launcher over the game, and the controller does not move
+your fighter while another window is in front. A Mac and a Windows copy with the same 60 fps table are paired (the
+compatibility key, `net1-…` in AJUSTES, is the same on both).
 
 ## Status (2026-10-18)
 
@@ -251,7 +255,9 @@ Test helpers (`native/`): `lrun.sh` (run live), `lshot.sh` (the host saves its o
 | `patches/bt3recomp-bt4mod-windows.patch` | BT3-Recomp runtime, on top of `bt3recomp-bt4mod-full.patch`: the Windows live ring (version 2 with readback), PSMCT24 transfer size, `PS2X_PAD_SCRIPT`. See [Native Windows](#native-windows). |
 | `patches/pcsx2-gsrunner-dbz-windows.patch` | `pcsx2-gsrunner`, on top of the NBA port's tree + `pcsx2-gsrunner-live-dbz.patch`: ReadFIFO2 replies on Windows, the shared `Ps2LiveRing.h`. |
 | `patches/bt3recomp-bt4mod-macos-app.patch` | BT3-Recomp runtime, on top of `bt3recomp-bt4mod-windows.patch`: `PS2X_GSHOST_ARGS` takes "quoted" arguments (the Mac app's `-ini` path has spaces); in live mode on macOS the runner drops its Dock icon (only the game window shows one). |
-| `macos/` | The Mac package: `launcher/DBZ_BT4.swift` (AppKit launcher: ISO check and extraction, quality, 60 fps, fullscreen), `build_launcher.sh`, `build_ffmpeg.sh` (minimal static FFmpeg), `build_runner.sh` (runner for macOS 14+ with only system libraries), `make_dist.sh` (`DBZ_BT4.app`: dylibs into Frameworks, presets, icon, ad-hoc signature, zip), `Info.plist`, `settings.toml`, `LEEME.txt`. |
+| `patches/bt3recomp-bt4mod-macos-online.patch` | BT3-Recomp runtime, on top of the two above: online play's pad focus on macOS (the controller counts only while the game's window is the frontmost app, asked to NSWorkspace). |
+| `patches/pcsx2-gsrunner-macos-online.patch` | Mac GS host, on top of `pcsx2-gsrunner-live-dbz.patch`: Back + Start belongs to the launcher, so with Back held Start does not open the host's menu (F1 and holding START still do). |
+| `macos/` | The Mac package: `build_launcher.sh` (the Recomp launcher from a recomp-online checkout, `RECOMP_ONLINE`, with the server built in), `build_ffmpeg.sh` (minimal static FFmpeg), `build_runner.sh` (runner for macOS 14+ with only system libraries), `make_dist.sh` (`DBZ_BT4.app`: dylibs into Frameworks, presets, icon, ad-hoc signature, zip), `Info.plist`, `settings.toml`, `LEEME.txt`. |
 | `windows/` | Windows launchers (`Jugar_DBZ*.cmd`), build scripts (`env.ps1`, `reconfigure.cmd`, `build_runner.cmd`, `build_pcsx2.cmd`, `make_patch.ps1`), `gshost/dbz.ini` (Vulkan, 6x) and `gshost/dbz_dlss.ini` (2x + DLSS), `iso_extract.py` (ISO9660 extractor), tests (`run_test.ps1`, `sheet.ps1`, `stack_snapshot.ps1`). |
 | `docs/screenshots/`, `docs/videos/` | Screenshots and the showcase video of the native Windows build. |
 | `gshost/dbz.ini` | PCSX2 GS settings, based on the Team BT4 1080p profile: 3x, merge PP sprites, TC offsets, 16:9. The `GameIndex.yaml` with the SLUS-21978 fixes comes from the Team BT4 PCSX2 extras. |

@@ -11,7 +11,10 @@ fan mod of BT3, disc `SLUS-219.78`, "Beta 14 Rev2") with [PS2Recomp](https://git
 
 *Native Windows build, PCSX2's GS on Vulkan at 6x, 1920x1080 window (RTX 4090).*
 
-**[▶ Video: the mod's characters and stages, Jiren vs. Zamas (Fusion) at the Tournament of Power](docs/videos/dbz_bt4_mod.mp4)**
+https://github.com/user-attachments/assets/f0d626ea-ad75-40a9-a4c0-8109d5d1ce4c
+
+*65 s of highlights (720p60; GitHub only plays videos up to 10 MB inline).*
+**[▶ Full video, 4:22: the mod's characters and stages, Jiren vs. Zamas (Fusion) at the Tournament of Power](docs/videos/dbz_bt4_mod.mp4)**
 (native Windows build, 6x internal resolution, 2560x1440 at 60 fps, game audio; AV1). It enters the mod's unlock-all
 code on the main menu (hold L1+R1, then Down, Right, Triangle, Down, Left, Triangle, Up: the seven Dragon Balls light up),
 goes through the roster rows that BT3 never had (Super Saiyan Blue forms, Beerus, Broly SSJ3, Cell Max, Goku Black,

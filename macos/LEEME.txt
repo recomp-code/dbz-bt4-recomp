@@ -1,0 +1,41 @@
+Dragon Ball Z Budokai Tenkaichi 4 (mod de Team BT4, Beta 14 Rev2) - Mac
+=======================================================================
+
+Como jugar
+----------
+1. Descomprime el .zip y arrastra DBZ_BT4.app a Aplicaciones (o dejalo donde quieras).
+2. La primera vez macOS avisa de que la app no es de un desarrollador identificado (no esta firmada con una
+   cuenta de Apple). Abrela asi, una sola vez:
+     - macOS 15 o mas nuevo: doble clic en DBZ_BT4.app, cierra el aviso, ve a Ajustes del Sistema >
+       Privacidad y seguridad y, abajo del todo, pulsa "Abrir igualmente" junto a DBZ_BT4.
+     - macOS 14: clic derecho (o Ctrl+clic) en DBZ_BT4.app > Abrir > Abrir.
+   O en Terminal:  xattr -dr com.apple.quarantine /Applications/DBZ_BT4.app
+3. Pulsa "Seleccionar ISO..." y elige tu ISO del mod: SLUS-219.78, Beta 14 Rev2 (DBZBT4B14REV2).
+   Solo se hace la primera vez. Otra version del mod no sirve: el juego esta recompilado para esa.
+4. Elige la calidad y pulsa JUGAR.
+
+Este paquete NO incluye el juego: necesitas tu propia ISO. El mod es de Team BT4:
+https://teambt4.wixsite.com/teambt4projects
+
+Requisitos
+----------
+- Mac con Apple Silicon (M1 o mas nuevo) y macOS 14 o mas nuevo.
+- Calidad "Maxima" (6x): M Pro / Max / Ultra.  "Alta" (4x) y "Equilibrada" (3x): el resto.
+  "Apple MetalFX": 3x reescalado a la resolucion de tu pantalla, para cualquier Mac.
+  Con 60 fps la GPU trabaja el doble: si da tirones, baja la calidad (F1 dentro del juego).
+
+Controles
+---------
+Mando (Xbox, PlayStation o MFi conectado al Mac) o teclado:
+  flechas = cruceta, WASD = stick izquierdo, Z/X/C/V = Cuadrado/Cruz/Circulo/Triangulo,
+  Q/E = L1/R1, 1/3 = L2/R2, Enter = START, Retroceso = SELECT.
+F1 (o mantener START 1,5 s) = opciones: resolucion interna, MetalFX, 60 fps, mostrar FPS...
+F11 o Alt+Enter = pantalla completa / ventana.  Cmd+Q en la ventana del juego = salir.
+
+Codigo para desbloquear todo (en el menu principal): manten L1+R1 y pulsa
+Abajo, Derecha, Triangulo, Abajo, Izquierda, Triangulo, Arriba.
+
+Partidas guardadas, opciones y registros: ~/Library/Application Support/DBZ_BT4
+(boton "Partidas y registros..." del launcher). Si algo falla: logs/juego.log.
+
+Codigo fuente y como compilarlo: https://github.com/recomp-code/dbz-bt4-recomp

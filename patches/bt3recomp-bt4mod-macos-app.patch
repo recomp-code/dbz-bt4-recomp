@@ -1,0 +1,32 @@
+diff --git a/ps2xRuntime/src/lib/ps2_gs_live.cpp b/ps2xRuntime/src/lib/ps2_gs_live.cpp
+index d5aa00b..66c7551 100644
+--- a/ps2xRuntime/src/lib/ps2_gs_live.cpp
++++ b/ps2xRuntime/src/lib/ps2_gs_live.cpp
+@@ -402,16 +402,18 @@ namespace ps2_gslive
+                 std::vector<std::string> args{exe, "-live", "-window", "-livering", suffix};
+                 const char *extra = std::getenv("PS2X_GSHOST_ARGS");
+                 std::string extraArgs = (extra && extra[0]) ? extra : "-ini dbz.ini"; // quality settings next to the host
+-                size_t pos = 0;
+-                while (pos < extraArgs.size())
++                // Split on spaces; "double quotes" keep a path with spaces in one argument (the Mac app's
++                // -ini lives in ~/Library/Application Support).
++                std::string cur;
++                bool inArg = false, quoted = false;
++                for (const char c : extraArgs)
+                 {
+-                    const size_t start = extraArgs.find_first_not_of(' ', pos);
+-                    if (start == std::string::npos)
+-                        break;
+-                    const size_t end = extraArgs.find(' ', start);
+-                    args.push_back(extraArgs.substr(start, end == std::string::npos ? std::string::npos : end - start));
+-                    pos = end == std::string::npos ? extraArgs.size() : end;
+-                }
++                    if (c == '"')
++                        quoted = !quoted, inArg = true;
++                    else if (c == ' ' && !quoted)
++                    {
++                        if (inArg)
++                            args.push_back(cur);
+                         cur.clear();
+                         inArg = false;
+                     }

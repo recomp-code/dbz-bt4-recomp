@@ -59,8 +59,28 @@ the C# compiler that ships with Windows).
 - **Browser** (WebAssembly): the web runtime from [street-recomp-v3](https://github.com/recomp-code/street-recomp-v3) with Play!'s GS on WebGL2.
 
 **This repository contains no game data.** Bring your own disc image. The sources and patches contain no game code
-either: building generates it from your ELF. The one exception is the ready-to-play Windows zip in the releases, whose
-runner holds the game's code already recompiled from the Beta 14 Rev2 ELF (no ISO, ELF or disc files are in it).
+either: building generates it from your ELF. The exceptions are the ready-to-play Windows and Mac zips in the releases, whose
+runners hold the game's code already recompiled from the Beta 14 Rev2 ELF (no ISO, ELF or disc files are in it).
+
+## Download and play (Mac, nothing to compile)
+
+**[⬇ DBZ_BT4_Mac.zip](https://github.com/recomp-code/dbz-bt4-recomp/releases/download/v1.0-mac/DBZ_BT4_Mac.zip)** (Apple Silicon, macOS 14 or newer)
+
+1. Unzip it and drag `DBZ_BT4.app` to Applications (or anywhere).
+2. The app is not signed with an Apple developer account, so macOS blocks the first start. Open it once like this:
+   macOS 15 or newer: double-click it, press **Done**, then System Settings > Privacy & Security > **Open Anyway**;
+   macOS 14: right-click (Ctrl+click) > **Open** > **Open**. Or in Terminal: `xattr -dr com.apple.quarantine /Applications/DBZ_BT4.app`.
+3. Press **Seleccionar ISO…** and pick your own image of the mod (`SLUS-219.78`, Beta 14 Rev2), only the first time.
+4. Press **JUGAR**. Defaults: 60 fps fights, fullscreen and a quality picked for the chip (M Max / Ultra: 6x native;
+   M Pro: 4x; others: 3x upscaled to the screen with Apple MetalFX). The launcher lets you change each one and remembers it.
+
+Same game and same in-game menu as on Windows (F1 or hold START: internal resolution, MetalFX, 60 fps fights, FPS
+counter...), drawn by PCSX2's GS on Metal. Controllers that macOS supports (Xbox, PlayStation, MFi) and the keyboard
+work. Saves, options and logs live in `~/Library/Application Support/DBZ_BT4` (the app itself stays read-only).
+`open -a DBZ_BT4 --args --jugar` starts straight away with the saved options. The app holds the recompiled runner,
+PCSX2's GS host and its libraries, **not the disc**: the launcher copies the ELF and the IRX modules out of your ISO and
+the game streams everything else from it. Built with `macos/make_dist.sh` (see [the `macos/` folder](#layout)); the
+launcher's source is `macos/launcher/DBZ_BT4.swift`.
 
 ## Status (2026-10-18)
 
@@ -207,6 +227,8 @@ Test helpers (`native/`): `lrun.sh` (run live), `lshot.sh` (the host saves its o
 | `patches/bt3recomp-bt4mod-full.patch` | The whole current BT3-Recomp tree change on upstream `e22a34b` (`git apply` it alone; it contains every layered patch above plus the browser work). Adds GS -> EE downloads through the live ring: the game's frame read-backs (fight-start fade) are answered by PCSX2 (ring version 2, readback area after the events; version 1 rings are still accepted), and `sceGsExecLoadImage`/`StoreImage` take `vram_addr` as a block address (the old `* 2048 / 256` wrapped, so the fade drew texture data as garbage blocks for ~0.4 s). |
 | `patches/bt3recomp-bt4mod-windows.patch` | BT3-Recomp runtime, on top of `bt3recomp-bt4mod-full.patch`: the Windows live ring (version 2 with readback), PSMCT24 transfer size, `PS2X_PAD_SCRIPT`. See [Native Windows](#native-windows). |
 | `patches/pcsx2-gsrunner-dbz-windows.patch` | `pcsx2-gsrunner`, on top of the NBA port's tree + `pcsx2-gsrunner-live-dbz.patch`: ReadFIFO2 replies on Windows, the shared `Ps2LiveRing.h`. |
+| `patches/bt3recomp-bt4mod-macos-app.patch` | BT3-Recomp runtime, on top of `bt3recomp-bt4mod-windows.patch`: `PS2X_GSHOST_ARGS` takes "quoted" arguments (the Mac app's `-ini` path has spaces). |
+| `macos/` | The Mac package: `launcher/DBZ_BT4.swift` (AppKit launcher: ISO check and extraction, quality, 60 fps, fullscreen), `build_launcher.sh`, `build_ffmpeg.sh` (minimal static FFmpeg), `build_runner.sh` (runner for macOS 14+ with only system libraries), `make_dist.sh` (`DBZ_BT4.app`: dylibs into Frameworks, presets, icon, ad-hoc signature, zip), `Info.plist`, `settings.toml`, `LEEME.txt`. |
 | `windows/` | Windows launchers (`Jugar_DBZ*.cmd`), build scripts (`env.ps1`, `reconfigure.cmd`, `build_runner.cmd`, `build_pcsx2.cmd`, `make_patch.ps1`), `gshost/dbz.ini` (Vulkan, 6x) and `gshost/dbz_dlss.ini` (2x + DLSS), `iso_extract.py` (ISO9660 extractor), tests (`run_test.ps1`, `sheet.ps1`, `stack_snapshot.ps1`). |
 | `docs/screenshots/`, `docs/videos/` | Screenshots and the showcase video of the native Windows build. |
 | `gshost/dbz.ini` | PCSX2 GS settings, based on the Team BT4 1080p profile: 3x, merge PP sprites, TC offsets, 16:9. The `GameIndex.yaml` with the SLUS-21978 fixes comes from the Team BT4 PCSX2 extras. |

@@ -33,6 +33,11 @@ with `windows/record_video.ps1` + `windows/mux_video.ps1`.
 3. Press **JUGAR**. Everything starts on: 60 fps fights, fullscreen and the best quality for your GPU (NVIDIA RTX:
    DLSS, or "DLSS 5" when [DLSS 5 Swapper](#dlss-5-dlss-neural-rendering-experimental) is installed; other GPUs: 3x native).
    The launcher lets you change each one (6x / 3x native, 2x + DLSS / FSR, DLSS 5) and remembers it.
+4. **Your own DLSS:** drop a newer `nvngx_dlss.dll` into the `DLSS` folder (or onto the launcher window) and the game
+   uses it from the next start; with several, the newest version wins, and removing it goes back to the bundled one
+   (310.9.1). Files are recognised by their version info, so the name does not matter, and ARM builds are ignored. For
+   DLSS 5 without DLSS 5 Swapper, the same folder takes `nvngx_dlssnr.dll`, `ReShade64.dll` and `renodx-dlss5.addon64`.
+   The launcher shows which version is in use.
 
 Needs Windows 10/11 64-bit and a GPU with Vulkan (DLSS on NVIDIA RTX, FSR on the rest). Xbox-style controllers and the
 keyboard work out of the box. **Hold START for 1.5 s** (or Back+Start, or F1) for the options menu: internal resolution,

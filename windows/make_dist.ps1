@@ -42,6 +42,18 @@ Copy-Item "$dist\gshost\dbz*.ini" "$dist\gshost\presets"
 # DLSS 5 preset (Direct3D 12 + DLSS, the neural pass on top) and its ReShade.ini; the launcher builds gshost_dlss5\ from
 # gshost\ plus DLSS 5 Swapper's ReShade / RenoDX DLSS 5 / nvngx_dlssnr.dll, none of which ship here.
 (Get-Content "$pr\dbz_dlss.ini") -replace '^Renderer = 14', 'Renderer = 15' | Set-Content "$dist\gshost\presets\dbz_dlss_dx12.ini" -Encoding ascii
+# the DLSS that ships lives in presets\ (once: it is 59 MB); on every start the launcher puts it, or the player's own
+# from DLSS\, next to the host
+Move-Item "$dist\gshost\nvngx_dlss.dll" "$dist\gshost\presets\"
+New-Item -ItemType Directory "$dist\DLSS" | Out-Null
+Set-Content "$dist\DLSS\LEEME.txt" -Encoding ascii -Value @(
+    "Pon aqui tus DLL de DLSS (o arrastralas sobre la ventana del launcher) y el juego las usa solo:",
+    "  nvngx_dlss.dll       DLSS (reescalado). Si hay varias, gana la version mas nueva. Si la quitas, vuelve la incluida.",
+    "Para DLSS 5 (NVIDIA RTX) sin DLSS 5 Swapper instalado, estos tres:",
+    "  nvngx_dlssnr.dll     pase neural de NVIDIA",
+    "  ReShade64.dll        ReShade 64 bits (con soporte de add-ons)",
+    "  renodx-dlss5.addon64 add-on RenoDX DLSS 5",
+    "Se reconocen por su informacion de version, asi que el nombre del archivo da igual (salvo el .addon64).")
 Get-Content "$R\gshost_hooktest\ReShade.ini" | Where-Object { $_ -notmatch '^IntermediateCachePath=' } |
     Set-Content "$dist\gshost\presets\ReShade.ini" -Encoding ascii
 

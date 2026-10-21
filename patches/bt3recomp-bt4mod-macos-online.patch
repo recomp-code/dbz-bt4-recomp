@@ -1,5 +1,8 @@
-macOS, on top of bt3recomp-bt4mod-windows.patch + bt3recomp-bt4mod-macos-app.patch: online play's [padfocus]
-(ps2_gs_live.cpp hostFocused): the controller counts only while the game's window is in front, asked to NSWorkspace.
+macOS, on top of bt3recomp-bt4mod-windows.patch + bt3recomp-bt4mod-macos-app.patch:
+- online play's [padfocus] (ps2_gs_live.cpp hostFocused): the controller counts only while the game's window is in
+  front, asked to NSWorkspace;
+- the fibers that online's virtual clock (PS2X_FIBERS=1) needs (ps2_fiber.cpp): _XOPEN_SOURCE before every header, or
+  ucontext_t has no room for the registers and swapcontext writes 816 bytes past each fiber, over the heap.
 
 diff --git a/ps2xRuntime/src/lib/ps2_gs_live.cpp b/ps2xRuntime/src/lib/ps2_gs_live.cpp
 index ea1f161..cc444e8 100644
@@ -52,3 +55,50 @@ index ea1f161..cc444e8 100644
  #else
          return true;
  #endif
+diff --git a/ps2xRuntime/src/lib/ps2_fiber.cpp b/ps2xRuntime/src/lib/ps2_fiber.cpp
+index fd34a9f..c2e521a 100644
+--- a/ps2xRuntime/src/lib/ps2_fiber.cpp
++++ b/ps2xRuntime/src/lib/ps2_fiber.cpp
+@@ -1,4 +1,11 @@
+ // [fibers] See include/runtime/ps2_fiber.h for why this exists.
++// macOS: _XOPEN_SOURCE has to come before ANY header. <cstdlib> already brings in ucontext_t, and without it the struct
++// has no room for the registers (56 bytes instead of 880 on arm64): getcontext/swapcontext then wrote 816 bytes past
++// every fiber, over the heap (a malloc freelist trap at the first GL shader link with PS2X_FIBERS=1).
++#if defined(__APPLE__) && !defined(_XOPEN_SOURCE)
++#  define _XOPEN_SOURCE 700
++#  define _DARWIN_C_SOURCE 1   // and keep the Darwin extensions (MAP_ANONYMOUS) that _XOPEN_SOURCE alone hides
++#endif
+ #include "runtime/ps2_fiber.h"
+ 
+ #include <cstdio>
+@@ -11,16 +18,16 @@
+ #  define WIN32_LEAN_AND_MEAN
+ #  include <windows.h>
+ #  define PS2X_FIBER_WIN 1
+-#elif defined(__APPLE__) || defined(__linux__) || defined(__unix__)
++#elif (defined(__APPLE__) || defined(__linux__) || defined(__unix__)) && !defined(__EMSCRIPTEN__)   // [web] no ucontext in wasm
+ // ucontext is deprecated on macOS but still present and functional; silence the deprecation there
+ // rather than carrying a third backend.
+-#  ifdef __APPLE__
+-#    define _XOPEN_SOURCE 700
+-#  endif
+ #  include <ucontext.h>
+ #  include <sys/mman.h>
+ #  include <unistd.h>
+ #  define PS2X_FIBER_UCTX 1
++#  ifdef __APPLE__
++static_assert(sizeof(ucontext_t) > sizeof(mcontext_t), "ucontext_t without its register area: _XOPEN_SOURCE came too late");
++#  endif
+ #else
+ #  define PS2X_FIBER_NONE 1
+ #endif
+@@ -252,7 +259,9 @@ bool ps2xFiberRestore(Ps2xFiber *f, const void *buf, size_t size)
+     // The context's fpregs pointer refers into the ucontext_t itself; restoring into the same
+     // object keeps it valid. The stack goes back to the same addresses it was copied from.
+     std::memcpy(&f->ctx, &ctx, sizeof ctx);
++#if defined(__linux__)
+     f->ctx.uc_mcontext.fpregs = &f->ctx.__fpregs_mem;
++#endif
+     std::memcpy(f->stack + f->stackSize - n, i, n);
+     return true;
+ #else

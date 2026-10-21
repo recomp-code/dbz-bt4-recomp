@@ -1320,3 +1320,61 @@ index f9163a8..9001a8a 100644
              {
                  std::memset(&out, 0, sizeof(out));
                  return;
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+index ff7444d..659de4b 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+@@ -308,6 +308,30 @@ namespace ps2_syscalls
+         for (const auto &kv : g_workerCtx) if (n < cap) out[n++] = kv.first;
+         return n;
+     }
++    // [dethash] The DEAD part of every worker thread's stack: from the stack's base up to the thread's current $sp
++    // (MIPS stacks grow down; nothing below $sp is live). What is left there is the residue of calls that already
++    // returned, and how far a busy thread got before a frame boundary leaves different residue on two machines
++    // with the same game state.
++    extern "C" int ps2xThreadDeadStacks(uint32_t *lo, uint32_t *hi, int cap)
++    {
++        std::vector<std::pair<int, uint32_t>> sps;
++        {
++            std::lock_guard<std::mutex> lk(g_workerCtxM);
++            for (const auto &kv : g_workerCtx)
++                if (kv.second) sps.emplace_back(kv.first, static_cast<uint32_t>(_mm_cvtsi128_si32(kv.second->r[29])));
++        }
++        int n = 0;
++        std::lock_guard<std::mutex> lk(g_thread_map_mutex);
++        for (const auto &e : sps)
++        {
++            auto it = g_threads.find(e.first);
++            if (it == g_threads.end() || !it->second || n >= cap) continue;
++            const uint32_t base = it->second->stack, size = it->second->stackSize;
++            if (base && size && e.second > base && e.second <= base + size)
++            { lo[n] = base; hi[n] = e.second; ++n; }
++        }
++        return n;
++    }
+     // [statesync] The kernel's view of a thread's park (status / wait kind / wait object), for the
+     // structural check before a synced state is adopted.
+     extern "C" bool ps2xKernelThreadWait(int tid, int *status, int *waitType, int *waitId)
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index ee80bab..54455bf 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -1,6 +1,8 @@
+ #include "Common.h"
+ #include "System.h"
+ 
++extern uint32_t g_ps2MainStackTop, g_ps2MainStackSize;   // [dethash] game_overrides.cpp
++
+ namespace ps2_syscalls
+ {
+     void GsSetCrt(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+@@ -691,6 +693,9 @@ namespace ps2_syscalls
+         }
+ 
+         sp &= ~0xFu;
++        // [dethash] the main thread's stack, for the state hash's dead-stack rule (game_overrides.cpp)
++        ::g_ps2MainStackTop = sp;
++        ::g_ps2MainStackSize = stackSizeSigned > 0 ? static_cast<uint32_t>(stackSizeSigned) : 0u;
+         setReturnU32(ctx, sp);
+     }
+ 

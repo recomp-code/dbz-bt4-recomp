@@ -1800,7 +1800,7 @@ index d6f75bd..866d2c4 100644
          // sceCdCLOCK format (BCD fields).
          clockData[0] = 0;
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
-index f9163a8..9001a8a 100644
+index f9163a8..330b415 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
 @@ -278,10 +278,31 @@ namespace ps2_stubs
@@ -1836,6 +1836,23 @@ index f9163a8..9001a8a 100644
              {
                  std::memset(&out, 0, sizeof(out));
                  return;
+@@ -826,6 +847,16 @@ namespace ps2_stubs
+                             {
+                                 continue;
+                             }
++                            // [netcard] The host's own files are not on a PS2 card: macOS leaves .DS_Store and ._*
++                            // (AppleDouble) in folders, Windows Thumbs.db / desktop.ini. Listed, they made the card a
++                            // different card on each machine -- the Mac's game saw one more entry (its '.' landed at
++                            // 0x4f8) and its memory-card window object diverged from the Windows one: the online
++                            // desync at frame 2400. A real card has no names starting with '.' besides "." and "..".
++                            const std::string lower = toLowerAscii(name);
++                            if (name[0] == '.' || lower == "thumbs.db" || lower == "desktop.ini")
++                            {
++                                continue;
++                            }
+ 
+                             std::error_code entryEc;
+                             const bool isDirectory = entry.is_directory(entryEc) && !entryEc;
 diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
 index ff7444d..659de4b 100644
 --- a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp

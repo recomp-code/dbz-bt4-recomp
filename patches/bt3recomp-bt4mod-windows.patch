@@ -555,7 +555,7 @@ index 0045f01..73e2da5 100644
      // the same mapping, after the data area (macOS: os_sync_wait_on_address, Linux: futex).
      // macOS limits shm names to 31 characters, so the base name is short.
 diff --git a/ps2xRuntime/src/lib/game_overrides.cpp b/ps2xRuntime/src/lib/game_overrides.cpp
-index 3c3d250..02338f2 100644
+index 3c3d250..05674cd 100644
 --- a/ps2xRuntime/src/lib/game_overrides.cpp
 +++ b/ps2xRuntime/src/lib/game_overrides.cpp
 @@ -38,6 +38,10 @@ extern std::atomic<uint64_t> g_seamHostChunks;  // [fightgate] the seam's host m
@@ -612,7 +612,7 @@ index 3c3d250..02338f2 100644
      void writeNeutralPadPacket(uint8_t *rdram, uint32_t bufAddr, uint32_t socket)
      {
          // TEST (env PS2X_SOUNDREADY): force the sound-ready flags that FUN_0026d9a0
-@@ -696,23 +722,59 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
+@@ -696,23 +722,60 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
          const uint16_t buttons = ps2_stubs::ps2xLivePadButtons(liveSlot, lx, ly, rx, ry);
          uint8_t b0 = static_cast<uint8_t>(buttons & 0xffu);
          uint8_t b1 = static_cast<uint8_t>((buttons >> 8) & 0xffu);
@@ -645,7 +645,8 @@ index 3c3d250..02338f2 100644
 +        // remote input that never arrives cannot hide behind both sides pressing the same pattern).
 +        static const bool s_menusOnly = [](){ const char *v = std::getenv("PS2X_AUTOSTART_MENUS_ONLY"); return v && v[0] == '1'; }();
 +        const bool fightNow = bt3FightNow();
-+        if (s_autostart && !(s_menusOnly && fightNow) &&
++        // [meet] not before the two games meet: the boot must be the same on both, whatever each one's test settings
++        if (s_autostart && !ps2NetMeetPending() && !(s_menusOnly && fightNow) &&
 +            (!g_padScriptTookOver.load(std::memory_order_relaxed) || (s_autoFight && fightNow)))
          {
              // In a fight START would only pause it: tap attacks and directions in bursts instead, so the fight stays live and busy (effects, blur,
@@ -677,7 +678,7 @@ index 3c3d250..02338f2 100644
              }
              else
              {
-@@ -724,7 +786,86 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
+@@ -724,7 +787,86 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
                  if (phase == 6u) { b1 = static_cast<uint8_t>(b1 & ~0x40u); b1 = static_cast<uint8_t>(b1 & ~0x80u); }   // CROSS+SQUARE (ki blast / rush)
              }
          }
@@ -734,7 +735,7 @@ index 3c3d250..02338f2 100644
 +            static const std::vector<Press> s_script = parse("PS2X_PAD_SCRIPT");
 +            static const std::vector<Press> s_script2 = parse("PS2X_PAD_SCRIPT_P2");
 +            const std::vector<Press> &script = (socket & 3u) == 0u ? s_script : s_script2;
-+            if (!s_script.empty() || !s_script2.empty())
++            if ((!s_script.empty() || !s_script2.empty()) && !ps2NetMeetPending())   // [meet] see the auto-start above
 +            {
 +                // PS2X_PAD_SCRIPT_STATE=fight: the clock starts with the fight itself (bt3FightNow), whatever its state number
 +                static const long s_baseState = [](){
@@ -765,7 +766,7 @@ index 3c3d250..02338f2 100644
          // live for the first <n> pad reads) or the g_ps2ForceSkipFrames countdown the FMV override
          // pokes to end the native movie. PS2X_FORCE_SKIP_BTNS=<hex> overrides the cleared bits.
          bool forceSkip = false;
-@@ -831,7 +972,8 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
+@@ -831,7 +973,8 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
              // In lockstep the host's P1 press crosses the wire, so injecting on the LOCAL player was right;
              // while a state sync is pending nothing crosses and each side drives its own menus, so it must
              // be injected on socket 0 whoever we are.
@@ -775,7 +776,7 @@ index 3c3d250..02338f2 100644
              if (injectHere && g_netJumpPressCross.load(std::memory_order_relaxed) > 0)
              {
                  g_netJumpPressCross.fetch_sub(1, std::memory_order_relaxed);
-@@ -850,6 +992,14 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
+@@ -850,6 +993,14 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
                  b0 = static_cast<uint8_t>(use.buttons & 0xFFu);
                  b1 = static_cast<uint8_t>((use.buttons >> 8) & 0xFFu);
                  rx = use.rx; ry = use.ry; lx = use.lx; ly = use.ly;
@@ -790,7 +791,7 @@ index 3c3d250..02338f2 100644
              }
              p[0] = b0; p[1] = b1; p[2] = rx; p[3] = ry; p[4] = lx; p[5] = ly;
              return;
-@@ -4499,6 +4649,8 @@ namespace
+@@ -4499,6 +4650,8 @@ namespace
          static const int s_env = [](){ const char *v = ::getenv("PS2X_NETVIEW");
                                         return (v && v[0]) ? std::atoi(v) : 0; }();
          const int s_player = s_env ? s_env : (ps2NetActive() ? ps2NetLocalPlayer() : 0);
@@ -799,7 +800,7 @@ index 3c3d250..02338f2 100644
          if (s_player == 1 || s_player == 2)
          {
              const uint32_t mode = getRegU32(ctx, 5);
-@@ -5267,7 +5419,73 @@ namespace
+@@ -5267,7 +5420,73 @@ namespace
      // EE RAM only, deliberately: guest state lives there, while the CPU context is transient
      // between frames and the R5900Context holds host pointers that would hash differently by
      // construction. ~2-3 ms/frame for 32 MB, which is fine for a diagnostic.
@@ -874,7 +875,7 @@ index 3c3d250..02338f2 100644
      {
          static const int s_every = [](){ const char *v = std::getenv("PS2X_DETHASH");
                                           const int n = (v && v[0]) ? std::atoi(v) : 0;
-@@ -5277,6 +5495,23 @@ namespace
+@@ -5277,6 +5496,23 @@ namespace
          const unsigned long long f = g_bt3FrameCount.load(std::memory_order_relaxed);
          if (f % (unsigned long long)s_every) return;
          const uint64_t h = XXH3_64bits(rdram, PS2_RAM_SIZE);
@@ -898,7 +899,7 @@ index 3c3d250..02338f2 100644
          // Second hash EXCLUDING the sound-stream / disc-stream window. Measured 2026-09-14: two
          // identical-input runs differ by only 12 bytes at frame 1 and 432 at frame 600, ALL of it
          // inside the sound stream control block at 0x2c9350 and its neighbours -- stream position
-@@ -5288,13 +5523,7 @@ namespace
+@@ -5288,13 +5524,7 @@ namespace
                                           return !(v && v[0] == '0'); }();
          if (s_skip)
          {
@@ -913,7 +914,7 @@ index 3c3d250..02338f2 100644
              // [dethash] also report the RNG STREAM. The user's concern is the classic desync
              // cause: if particles/effects draw from the same rand() sequence as gameplay and the
              // two machines consume it at different rates, every later gameplay roll drifts.
-@@ -6071,7 +6300,26 @@ namespace
+@@ -6071,7 +6301,26 @@ namespace
          // thing that says what is happening.
          if (!ps2xNetOverlayEnabled())
              return;
@@ -941,7 +942,7 @@ index 3c3d250..02338f2 100644
          // [netjump] `live` is NOT an entry gate any more, and that is the fix for the curtain that
          // never came down. It used to be one, and every path that CLEARS the curtain sits below
          // here -- so the moment the session died (Disconnect, the peer leaving, the fake switched
-@@ -6107,8 +6355,19 @@ namespace
+@@ -6107,8 +6356,19 @@ namespace
          // this state machine has to be reset per session, the armed gate flag included -- a gate
          // left armed from a failed attempt fires on the NEXT connect before the duel module is up.
          static uint64_t s_pulseStart = 0;
@@ -963,7 +964,7 @@ index 3c3d250..02338f2 100644
            s_desyncBase = ps2NetDesyncFrame();
            s_returnStart = 0;
            s_saidEntry = false;
-@@ -6219,6 +6478,10 @@ namespace
+@@ -6219,6 +6479,10 @@ namespace
              const uint32_t duelObj = rd32(rdram, 0x3b38e8u) & 0x1FFFFFFFu;
              if (!duelObj) return;                       // module still coming up: wait
              wr32(rdram, duelObj + 0x110u, 1u);          // 1P VS 2P
@@ -974,7 +975,7 @@ index 3c3d250..02338f2 100644
              // Take the battle type from the netplay session (the host stamps its choice into
              // every packet) instead of forcing Single -- this write is what the versus menu would
              // have made had the player navigated it, and the gate below reads it back out.
-@@ -6226,6 +6489,7 @@ namespace
+@@ -6226,6 +6490,7 @@ namespace
              wr32(rdram, duelObj + 0x118u, (uint32_t)ps2NetDpLimit());
              wr32(rdram, duelObj + 0x13cu, (uint32_t)ps2NetTimeLimit());
              bt3NetCommitTimeLimit(rdram, duelObj, &rd32, &wr32);
@@ -982,7 +983,7 @@ index 3c3d250..02338f2 100644
              std::fprintf(stderr, "[netjump] duelObj=0x%x: mode -> 1 (1P VS 2P), type -> %u, dp -> %u\n",
                           duelObj, (unsigned)ps2NetBattleType(), (unsigned)ps2NetDpLimit());
              // Advance with a PLAIN WRITE, not bt3MenuGoto: that helper needs the MAIN-MENU object
-@@ -6236,8 +6500,13 @@ namespace
+@@ -6236,8 +6501,13 @@ namespace
              // branches on this very slot -- 0x27 goes to the character-select handler at 0x352dd8.
              // Do NOT write the state here: the module must run its own 0x26 -> 0x27 path so
              // func_356090 loads the screen. Press confirm and let the game do it.
@@ -998,7 +999,7 @@ index 3c3d250..02338f2 100644
              s_step = 2; return;
          }
          if (s_step == 2)
-@@ -6328,6 +6597,52 @@ namespace
+@@ -6328,6 +6598,52 @@ namespace
                      g_netJumpState.store(3, std::memory_order_relaxed);   // 3 = returning: "Aborting..."
                      return;
                  }
@@ -1051,7 +1052,7 @@ index 3c3d250..02338f2 100644
                  if (duel && ((now - s_pulseStart) % 8u) == 0u)
                  {
                      // The project's own synthetic press, not g_netJumpPressCross: the retired page's
-@@ -6821,7 +7136,7 @@ namespace
+@@ -6821,7 +7137,7 @@ namespace
          // runs every frame whatever the UI is doing, and it is the only place with the guest RAM in
          // hand -- which the box's `dump` verb needs. The module throttles the actual stat().
          ps2xNotifyPollDropBox(ps2xDropBoxDir(), rdram);
@@ -1060,7 +1061,7 @@ index 3c3d250..02338f2 100644
          if (g_ps2StepCensus.load(std::memory_order_relaxed)) ps2StepCensusFrame(ctx);   // [stepcensus]
          ps2HalfStepFrame(ctx);        // [halfstep] (no-op unless configured; raises the macro switch on fight frames only)
          {   // [findclock] PS2X_FINDCLOCK=<start value>: when the fight gate opens, remember every 32-bit slot holding a value
-@@ -8348,3 +8663,6 @@ extern "C" int ps2xMenuSePlay(int bank, int idx)
+@@ -8348,3 +8664,6 @@ extern "C" int ps2xMenuSePlay(int bank, int idx)
  }
  
  

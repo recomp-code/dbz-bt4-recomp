@@ -1,0 +1,18 @@
+macOS GS host, on top of pcsx2-gsrunner-live-dbz.patch: Back + Start belongs to the Recomp launcher (it opens it over
+the game), so with Back held Start does not reach this host's menu; F1 and holding START still open it.
+
+diff --git a/pcsx2-gsrunner/Main.cpp b/pcsx2-gsrunner/Main.cpp
+index 737249e..d8e3062 100644
+--- a/pcsx2-gsrunner/Main.cpp
++++ b/pcsx2-gsrunner/Main.cpp
+@@ -2085,6 +2085,10 @@ static bool LivePlatformReadGamepad(u16* buttons)
+ 		return false;
+ 	*buttons = 0;
+ 	LiveMac::ReadGamepad(buttons);
++	// Back + Start opens the launcher over the game (it watches the pad itself): with Back held, Start does not
++	// count here, so the combo never opens this menu (F1 and holding START still do).
++	if (*buttons & LivePad::Back)
++		*buttons &= ~LivePad::Start;
+ 	return true;
+ }
+ 

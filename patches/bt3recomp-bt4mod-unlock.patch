@@ -1,0 +1,73 @@
+diff --git a/games/bt3/apply_patches.py b/games/bt3/apply_patches.py
+index 155692d..3ba43e3 100644
+--- a/games/bt3/apply_patches.py
++++ b/games/bt3/apply_patches.py
+@@ -146,6 +146,18 @@ PATCHES = [
+         "insert_after_anchor": SUNGLARE_SKIP,
+         "extra_include": "#include <cstdio>\n#include <cstdlib>\n",
+     },
++    {
++        # [bt3 patch: cheatslot] The unlock cheat's handler (0x299824: lui $a0,0x30; j func_266088;
++        # lw $a0,-0xd74($a0)) is the last instruction of FUN_00299630 in functions.csv, whose end
++        # (0x29982c) leaves out the jump's delay slot: the generated code called FUN_00266088 with
++        # $a0 = 0x300000 instead of the save data at *(u32 *)0x2ff28c, so the main-menu cheat set its
++        # flags in the wrong place and unlocked nothing. Run the delay slot before the jump.
++        "file": "FUN_00299630_0x299630.cpp",
++        "marker": "[bt3 patch: cheatslot]",
++        "anchor": "    // 0x299828: 0x8099822  j           func_266088\n",
++        "insert_after_anchor": "    // [bt3 patch: cheatslot] delay slot 0x29982c: lw $a0, -0xd74($a0)\n"
++                               "    SET_GPR_S32(ctx, 4, (int32_t)READ32(ADD32(GPR_U32(ctx, 4), 4294963852)));\n",
++    },
+ ]
+ 
+ 
+diff --git a/ps2xRuntime/src/lib/game_overrides.cpp b/ps2xRuntime/src/lib/game_overrides.cpp
+index 05674cd..6cc6c0e 100644
+--- a/ps2xRuntime/src/lib/game_overrides.cpp
++++ b/ps2xRuntime/src/lib/game_overrides.cpp
+@@ -6987,6 +6987,37 @@ namespace
+         s_last = st;
+     }
+ 
++    // [unlockall] PS2X_UNLOCK_ALL=1: everything unlocked from the start, as the main-menu cheat does (hold L1+R1:
++    // Down, Right, Triangle, Down, Left, Triangle, Up). The cheat handler (0x299824, every entry of the cheat table at
++    // 0x29966c) is just FUN_00266088(*(u32 *)0x2ff28c): it sets the progress flags in the save data (characters, stages,
++    // items at +0x2ec8, the masks at +0x2d58, the modes at +0x10). Run once, the first time the game reaches the menu
++    // flow (state 0x04: the memory card has been read by then), from this per-frame tick of the game thread, so an
++    // online match stays deterministic (FUN_00266088 draws one random number per item). The flags reach the memory
++    // card the next time the game saves, as with the cheat.
++    static void bt3UnlockAll(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        static const bool s_on = [](){ const char *v = std::getenv("PS2X_UNLOCK_ALL"); return v && v[0] && v[0] != '0'; }();
++        static bool s_done = false;
++        if (!s_on || s_done || !rdram) return;
++        const uint32_t stateObj = rd32(rdram, 0x2ff10cu) & 0x1FFFFFFFu;
++        const uint32_t save = rd32(rdram, 0x2ff28cu);
++        if (!stateObj || rd32(rdram, stateObj + 0x18u) != 0x04u || !save) return;
++        s_done = true;
++        R5900Context t = *ctx;   // a private context, ra = 0 so it returns to us; the stack below sp is free here
++        t.r[4] = _mm_set_epi64x(0, (int64_t)(int32_t)save);
++        t.r[31] = _mm_setzero_si128();
++        t.pc = 0x00266088u;
++        uint32_t steps = 0u;
++        while (t.pc != 0u && steps++ < 100000u)
++        {
++            PS2Runtime::RecompiledFunction f = runtime->lookupFunction(t.pc);
++            if (!f) break;
++            f(rdram, &t, runtime);
++        }
++        std::fprintf(stderr, "[unlockall] frame %llu: FUN_00266088(0x%x) ran %u steps\n",
++                     (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed), save, steps);
++    }
++
+     extern "C" void ps2xFrameGateWait(uint64_t frame, uint8_t *rdram, R5900Context *ctx);   // [rollback] ps2_runtime.cpp
+     extern "C" bool ps2xFrameStepOn();                                                        // [rollback] ps2_runtime.cpp
+     extern "C" bool ps2xRenderSkipOn();                                                       // [rollback] ps2_memory.cpp
+@@ -7114,6 +7145,7 @@ namespace
+                 }
+         }
+         bt3StateWatch(rdram, ctx);   // [statewatch]
++        bt3UnlockAll(rdram, ctx, runtime);   // [unlockall]
+         bt3MatchWatch(rdram);        // [matchwatch]
+         bt3MatchScan(rdram);         // [matchwatch] level 2
+         bt3MemWatch(rdram);          // [memwatch]

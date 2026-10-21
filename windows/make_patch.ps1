@@ -1,4 +1,4 @@
-﻿# Regenera los parches propios de Windows:
+# Regenera los parches propios de Windows:
 #  patches\bt3recomp-bt4mod-windows.patch  sobre BT3-Recomp e22a34b + dbz-bt4-recomp\patches\bt3recomp-bt4mod-full.patch
 #    (bt3mod tiene encima macos + perf + unlock + netstats: se quitan de una copia antes de sacar el diff)
 #  patches\pcsx2-gsrunner-dbz-windows.patch sobre el arbol PCSX2 de NBA + dbz-bt4-recomp\patches\pcsx2-gsrunner-live-dbz.patch
@@ -50,7 +50,7 @@ $ok1 = $LASTEXITCODE -eq 0
 
 # 2. Host (PCSX2): los archivos de la NBA con el parche DBZ aplicado, contra los de C:\DBZBT4Recomp\pcsx2
 $hb = "$R\tmp_host"
-$hf = @('pcsx2/GSDumpReplayer.cpp', 'pcsx2/GSDumpReplayer.h', 'pcsx2/Ps2LiveRing.h', 'pcsx2-gsrunner/Main.cpp')
+$hf = @('pcsx2/GSDumpReplayer.cpp', 'pcsx2/GSDumpReplayer.h', 'pcsx2/Ps2LiveRing.h', 'pcsx2-gsrunner/Main.cpp', 'pcsx2/ImGui/ImGuiManager.cpp')
 Remove-Item -Recurse -Force $hb -ErrorAction SilentlyContinue
 foreach ($rel in $hf) { $d = Join-Path $hb $rel; New-Item -ItemType Directory -Force (Split-Path $d) | Out-Null; Copy-Item "C:\NBAStreetRecomp\pcsx2\$rel" $d }
 & $g -C $hb init -q

@@ -1,5 +1,8 @@
-macOS GS host, on top of pcsx2-gsrunner-live-dbz.patch: Back + Start belongs to the Recomp launcher (it opens it over
-the game), so with Back held Start does not reach this host's menu; F1 and holding START still open it.
+macOS GS host, on top of pcsx2-gsrunner-live-dbz.patch:
+- Back + Start belongs to the Recomp launcher (it opens it over the game), so with Back held Start does not reach this
+  host's menu; F1 and holding START still open it;
+- Quit (Cmd+Q, the Dock, a logout) stops the VM in order like closing the window: [NSApp terminate:] called exit() with
+  the GS running and the static destructors crashed (GSTextureCache, a crash report on every quit).
 
 diff --git a/pcsx2-gsrunner/Main.cpp b/pcsx2-gsrunner/Main.cpp
 index 737249e..d8e3062 100644
@@ -15,4 +18,50 @@ index 737249e..d8e3062 100644
 +		*buttons &= ~LivePad::Start;
  	return true;
  }
+ 
+diff --git a/pcsx2-gsrunner/LiveMac.mm b/pcsx2-gsrunner/LiveMac.mm
+index 4886320..8663e5c 100644
+--- a/pcsx2-gsrunner/LiveMac.mm
++++ b/pcsx2-gsrunner/LiveMac.mm
+@@ -10,6 +10,7 @@
+ 
+ #import <AppKit/AppKit.h>
+ #import <Carbon/Carbon.h> // kVK_* key codes
++#include <unistd.h> // _exit
+ #import <GameController/GameController.h>
+ 
+ #include <atomic>
+@@ -193,8 +194,33 @@ namespace
+ }
+ @end
+ 
++// Cmd+Q, Quit from the Dock or a logout: [NSApp terminate:] would call exit() with the GS still running, and the static
++// destructors then crashed in GSTextureCache (SIGSEGV, a crash report on every quit). Quit does what closing the window
++// does: the VM stops in order and the process ends on its own. A second quit while that runs ends it at once, with
++// _exit, never through the static destructors.
++@interface PS2RecompLiveAppDelegate : NSObject <NSApplicationDelegate>
++@end
++
++@implementation PS2RecompLiveAppDelegate
++- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication*)sender
++{
++	static bool s_asked = false;
++	if (s_asked || !s_callbacks.close)
++		_exit(0);
++	s_asked = true;
++	s_callbacks.close();
++	return NSTerminateCancel;
++}
++@end
++
+ void LiveMac::Install(void* window_handle, const Callbacks& cb)
+ {
++	static PS2RecompLiveAppDelegate* s_app_delegate = nil;
++	if (!s_app_delegate)
++	{
++		s_app_delegate = [[PS2RecompLiveAppDelegate alloc] init];
++		NSApp.delegate = s_app_delegate;
++	}
+ 	static PS2RecompLiveWindowDelegate* s_delegate = nil;
+ 	static id s_key_monitor = nil;
  

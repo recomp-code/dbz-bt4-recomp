@@ -1249,3 +1249,40 @@ index d6f75bd..866d2c4 100644
  
          // sceCdCLOCK format (BCD fields).
          clockData[0] = 0;
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
+index f9163a8..9001a8a 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
+@@ -278,10 +278,31 @@ namespace ps2_stubs
+             std::memcpy(dst, value.c_str(), value.size() + 1u);
+         }
+ 
++        // [netclock] PS2X_RTC set (online): every file reports that date, in UTC. The host's file times differ per
++        // machine (each one unpacked the shared card at its own moment, in its own time zone), and the game keeps the
++        // directory table it gets: 0x1eff... differed Mac vs Windows at frame 60, by the dates alone.
++        long long mcFixedTime()
++        {
++            static const long long s_rtc = [](){ const char *v = std::getenv("PS2X_RTC"); return (v && v[0]) ? std::atoll(v) : -1LL; }();
++            return s_rtc;
++        }
++
+         void writeMcDateTime(SceMcStDateTime &out, std::time_t value)
+         {
+             std::tm tm{};
+-            if (!localtimeSafeMc(&value, &tm))
++            bool ok;
++            if (mcFixedTime() >= 0)
++            {
++                value = static_cast<std::time_t>(mcFixedTime());
++#ifdef _WIN32
++                ok = gmtime_s(&tm, &value) == 0;
++#else
++                ok = gmtime_r(&value, &tm) != nullptr;
++#endif
++            }
++            else
++                ok = localtimeSafeMc(&value, &tm);
++            if (!ok)
+             {
+                 std::memset(&out, 0, sizeof(out));
+                 return;

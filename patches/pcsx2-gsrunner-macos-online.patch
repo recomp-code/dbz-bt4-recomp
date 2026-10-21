@@ -180,3 +180,24 @@ index 44ce030..d8ebfdd 100644
  	{
  		u8* out = static_cast<u8*>(dst);
  		while (size > 0)
+diff --git a/pcsx2-gsrunner/LiveMac.mm b/pcsx2-gsrunner/LiveMac.mm
+--- a/pcsx2-gsrunner/LiveMac.mm
++++ b/pcsx2-gsrunner/LiveMac.mm
+@@ -232,8 +232,16 @@ void LiveMac::Install(void* window_handle, const Callbacks& cb)
+ 
+ 	// Started from the game (a terminal process): come to the front with the keyboard focus.
+ 	// PS2X_HOST_NOACTIVATE=1 (automated tests): show the window without taking the focus.
++	// PS2X_HOST_NOACTIVATE=2 (tests while someone uses the Mac): an invisible window at the back that lets the clicks
++	// through. It still draws (PS2X_SHOT_DIR screenshots work); only its Dock icon shows.
+ 	const char* no_activate = std::getenv("PS2X_HOST_NOACTIVATE");
+-	if (no_activate && *no_activate == '1')
++	if (no_activate && *no_activate == '2')
++	{
++		window.alphaValue = 0.0;
++		window.ignoresMouseEvents = YES;
++		[window orderBack:nil];
++	}
++	else if (no_activate && *no_activate == '1')
+ 	{
+ 		[window orderFront:nil];
+ 	}

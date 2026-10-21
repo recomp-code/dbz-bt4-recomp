@@ -1221,7 +1221,7 @@ index c086d76..3a39975 100644
          else if (kind == 'j') { g_hs[(pc - kBase) >> 2] = 5; ++ni; }
          else if (kind == 'D') { g_hs[(pc - kBase) >> 2] = 6; ++ni; }   // duration assignment: value * 2 (pairs with a 'd' countdown)   // integer step: store old + (new - old) / 2 (ki drain/charge)
 diff --git a/ps2xRuntime/src/lib/ps2_netplay.cpp b/ps2xRuntime/src/lib/ps2_netplay.cpp
-index 33b15d8..ae7b76d 100644
+index 33b15d8..1d0beff 100644
 --- a/ps2xRuntime/src/lib/ps2_netplay.cpp
 +++ b/ps2xRuntime/src/lib/ps2_netplay.cpp
 @@ -18,7 +18,10 @@
@@ -1361,7 +1361,32 @@ index 33b15d8..ae7b76d 100644
      if (const char *t = std::getenv("PS2X_NET_TIMEOUT")) { const int v = std::atoi(t); if (v > 0) g.timeoutMs = (uint32_t)v; }
  
      g.sock = ::socket(AF_INET, SOCK_DGRAM, 0);
-@@ -681,9 +759,20 @@ void ps2NetInit()
+@@ -553,9 +631,24 @@ static void sendBye()
+ // latch likewise. Both are forward-declared above the teardown that needs them: a half-replayed
+ // canned sequence is session state like any other, and leaving it running is how a new session
+ // inherits the old one's cursor.
++// [netstatus] PS2X_NET_STATUS_FILE=<path>: one line for the launcher -- "online" once the two games meet, "offline
++// <why>" when the session ends -- so it can end the match on the server and stop showing it as being played while
++// the game goes on offline. Rewritten whole each time; the launcher polls it.
++static void netWriteStatus(const char *line)
++{
++    static const char *s_path = std::getenv("PS2X_NET_STATUS_FILE");
++    if (!s_path || !s_path[0]) return;
++    if (std::FILE *f = std::fopen(s_path, "wb")) { std::fprintf(f, "%s\n", line); std::fclose(f); }
++}
++
+ void ps2NetDisconnect(const char *why)
+ {
+     if (!g.active) return;
++    {
++        char line[160];
++        std::snprintf(line, sizeof line, "offline %s", why ? why : "requested");
++        netWriteStatus(line);
++    }
+     // [notify] Captured before the teardown clears it. A disconnect is announced even when the
+     // session never connected -- the player pressed Disconnect or Join failed, and either way the
+     // thing they asked for is not happening, which is worth one card. `why` goes on the card
+@@ -681,9 +774,20 @@ void ps2NetInit()
      done = true;
      const char *conn = std::getenv("PS2X_NET");
      const char *lis  = std::getenv("PS2X_NET_LISTEN");
@@ -1383,7 +1408,7 @@ index 33b15d8..ae7b76d 100644
      if (lis && lis[0]) ps2NetHost(std::atoi(lis), player);
      else               ps2NetJoin(conn, player);
  }
-@@ -700,6 +789,18 @@ static void sendHello()
+@@ -700,6 +804,18 @@ static void sendHello()
      // -- the listener learns the peer address from this. Gating sends on g.connected (which is
      // only set BY a receive) deadlocked both sides at tx 0, waiting for each other forever.
      if (!g.peerKnown) return;
@@ -1402,7 +1427,7 @@ index 33b15d8..ae7b76d 100644
      NetPkt p{};
      p.magic = kMagic; p.version = kVersion;
      p.player = static_cast<uint8_t>(g.localPlayer);
-@@ -762,9 +863,148 @@ uint32_t ps2NetRollbackPoll(uint32_t frameAbs, bool *mustStall)
+@@ -762,9 +878,149 @@ uint32_t ps2NetRollbackPoll(uint32_t frameAbs, bool *mustStall)
      return rb;
  }
  
@@ -1537,6 +1562,7 @@ index 33b15d8..ae7b76d 100644
 +        g.lastRx = clock::now();
 +    }
 +    g.met = true;
++    netWriteStatus("online");
 +    std::fprintf(stderr, "[meet] in step at frame %u: lockstep from the next frame, input delay %u\n", frameAbs, g.delay);
 +    s_why = "";
 +    return true;
@@ -1551,7 +1577,7 @@ index 33b15d8..ae7b76d 100644
      if (!g.connected || !g.synced) { sendHello(); pump(); return; }   // handshake / state sync only, no frame numbering yet
      const uint32_t frame = relFrame(frameAbs);
      Ps2xNetInput use = in;
-@@ -782,9 +1022,14 @@ void ps2NetSubmitLocal(uint32_t frameAbs, const Ps2xNetInput &in)
+@@ -782,9 +1038,14 @@ void ps2NetSubmitLocal(uint32_t frameAbs, const Ps2xNetInput &in)
  bool ps2NetGetInput(uint32_t frameAbs, int player, Ps2xNetInput &out)
  {
      if (!g.active || !g.connected || !g.synced) return false;   // pre-connection / pre-sync: leave the pads alone
@@ -1567,7 +1593,7 @@ index 33b15d8..ae7b76d 100644
      const auto t0 = std::chrono::steady_clock::now();
      bool stalled = false;
      for (;;)
-@@ -815,11 +1060,24 @@ bool ps2NetGetInput(uint32_t frameAbs, int player, Ps2xNetInput &out)
+@@ -815,11 +1076,24 @@ bool ps2NetGetInput(uint32_t frameAbs, int player, Ps2xNetInput &out)
              break;
          }
          pump();
@@ -1595,7 +1621,7 @@ index 33b15d8..ae7b76d 100644
          }
          stalled = true;
          std::this_thread::sleep_for(std::chrono::microseconds(250));
-@@ -851,8 +1109,7 @@ void ps2NetSetChecksum(uint32_t frame, uint64_t hash)
+@@ -851,8 +1125,7 @@ void ps2NetSetChecksum(uint32_t frame, uint64_t hash)
      {
          for (auto i = g.ourHash.begin(); i != g.ourHash.end();) i = (i->first + 600 < frame) ? g.ourHash.erase(i) : ++i;
          for (auto i = g.peerHash.begin(); i != g.peerHash.end();) i = (i->first + 600 < frame) ? g.peerHash.erase(i) : ++i;
@@ -1605,7 +1631,7 @@ index 33b15d8..ae7b76d 100644
  }
  
  // [flush] Why this exists at all.
-@@ -913,8 +1170,15 @@ static void netFlushCheck()
+@@ -913,8 +1186,15 @@ static void netFlushCheck()
  void ps2NetFrame(uint32_t frame)
  {
      if (!g.active) return;

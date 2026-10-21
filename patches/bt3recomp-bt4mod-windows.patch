@@ -988,10 +988,20 @@ index c086d76..3a39975 100644
          else if (kind == 'j') { g_hs[(pc - kBase) >> 2] = 5; ++ni; }
          else if (kind == 'D') { g_hs[(pc - kBase) >> 2] = 6; ++ni; }   // duration assignment: value * 2 (pairs with a 'd' countdown)   // integer step: store old + (new - old) / 2 (ki drain/charge)
 diff --git a/ps2xRuntime/src/lib/ps2_netplay.cpp b/ps2xRuntime/src/lib/ps2_netplay.cpp
-index 33b15d8..07abafa 100644
+index 33b15d8..0663a36 100644
 --- a/ps2xRuntime/src/lib/ps2_netplay.cpp
 +++ b/ps2xRuntime/src/lib/ps2_netplay.cpp
-@@ -92,7 +92,7 @@ struct Net
+@@ -18,7 +18,9 @@
+ //   PS2X_NET_TIMEOUT=<ms>    stall limit, default 2000
+ #include "runtime/ps2x_notify.h"   // [notify] the session cards and their sounds
+ 
++#include <algorithm>
+ #include <atomic>
++#include <cmath>
+ #include <cstddef>
+ #include <cstdint>
+ #include <cstdio>
+@@ -92,7 +94,7 @@ struct Net
      // chosen as if this were a 60 fps game. The delay only has to cover the network round trip:
      // 1 on loopback, 2 on a LAN, more only for a real internet link.
      uint32_t    delay    = 2;
@@ -1000,7 +1010,7 @@ index 33b15d8..07abafa 100644
      SOCKET      sock     = INVALID_SOCKET;
      sockaddr_in peer{};
      bool        peerKnown = false;
-@@ -140,6 +140,12 @@ struct Net
+@@ -140,11 +142,26 @@ struct Net
      SOCKET      syncListen = INVALID_SOCKET;
      bool        envDefaults = false;   // PS2X_NET_ROLLBACK / PS2X_NET_SYNC read once; the overlay may override
      uint32_t    desyncFrame = 0;       // [desyncdump] first frame whose confirmed hash differed (0 = none yet)
@@ -1013,7 +1023,21 @@ index 33b15d8..07abafa 100644
      uint32_t    checkEvery = 60;       // PS2X_NET_CHECKEVERY: confirmed-state checksum interval in frames
  };
  
-@@ -198,6 +204,19 @@ bool parseHostPort(const char *v, sockaddr_in &out)
+ Net g;
+ 
++// [autodelay] PS2X_NET_DELAY=auto: the input delay is measured on the real path (through the relay) when the two
++// connect, before the first frame. Player 1 pings player 2, picks the delay that covers half the round trip plus
++// some jitter, and tells player 2; both use the same value. Lockstep stalls whenever an input arrives later than
++// the delay: a fixed 3 frames (50 ms at 60 fps) made Mac <-> server <-> Windows wait 3.4 s of every 5.
++std::vector<uint64_t> g_rttUs;         // round trips measured by player 1
++uint32_t g_peerDelay = 0;              // player 2: the delay player 1 announced (0 = none yet)
++bool     g_delayAcked = false;         // player 1: player 2 confirmed it
++static bool autoDelayWanted() { const char *d = std::getenv("PS2X_NET_DELAY"); return d && std::strcmp(d, "auto") == 0; }
++
+ // [flush] Whether the session has entered the match flow, and how many frames it has then sat on the
+ // main menu. Per-session, so both are reset on connect and on teardown: a latch that outlived its
+ // session would fire on the next connect and drop a session that never left. It lives here, with
+@@ -198,6 +215,19 @@ bool parseHostPort(const char *v, sockaddr_in &out)
  void sendOurs(uint32_t frame)
  {
      if (!g.peerKnown) return;
@@ -1033,7 +1057,39 @@ index 33b15d8..07abafa 100644
      NetPkt p{};
      p.magic = kMagic; p.version = kVersion;
      p.player = static_cast<uint8_t>(g.localPlayer);
-@@ -681,9 +700,19 @@ void ps2NetInit()
+@@ -362,6 +392,22 @@ void pump()
+             if (g.listening && p.baseFrame == g.syncFrame) g.syncDone = true;
+             continue;
+         }
++        // [autodelay] 3 PING (echoed as 4 PONG with the same seq/time), 5 DELAY (player 1 -> 2: the input delay
++        // both will use), 6 ACK. Only before the first frame (netWaitConnected).
++        if (p.kind == 3u) { sendSyncCtl(4u, p.baseFrame, p.checksum, nullptr); continue; }
++        if (p.kind == 4u)
++        {
++            const uint64_t nowUs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
++                std::chrono::steady_clock::now().time_since_epoch()).count());
++            if (nowUs > p.checksum) g_rttUs.push_back(nowUs - p.checksum);
++            continue;
++        }
++        if (p.kind == 5u)
++        {
++            if (g.localPlayer == 2) { g_peerDelay = p.baseFrame; for (int i = 0; i < 3; ++i) sendSyncCtl(6u, p.baseFrame, 0u, nullptr); }
++            continue;
++        }
++        if (p.kind == 6u) { g_delayAcked = true; continue; }
+         if (g.fakeLagMs) g.held.emplace_back(std::chrono::steady_clock::now(), p);
+         else applyInputs(p);
+     }
+@@ -418,7 +464,7 @@ static bool netStart(const char *conn, int listenPort, int player)
+     (void)s_wsa;
+ #endif
+     g.localPlayer = (player == 2) ? 2 : 1;
+-    if (const char *d = std::getenv("PS2X_NET_DELAY")) { const int v = std::atoi(d); if (v >= 0 && v <= 20) g.delay = (uint32_t)v; }
++    if (const char *d = std::getenv("PS2X_NET_DELAY"); d && std::strcmp(d, "auto") != 0) { const int v = std::atoi(d); if (v >= 0 && v <= 20) g.delay = (uint32_t)v; }   // "auto": measured at connect ([autodelay])
+     if (const char *t = std::getenv("PS2X_NET_TIMEOUT")) { const int v = std::atoi(t); if (v > 0) g.timeoutMs = (uint32_t)v; }
+ 
+     g.sock = ::socket(AF_INET, SOCK_DGRAM, 0);
+@@ -681,9 +727,19 @@ void ps2NetInit()
      done = true;
      const char *conn = std::getenv("PS2X_NET");
      const char *lis  = std::getenv("PS2X_NET_LISTEN");
@@ -1054,7 +1110,7 @@ index 33b15d8..07abafa 100644
      if (lis && lis[0]) ps2NetHost(std::atoi(lis), player);
      else               ps2NetJoin(conn, player);
  }
-@@ -700,6 +729,18 @@ static void sendHello()
+@@ -700,6 +756,18 @@ static void sendHello()
      // -- the listener learns the peer address from this. Gating sends on g.connected (which is
      // only set BY a receive) deadlocked both sides at tx 0, waiting for each other forever.
      if (!g.peerKnown) return;
@@ -1073,7 +1129,7 @@ index 33b15d8..07abafa 100644
      NetPkt p{};
      p.magic = kMagic; p.version = kVersion;
      p.player = static_cast<uint8_t>(g.localPlayer);
-@@ -762,9 +803,36 @@ uint32_t ps2NetRollbackPoll(uint32_t frameAbs, bool *mustStall)
+@@ -762,9 +830,78 @@ uint32_t ps2NetRollbackPoll(uint32_t frameAbs, bool *mustStall)
      return rb;
  }
  
@@ -1095,6 +1151,48 @@ index 33b15d8..07abafa 100644
 +    if (!g.connected) { std::fprintf(stderr, "[netplay] the other player never came: playing offline\n"); ps2NetDisconnect("no peer"); return; }
 +    std::fprintf(stderr, "[netplay] the other player is here after %.1f s\n",
 +                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
++    if (!autoDelayWanted()) return;
++    using clock = std::chrono::steady_clock;
++    auto nowUs = [] { return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(clock::now().time_since_epoch()).count()); };
++    if (g.localPlayer == 1)
++    {   // 12 pings, 40 ms apart; the median round trip decides
++        g_rttUs.clear();
++        for (uint32_t i = 0; i < 12u; ++i)
++        {
++            sendSyncCtl(3u, i, nowUs(), nullptr);
++            const auto until = clock::now() + std::chrono::milliseconds(40);
++            while (clock::now() < until) { pump(); std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
++        }
++        const auto until = clock::now() + std::chrono::milliseconds(500);   // late pongs
++        while (g_rttUs.size() < 12u && clock::now() < until) { pump(); std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
++        std::vector<uint64_t> r = g_rttUs;
++        std::sort(r.begin(), r.end());
++        const double rttMs = r.empty() ? 150.0 : r[r.size() / 2] / 1000.0;
++        // one way = half the round trip, plus 8 ms of jitter, in 60 fps frames, plus one frame of margin
++        uint32_t d = static_cast<uint32_t>(std::ceil((rttMs / 2.0 + 8.0) / (1000.0 / 60.0))) + 1u;
++        d = std::min<uint32_t>(12u, std::max<uint32_t>(2u, d));
++        g.delay = d;
++        std::fprintf(stderr, "[netplay] round trip %.0f ms (%zu pings): input delay %u frames\n", rttMs, r.size(), d);
++        g_delayAcked = false;
++        const auto ackBy = clock::now() + std::chrono::seconds(5);
++        while (!g_delayAcked && clock::now() < ackBy)
++        {
++            sendSyncCtl(5u, d, 0u, nullptr);
++            const auto until2 = clock::now() + std::chrono::milliseconds(50);
++            while (!g_delayAcked && clock::now() < until2) { pump(); std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
++        }
++        if (!g_delayAcked) { std::fprintf(stderr, "[netplay] player 2 did not confirm the delay: ending the session\n"); ps2NetDisconnect("delay not agreed"); }
++    }
++    else
++    {   // answer the pings (pump echoes them) until player 1 announces the delay
++        const auto by = clock::now() + std::chrono::seconds(8);
++        while (g_peerDelay == 0u && clock::now() < by) { pump(); std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
++        if (g_peerDelay == 0u) { std::fprintf(stderr, "[netplay] player 1 did not announce the delay: ending the session\n"); ps2NetDisconnect("delay not agreed"); return; }
++        g.delay = g_peerDelay;
++        std::fprintf(stderr, "[netplay] input delay %u frames (chosen by player 1)\n", g.delay);
++        const auto drain = clock::now() + std::chrono::milliseconds(200);   // keep acking a repeated DELAY
++        while (clock::now() < drain) { pump(); std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
++    }
 +}
 +
 +void ps2NetWaitPeer()
@@ -1110,7 +1208,7 @@ index 33b15d8..07abafa 100644
      if (!g.connected || !g.synced) { sendHello(); pump(); return; }   // handshake / state sync only, no frame numbering yet
      const uint32_t frame = relFrame(frameAbs);
      Ps2xNetInput use = in;
-@@ -815,11 +883,24 @@ bool ps2NetGetInput(uint32_t frameAbs, int player, Ps2xNetInput &out)
+@@ -815,11 +952,24 @@ bool ps2NetGetInput(uint32_t frameAbs, int player, Ps2xNetInput &out)
              break;
          }
          pump();
@@ -1138,7 +1236,7 @@ index 33b15d8..07abafa 100644
          }
          stalled = true;
          std::this_thread::sleep_for(std::chrono::microseconds(250));
-@@ -851,8 +932,7 @@ void ps2NetSetChecksum(uint32_t frame, uint64_t hash)
+@@ -851,8 +1001,7 @@ void ps2NetSetChecksum(uint32_t frame, uint64_t hash)
      {
          for (auto i = g.ourHash.begin(); i != g.ourHash.end();) i = (i->first + 600 < frame) ? g.ourHash.erase(i) : ++i;
          for (auto i = g.peerHash.begin(); i != g.peerHash.end();) i = (i->first + 600 < frame) ? g.peerHash.erase(i) : ++i;

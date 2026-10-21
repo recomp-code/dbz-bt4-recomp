@@ -72,6 +72,8 @@ PCSX2 deps in `C:\NBAStreetRecomp` (LLVM 20, Ninja, CMake, MinGit; VS 2022 Build
 git clone https://github.com/z3xox/BT3-Recomp C:\DBZBT4Recomp\bt3mod && cd /d C:\DBZBT4Recomp\bt3mod && git checkout e22a34b
 git apply --exclude=ps2xRuntime/third_party/parallel-gs ..\dbz-bt4-recomp\patches\bt3recomp-bt4mod-full.patch
 git apply ..\dbz-bt4-recomp\patches\bt3recomp-bt4mod-windows.patch
+:: the shared layers on top (macos is a no-op on Windows, but perf applies on top of it): perf, unlock, netstats
+for %p in (macos perf unlock netstats) do git apply ..\dbz-bt4-recomp\patches\bt3recomp-bt4mod-%p.patch
 python ..\dbz-bt4-recomp\windows\iso_extract.py <iso> extract games\bt3\work   &:: 7-Zip fails on the three big AFS files
 set PS2X_SETUP_FORCE=1& set PS2X_SETUP_NO_SUBMODULES=1
 python games\bt3\setup.py games\bt3\work\SLUS_219.78 --stages 3-3 --jobs 20 --no-deps --non-interactive --no-package

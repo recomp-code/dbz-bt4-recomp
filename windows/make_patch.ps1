@@ -1,5 +1,6 @@
 ﻿# Regenera los parches propios de Windows:
 #  patches\bt3recomp-bt4mod-windows.patch  sobre BT3-Recomp e22a34b + dbz-bt4-recomp\patches\bt3recomp-bt4mod-full.patch
+#    (bt3mod tiene encima macos + perf + unlock + netstats: se quitan de una copia antes de sacar el diff)
 #  patches\pcsx2-gsrunner-dbz-windows.patch sobre el arbol PCSX2 de NBA + dbz-bt4-recomp\patches\pcsx2-gsrunner-live-dbz.patch
 $g = "C:\NBAStreetRecomp\tools\mingit\cmd\git.exe"
 $R = "C:\DBZBT4Recomp"
@@ -30,7 +31,19 @@ $rt = @('ps2xRuntime/src/lib/ps2_gs_live.cpp', 'ps2xRuntime/src/lib/ps2_live_rin
         'ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp',
         # strcmp/strncmp like newlib (the host CRTs differ: the Mac-vs-Windows desync)
         'ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp')
-Write-Diff 'C:/DBZBT4Recomp/tmp_base' 'C:/DBZBT4Recomp/bt3mod' $rt "$R\patches\bt3recomp-bt4mod-windows.patch"
+# The tree also has the patches that go on top of this one (macos, perf, unlock, netstats): take them back out of a
+# copy of the Windows files, so the Windows patch stays only the Windows work and the layers keep applying in order.
+$top = "$R\tmp_top"
+Remove-Item -Recurse -Force $top -ErrorAction SilentlyContinue
+foreach ($rel in $rt) { $d = Join-Path $top $rel; New-Item -ItemType Directory -Force (Split-Path $d) | Out-Null; Copy-Item "$R\bt3mod\$rel" $d }
+& $g -C $top init -q
+$inc = $rt | ForEach-Object { "--include=$_" }
+foreach ($layer in 'netstats', 'unlock', 'perf', 'macos') {
+    & $g -C $top apply -R --whitespace=nowarn @inc "$R\dbz-bt4-recomp\patches\bt3recomp-bt4mod-$layer.patch"
+    if ($LASTEXITCODE -ne 0) { throw "bt3recomp-bt4mod-$layer.patch no se puede quitar del arbol (no esta aplicado?)" }
+}
+Write-Diff 'C:/DBZBT4Recomp/tmp_base' 'C:/DBZBT4Recomp/tmp_top' $rt "$R\patches\bt3recomp-bt4mod-windows.patch"
+Remove-Item -Recurse -Force $top
 & $g -C $base apply --check "$R\patches\bt3recomp-bt4mod-windows.patch"
 $ok1 = $LASTEXITCODE -eq 0
 & $g -C "$R\bt3mod" worktree remove --force $base

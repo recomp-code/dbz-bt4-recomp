@@ -8,8 +8,104 @@ under __APPLE__). Determinism unchanged: an offline run keeps the Windows state 
   interactive QoS. The timer coalescing woke them 5 ms late on average (up to 8): frames reached the GS host
   16-24 ms apart and the 60 Hz display repeated ~10-15 a second. Now 16.7/16.9 ms, worst frame 17 ms.
   PS2X_VBLANK_PRECISE=0 restores the plain wait.
+- [storefast]/[hsfast] the store macros check inline whether a store can be a 60 fps site (pc in the site table or an
+  '@address' rule) and whether a write trace is armed; the calls ps2HalfStepWrite / ps2TraceGuestWrite paid on EVERY
+  store are gone (same results: those functions returned the value untouched for the others; a fight's state hashes
+  are identical to the previous build for 101 points).
 - [pacediag] PS2X_PACEDIAG=1: vblank-to-frame latency, frame gaps and the vblank worker's lateness every 5 s.
 
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 0b6f4a2..800ebc4 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -266,10 +266,36 @@ void ps2Set60Fps(bool on, const char *sitesPath);
+ inline bool ps2VStepActive() { return g_ps2VStepMode.load(std::memory_order_relaxed) != 0; }
+ extern std::atomic<uint64_t> g_ps2HalfStepLogicFrame;   // render frame of the last fight update: the gate
+ uint32_t ps2HalfStepWrite(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uint32_t value, const R5900Context *ctx);
++// [hsfast] the store macros call ps2HalfStepWrite only when this store CAN be a 60 fps site: its pc is in the site table
++// or its address is one of the '@address' rules. The rest of the stores (nearly all) skip the call; the result is the
++// same value ps2HalfStepWrite would have returned for them (it returns early without side effects).
++extern const uint8_t *g_ps2HsSites;          // per instruction of 0x100000-0x340000: non-zero = a site (ps2_stepcensus.cpp)
++extern int g_ps2HsAddrN;
++extern uint32_t g_ps2HsAddr[16];
++inline bool ps2HalfStepCandidate(uint32_t addr, const R5900Context *ctx)
++{
++    const uint32_t off = ctx->pc - 0x100000u;
++    if (off < 0x240000u && g_ps2HsSites && g_ps2HsSites[off >> 2]) return true;
++    if (g_ps2HsAddrN)
++    {
++        const uint32_t a = addr & 0x1FFFFFFFu;
++        for (int i = 0; i < g_ps2HsAddrN; ++i) if (g_ps2HsAddr[i] == a) return true;
++    }
++    return false;
++}
+ void ps2HalfStepWrite128(uint8_t *rdram, uint32_t guestAddr, uint64_t &lo, uint64_t &hi, const R5900Context *ctx);   // sqc2: 4 float lanes
+ void ps2HalfStepEnable(const char *sitesPath);
+ void ps2HalfStepFrame(const R5900Context *ctx);
+ 
++// [storefast] Every store of the recompiled code goes through ps2TraceGuestWrite; the whole body was too big to inline,
++// so each store paid a call just to read the (almost always clear) armed flag. The check is inline, the rest is not.
++#if defined(_MSC_VER) && !defined(__clang__)
++#define PS2X_NOINLINE __declspec(noinline)
++#else
++#define PS2X_NOINLINE __attribute__((noinline))
++#endif
++inline PS2X_NOINLINE void ps2TraceGuestWriteArmed(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uint64_t valueLo,
++                                                  uint64_t valueHi, const char *op, const R5900Context *ctx);
+ inline void ps2TraceGuestWrite(uint8_t *rdram,
+                                uint32_t guestAddr,
+                                uint32_t size,
+@@ -278,8 +304,18 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
+                                const char *op,
+                                const R5900Context *ctx)
+ {
+-    (void)rdram;
+     if (g_ps2TraceArmed.load(std::memory_order_relaxed) == 0u) return;   // [tracearm] nothing armed: one load per store
++    ps2TraceGuestWriteArmed(rdram, guestAddr, size, valueLo, valueHi, op, ctx);
++}
++inline PS2X_NOINLINE void ps2TraceGuestWriteArmed(uint8_t *rdram,
++                                                  uint32_t guestAddr,
++                                                  uint32_t size,
++                                                  uint64_t valueLo,
++                                                  uint64_t valueHi,
++                                                  const char *op,
++                                                  const R5900Context *ctx)
++{
++    (void)rdram;
+     if (g_ps2StepCensus.load(std::memory_order_relaxed) != 0) ps2StepCensusStore(rdram, guestAddr, size, valueLo, valueHi, ctx);   // [stepcensus]
+     const uint32_t _wlo = g_ps2WatchLo.load(std::memory_order_relaxed);
+     if (_wlo != 0u)
+diff --git a/ps2xRuntime/include/ps2_runtime_macros.h b/ps2xRuntime/include/ps2_runtime_macros.h
+index 85273db..b48d8b8 100644
+--- a/ps2xRuntime/include/ps2_runtime_macros.h
++++ b/ps2xRuntime/include/ps2_runtime_macros.h
+@@ -411,7 +411,7 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
+         else                                                                         \
+         {                                                                            \
+             ps2TraceGuestWrite(rdram, _addr, 1u, (uint8_t)(val), 0u, "WRITE8", ctx); \
+-            if (g_ps2HalfStep.load(std::memory_order_relaxed) != 0)                          \
++            if (g_ps2HalfStep.load(std::memory_order_relaxed) != 0 && ps2HalfStepCandidate(_addr, ctx)) \
+                 FAST_WRITE8(_addr, (uint8_t)ps2HalfStepWrite(rdram, _addr, 1u, (uint32_t)(uint8_t)(val), ctx)); \
+             else                                                                           \
+                 FAST_WRITE8(_addr, (val));                                               \
+@@ -427,7 +427,7 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
+         else                                                                           \
+         {                                                                              \
+             ps2TraceGuestWrite(rdram, _addr, 2u, (uint16_t)(val), 0u, "WRITE16", ctx); \
+-            if (g_ps2HalfStep.load(std::memory_order_relaxed) != 0)                          \
++            if (g_ps2HalfStep.load(std::memory_order_relaxed) != 0 && ps2HalfStepCandidate(_addr, ctx)) \
+                 FAST_WRITE16(_addr, (uint16_t)ps2HalfStepWrite(rdram, _addr, 2u, (uint32_t)(uint16_t)(val), ctx)); \
+             else                                                                           \
+                 FAST_WRITE16(_addr, (val));                                               \
+@@ -443,7 +443,7 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
+         else                                                                           \
+         {                                                                              \
+             ps2TraceGuestWrite(rdram, _addr, 4u, (uint32_t)(val), 0u, "WRITE32", ctx); \
+-            if (g_ps2HalfStep.load(std::memory_order_relaxed) != 0)                          \
++            if (g_ps2HalfStep.load(std::memory_order_relaxed) != 0 && ps2HalfStepCandidate(_addr, ctx)) \
+                 FAST_WRITE32(_addr, (uint32_t)ps2HalfStepWrite(rdram, _addr, 4u, (uint32_t)(uint32_t)(val), ctx)); \
+             else                                                                           \
+                 FAST_WRITE32(_addr, (val));                                               \
 diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Interrupt.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Interrupt.cpp
 index 676c442..04d9ccc 100644
 --- a/ps2xRuntime/src/lib/Kernel/Syscalls/Interrupt.cpp
@@ -443,3 +539,33 @@ index cb60e67..8036e29 100644
                      else if (now - nextVblank > period * 4) nextVblank = now;   // fell far behind: resync, do not burst
                  }
                  nextVblank += period;
+diff --git a/ps2xRuntime/src/lib/ps2_stepcensus.cpp b/ps2xRuntime/src/lib/ps2_stepcensus.cpp
+index 3a39975..1e139a7 100644
+--- a/ps2xRuntime/src/lib/ps2_stepcensus.cpp
++++ b/ps2xRuntime/src/lib/ps2_stepcensus.cpp
+@@ -350,6 +350,7 @@ void ps2StepCensusFrame(const R5900Context *ctx)
+ std::atomic<int> g_ps2VStepMode{0};      // [fps60] 0 = 30 fps (untouched), 1 = 60 fps (step 1 + pacing table)
+ static std::atomic<int> g_vstepWanted{-1};   // the overlay's wish; applied only BETWEEN fights (see ps2HalfStepFrame)
+ static std::atomic<int> g_vstepLoaded{0};
++const uint8_t *g_ps2HsSites = nullptr; int g_ps2HsAddrN = 0; uint32_t g_ps2HsAddr[16] = {};   // [hsfast] see ps2_runtime.h
+ std::atomic<int> g_ps2HalfStep{0};          // the macros' switch: raised by ps2HalfStepFrame only on fight frames
+ static std::atomic<int> g_hsEnabled{0};     // the experiment is configured
+ std::atomic<uint64_t> g_ps2HalfStepLogicFrame{0};
+@@ -719,6 +720,7 @@ void ps2HalfStepEnable(const char *sitesPath)
+     FILE *f = std::fopen(sitesPath, "r");
+     if (!f) { std::fprintf(stderr, "[halfstep] cannot read %s\n", sitesPath); return; }
+     g_hs = new uint8_t[(kEnd - kBase) >> 2]();
++    g_ps2HsSites = g_hs;   // [hsfast] the macros' pre-check reads the same table
+     g_hsLast = new HsEntry[kHsSize];
+     for (uint32_t i = 0; i < kHsSize; ++i) { g_hsLast[i].addr = 0xFFFFFFFFu; g_hsLast[i].frame = 0xFFFF0000u; g_hsLast[i].pc = 0; g_hsLast[i].halfRate = 0; g_hsLast[i].val = 0; }
+     char line[128]; unsigned nf = 0, ni = 0, nd = 0, nv = 0;
+@@ -729,7 +731,8 @@ void ps2HalfStepEnable(const char *sitesPath)
+             unsigned aa = 0; const char *q = line; while (*q == ' ' || *q == '\t') ++q;
+             if (*q == '@' && std::sscanf(q + 1, "%x %c", &aa, &kind) == 2)
+             {
+-                if (g_hsAddrN < 16) { g_hsAddr[g_hsAddrN] = aa & 0x1FFFFFFFu; g_hsAddrKind[g_hsAddrN] = kind; ++g_hsAddrN; ++ni; }
++                if (g_hsAddrN < 16) { g_hsAddr[g_hsAddrN] = aa & 0x1FFFFFFFu; g_hsAddrKind[g_hsAddrN] = kind; ++g_hsAddrN; ++ni;
++                                      g_ps2HsAddr[g_ps2HsAddrN++] = aa & 0x1FFFFFFFu; }   // [hsfast]
+                 continue;
+             }
+             kind = 0;

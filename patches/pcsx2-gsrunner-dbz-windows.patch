@@ -1,5 +1,5 @@
 diff --git a/pcsx2/GSDumpReplayer.cpp b/pcsx2/GSDumpReplayer.cpp
-index 2259b89..f99475d 100644
+index 2259b89..08e1c01 100644
 --- a/pcsx2/GSDumpReplayer.cpp
 +++ b/pcsx2/GSDumpReplayer.cpp
 @@ -119,6 +119,7 @@ namespace
@@ -29,7 +29,62 @@ index 2259b89..f99475d 100644
  #endif
  		}
  		break;
-@@ -1107,6 +1120,15 @@ bool GSDumpReplayer::AttachLiveRing(Error* error)
+@@ -929,12 +942,54 @@ static void RenderLiveMenu()
+ 	dl->AddText(font, font_size * 0.85f, ImVec2(p0.x + pad, y + line_h * 0.25f), IM_COL32(160, 160, 170, 255), s_menu_footer.c_str());
+ }
+ 
++// The online banner (RingHeader::netStatus, set by the game): a box at the top centre with what the online match
++// is doing. Drawn with each frame the game presents; while the game waits for the other player it presents none,
++// so the banner set just before that wait stays on screen.
++static void RenderLiveNetBanner()
++{
++	const u32 status = s_live.header ? s_live.header->netStatus : 0u;
++	if (status == 0u || status > 6u)
++		return;
++	static const std::string s_peer = [] {
++		const char* v = std::getenv("PS2X_NET_PEER_NAME");
++		return std::string((v && v[0]) ? v : "el otro jugador");
++	}();
++	std::string title, line;
++	ImU32 accent = IM_COL32(255, 160, 40, 255);
++	switch (status)
++	{
++		case 1: title = "Partida online"; line = "Preparando la partida con " + s_peer + "..."; break;
++		case 2: title = "Esperando a " + s_peer; line = "En el menu Multijugador. Empezais en cuanto llegue."; break;
++		case 3: title = "Conectado con " + s_peer; line = "El jugador 1 elige el modo."; accent = IM_COL32(90, 210, 120, 255); break;
++		case 4: title = "No se pudo conectar con " + s_peer; line = "Sigues jugando sin conexion."; accent = IM_COL32(230, 80, 70, 255); break;
++		case 5: title = "Estas en una partida online"; line = "Para salir, abre el launcher (Back + Start o Shift + Tab)."; break;
++		default: title = "Se perdio la conexion con " + s_peer; line = "Sigues jugando sin conexion."; accent = IM_COL32(230, 80, 70, 255); break;
++	}
++	const float scale = ImGuiManager::GetGlobalScale();
++	ImFont* const font = ImGuiManager::GetStandardFont();
++	const float font_size = ImGuiManager::GetFontSizeStandard() * 1.15f;
++	const float pad = std::ceil(14.0f * scale);
++	const ImVec2 ts = font->CalcTextSizeA(font_size * 1.2f, FLT_MAX, -1.0f, title.c_str());
++	const ImVec2 ls = font->CalcTextSizeA(font_size, FLT_MAX, -1.0f, line.c_str());
++	const float width = std::max(ts.x, ls.x) + pad * 2.0f;
++	const float height = ts.y + ls.y + pad * 2.0f + std::ceil(6.0f * scale);
++	const ImVec2 display = ImGui::GetIO().DisplaySize;
++	const ImVec2 p0((display.x - width) * 0.5f, std::ceil(24.0f * scale));
++	const ImVec2 p1(p0.x + width, p0.y + height);
++	ImDrawList* dl = ImGui::GetForegroundDrawList();
++	dl->AddRectFilled(p0, p1, IM_COL32(10, 10, 20, 225), 10.0f * scale);
++	dl->AddRect(p0, p1, accent, 10.0f * scale, 2.0f * scale);
++	dl->AddText(font, font_size * 1.2f, ImVec2(p0.x + pad, p0.y + pad), accent, title.c_str());
++	dl->AddText(font, font_size, ImVec2(p0.x + pad, p0.y + pad + ts.y + std::ceil(6.0f * scale)), IM_COL32(230, 230, 240, 255), line.c_str());
++}
++
+ void GSDumpReplayer::RenderUI()
+ {
+ #ifdef PS2X_LIVE_RING
+ 	// Playing a recompiled game live: no dump frame/packet counters on screen, only our menu.
+ 	if (s_live_mode)
+ 	{
++		RenderLiveNetBanner();
+ 		RenderLiveMenu();
+ 		return;
+ 	}
+@@ -1107,6 +1162,15 @@ bool GSDumpReplayer::AttachLiveRing(Error* error)
  		ps2live::objectName(ps2live::kDataEventName, s_live_ring_suffix).c_str());
  	s_live.space_event = OpenEventW(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE,
  		ps2live::objectName(ps2live::kSpaceEventName, s_live_ring_suffix).c_str());
@@ -45,7 +100,7 @@ index 2259b89..f99475d 100644
  	if (!s_live_ring_suffix.empty())
  	{
  		const DWORD pid = static_cast<DWORD>(std::wcstoul(s_live_ring_suffix.c_str(), nullptr, 10));
-@@ -1140,6 +1162,23 @@ void GSDumpReplayer::SetLivePad(u32 buttons, u32 axes)
+@@ -1140,6 +1204,23 @@ void GSDumpReplayer::SetLivePad(u32 buttons, u32 axes)
  #endif
  }
  
@@ -84,10 +139,10 @@ index 1db531a..2429598 100644
  	/// Writes a minimal dump (header + registers, no packets) to boot the replayer with.
  	bool WriteLiveBootDump(const std::string& path, Error* error);
 diff --git a/pcsx2/Ps2LiveRing.h b/pcsx2/Ps2LiveRing.h
-index 0045f01..fac0c83 100644
+index 0045f01..73e2da5 100644
 --- a/pcsx2/Ps2LiveRing.h
 +++ b/pcsx2/Ps2LiveRing.h
-@@ -53,7 +53,13 @@ namespace ps2live
+@@ -53,7 +53,19 @@ namespace ps2live
          volatile uint32_t consumerWaiting; // host blocked on the data event
          volatile uint32_t producerFlags;
          volatile uint32_t producerWaiting; // game blocked on the space event (ring full)
@@ -96,12 +151,18 @@ index 0045f01..fac0c83 100644
 +        // the game clears it once applied. Both fit in the padding of this cache line: the layout is unchanged.
 +        volatile uint32_t gameFps60;
 +        volatile uint32_t fps60Request;
++        // Online status the host draws as a banner over the game (the runtime has no window of its own on screen):
++        // 0 none, 1 preparing the match (the boot runs on its own), 2 waiting for the other player at the multiplayer
++        // menu, 3 connected, 4 could not connect (playing offline), 5 how to leave the online match (CIRCLE on a duel
++        // menu), 6 the connection was lost after the meeting. The other player's name is in the host's
++        // environment (PS2X_NET_PEER_NAME). Also in the padding: the layout is unchanged.
++        volatile uint32_t netStatus;
      };
 +    static_assert(sizeof(RingHeader) == 192, "the ring header layout is shared with older builds");
  
      // Object names for one game instance: base name + "_" + suffix (the game's process id, passed
      // to the host as "-livering <suffix>"), so several instances never share a ring.
-@@ -67,7 +73,35 @@ namespace ps2live
+@@ -67,7 +79,35 @@ namespace ps2live
          return reinterpret_cast<uint8_t *>(header) + sizeof(RingHeader);
      }
  

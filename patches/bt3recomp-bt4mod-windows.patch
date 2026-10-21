@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/src/lib/ps2_gs_live.cpp b/ps2xRuntime/src/lib/ps2_gs_live.cpp
-index 086b77e..f0c1a37 100644
+index 086b77e..973c0aa 100644
 --- a/ps2xRuntime/src/lib/ps2_gs_live.cpp
 +++ b/ps2xRuntime/src/lib/ps2_gs_live.cpp
 @@ -1,5 +1,5 @@
@@ -360,10 +360,23 @@ index 086b77e..f0c1a37 100644
                  }
  #endif
                  const char *path = std::getenv("PS2X_GS_DUMP");
-@@ -523,6 +807,23 @@ namespace ps2_gslive
+@@ -523,6 +807,36 @@ namespace ps2_gslive
  #endif
      }
  
++    void setNetStatus(uint32_t status)
++    {
++#if defined(PS2X_GS_LIVE_RING)
++        if (!requested())
++            return;
++        Writer &w = writer();
++        if (w.liveActive && w.live.header)
++            w.live.header->netStatus = status;
++#else
++        (void)status;
++#endif
++    }
++
 +    bool hostFocused()
 +    {
 +#if defined(PS2X_GS_LIVE_RING) && defined(_WIN32)
@@ -384,7 +397,7 @@ index 086b77e..f0c1a37 100644
      bool remotePad(uint32_t &buttons, uint32_t &axes)
      {
  #if defined(PS2X_GS_LIVE_RING)
-@@ -549,7 +850,8 @@ namespace ps2_gslive
+@@ -549,7 +863,8 @@ namespace ps2_gslive
          std::lock_guard<std::mutex> lock(w.mutex);
          if (!w.usable())
              return;
@@ -394,7 +407,7 @@ index 086b77e..f0c1a37 100644
      }
  
      void writeRegister(uint8_t reg, uint64_t value)
-@@ -590,6 +892,13 @@ namespace ps2_gslive
+@@ -590,6 +905,13 @@ namespace ps2_gslive
          const uint32_t qwc = bytes / 16u;
          if (qwc == 0u || !active())
              return false;
@@ -408,7 +421,7 @@ index 086b77e..f0c1a37 100644
          Writer &w = writer();
  #if defined(PS2X_GS_LIVE_RING) && !defined(PS2X_GS_LIVE_WEB) // the browser page does not answer (yet)
          uint32_t seq0 = 0;
-@@ -598,28 +907,29 @@ namespace ps2_gslive
+@@ -598,28 +920,29 @@ namespace ps2_gslive
              if (!w.usable())
                  return false;
              if (w.liveActive)
@@ -444,7 +457,7 @@ index 086b77e..f0c1a37 100644
          if (const char *dd = std::getenv("PS2X_READBACK_DUMP"); dd && dd[0])
          {   // [readback] raw copies for inspection: <dir>/rb_<n>.bin
              static uint32_t s_n = 0;
-@@ -691,17 +1001,33 @@ namespace ps2_gslive
+@@ -691,17 +1014,33 @@ namespace ps2_gslive
                      if (w.live.hostGone())
                          break;
                      w.live.header->producerWaiting = 1u;
@@ -481,10 +494,10 @@ index 086b77e..f0c1a37 100644
          ++w.statFrames;
          // PS2X_GS_DUMP_UNTIL=<file>: the dump is closed at the first frame after that file appears (test scripts cut a
 diff --git a/ps2xRuntime/src/lib/ps2_live_ring.h b/ps2xRuntime/src/lib/ps2_live_ring.h
-index 0045f01..fac0c83 100644
+index 0045f01..73e2da5 100644
 --- a/ps2xRuntime/src/lib/ps2_live_ring.h
 +++ b/ps2xRuntime/src/lib/ps2_live_ring.h
-@@ -53,7 +53,13 @@ namespace ps2live
+@@ -53,7 +53,19 @@ namespace ps2live
          volatile uint32_t consumerWaiting; // host blocked on the data event
          volatile uint32_t producerFlags;
          volatile uint32_t producerWaiting; // game blocked on the space event (ring full)
@@ -493,12 +506,18 @@ index 0045f01..fac0c83 100644
 +        // the game clears it once applied. Both fit in the padding of this cache line: the layout is unchanged.
 +        volatile uint32_t gameFps60;
 +        volatile uint32_t fps60Request;
++        // Online status the host draws as a banner over the game (the runtime has no window of its own on screen):
++        // 0 none, 1 preparing the match (the boot runs on its own), 2 waiting for the other player at the multiplayer
++        // menu, 3 connected, 4 could not connect (playing offline), 5 how to leave the online match (CIRCLE on a duel
++        // menu), 6 the connection was lost after the meeting. The other player's name is in the host's
++        // environment (PS2X_NET_PEER_NAME). Also in the padding: the layout is unchanged.
++        volatile uint32_t netStatus;
      };
 +    static_assert(sizeof(RingHeader) == 192, "the ring header layout is shared with older builds");
  
      // Object names for one game instance: base name + "_" + suffix (the game's process id, passed
      // to the host as "-livering <suffix>"), so several instances never share a ring.
-@@ -67,7 +73,35 @@ namespace ps2live
+@@ -67,7 +79,35 @@ namespace ps2live
          return reinterpret_cast<uint8_t *>(header) + sizeof(RingHeader);
      }
  
@@ -536,7 +555,7 @@ index 0045f01..fac0c83 100644
      // the same mapping, after the data area (macOS: os_sync_wait_on_address, Linux: futex).
      // macOS limits shm names to 31 characters, so the base name is short.
 diff --git a/ps2xRuntime/src/lib/game_overrides.cpp b/ps2xRuntime/src/lib/game_overrides.cpp
-index 3c3d250..3f76252 100644
+index 3c3d250..02338f2 100644
 --- a/ps2xRuntime/src/lib/game_overrides.cpp
 +++ b/ps2xRuntime/src/lib/game_overrides.cpp
 @@ -38,6 +38,10 @@ extern std::atomic<uint64_t> g_seamHostChunks;  // [fightgate] the seam's host m
@@ -550,7 +569,23 @@ index 3c3d250..3f76252 100644
  extern "C" bool ps2xFrameGateHeavy() { return g_ps2xFrameGateHeavy.load(std::memory_order_relaxed); }
  
  // [guestbusy-tid] FILE SCOPE, not inside bt3FrameKick. Declaring this extern "C" inside a function
-@@ -664,6 +668,26 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
+@@ -56,6 +60,7 @@ extern "C" unsigned long long ps2xWinThreadCpuNs();
+ #include "Kernel/Stubs/MemoryCard.h"   // [savestate] getMemoryCardDebugSnapshot (deferred quickload)
+ #include "runtime/ps2x_dueldump.h"
+ #include "runtime/ps2_netplay.h"   // [netplay]
++#include "runtime/ps2_gs_live.h"   // [meet] the online banner the GS host draws
+ #include "runtime/ps2_seamprobe.h"  // [seamprobe]
+ #include "runtime/ps2x_achieve.h"  // [ach]
+ #include "runtime/ps2x_notify.h"   // [notify] the drop box
+@@ -500,6 +505,7 @@ namespace
+     // module polls it -- it completes on a press, and no amount of variable writing substitutes
+     // for that loading. One press at a state we chose and can verify, not menu navigation.
+     std::atomic<int> g_netJumpPressCross{0};
++    std::atomic<bool> g_netLeaveHint{false};   // [meet] our player pressed CIRCLE on a duel menu: show how to leave
+ 
+     // [netjump] The player asking to abort, from CIRCLE. The ONLY new pad state this work needs:
+     // the freeze-with-an-exception and the two synthetic presses are the ones that already existed
+@@ -664,6 +670,26 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
      extern "C" int ps2xNetJumpSettledFor(uint32_t session)
      { return g_netJumpSession.load(std::memory_order_relaxed) == session && g_netJumpState.load(std::memory_order_relaxed) == 2; }
  
@@ -577,8 +612,27 @@ index 3c3d250..3f76252 100644
      void writeNeutralPadPacket(uint8_t *rdram, uint32_t bufAddr, uint32_t socket)
      {
          // TEST (env PS2X_SOUNDREADY): force the sound-ready flags that FUN_0026d9a0
-@@ -698,21 +722,40 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
+@@ -696,23 +722,59 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
+         const uint16_t buttons = ps2_stubs::ps2xLivePadButtons(liveSlot, lx, ly, rx, ry);
+         uint8_t b0 = static_cast<uint8_t>(buttons & 0xffu);
          uint8_t b1 = static_cast<uint8_t>((buttons >> 8) & 0xffu);
++        // [meet] Online, before the two games meet at the multiplayer menu: each boots alone, so the boot must be the
++        // same on both machines -- no player's pad at all. Pad 1 instead taps START + CROSS (skips the intro movie,
++        // passes the title) and LEFT ("Si" to the memory-card questions), counted in pad reads, until the main menu;
++        // from there the netjump drives the menus. Every press is a function of the read count, never of the clock.
++        if (ps2NetMeetPending())
++        {
++            b0 = b1 = 0xffu; lx = ly = rx = ry = 0x80u;
++            static uint32_t s_reads = 0;
++            static bool s_atMenu = false;
++            if (g_bt3StateLive.load(std::memory_order_relaxed) == 0x04u) s_atMenu = true;
++            if ((socket & 3u) == 0u && !s_atMenu)
++            {
++                const uint32_t n = s_reads++ % 60u;
++                if (n < 6u) { b0 = static_cast<uint8_t>(b0 & ~0x08u); b1 = static_cast<uint8_t>(b1 & ~0x40u); }   // START + CROSS
++                else if (n >= 30u && n < 36u) b0 = static_cast<uint8_t>(b0 & ~0x80u);                            // LEFT
++            }
++        }
          // TEST (env PS2X_AUTOSTART): also tap START+CROSS periodically to auto-advance.
          static const bool s_autostart = [](){ const char *v = std::getenv("PS2X_AUTOSTART"); return v && v[0] && v[0] != '0'; }();
 -        if (s_autostart)
@@ -623,7 +677,7 @@ index 3c3d250..3f76252 100644
              }
              else
              {
-@@ -724,7 +767,86 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
+@@ -724,7 +786,86 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
                  if (phase == 6u) { b1 = static_cast<uint8_t>(b1 & ~0x40u); b1 = static_cast<uint8_t>(b1 & ~0x80u); }   // CROSS+SQUARE (ki blast / rush)
              }
          }
@@ -711,7 +765,32 @@ index 3c3d250..3f76252 100644
          // live for the first <n> pad reads) or the g_ps2ForceSkipFrames countdown the FMV override
          // pokes to end the native movie. PS2X_FORCE_SKIP_BTNS=<hex> overrides the cleared bits.
          bool forceSkip = false;
-@@ -4499,6 +4621,8 @@ namespace
+@@ -831,7 +972,8 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
+             // In lockstep the host's P1 press crosses the wire, so injecting on the LOCAL player was right;
+             // while a state sync is pending nothing crosses and each side drives its own menus, so it must
+             // be injected on socket 0 whoever we are.
+-            const bool injectHere = ps2NetSyncPending() ? (pl == 1) : (pl == ps2NetLocalPlayer());
++            // [meet] before the two meet nothing crosses either: socket 0 on both machines, like the state sync.
++            const bool injectHere = (ps2NetSyncPending() || ps2NetMeetPending()) ? (pl == 1) : (pl == ps2NetLocalPlayer());
+             if (injectHere && g_netJumpPressCross.load(std::memory_order_relaxed) > 0)
+             {
+                 g_netJumpPressCross.fetch_sub(1, std::memory_order_relaxed);
+@@ -850,6 +992,14 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
+                 b0 = static_cast<uint8_t>(use.buttons & 0xFFu);
+                 b1 = static_cast<uint8_t>((use.buttons >> 8) & 0xFFu);
+                 rx = use.rx; ry = use.ry; lx = use.lx; ly = use.ly;
++                // [meet] Online, the duel menus have no way back: CIRCLE there walks out to the main menu, which ends
++                // the session. Taken off the input both machines apply (so both drop it on the same frame); the one
++                // who pressed it is told how to leave instead.
++                if (ps2NetMeetMode() && pl == 1 && g_bt3StateLive.load(std::memory_order_relaxed) == 0x26u && (b1 & 0x20u) == 0u)
++                {
++                    b1 = static_cast<uint8_t>(b1 | 0x20u);
++                    if (pl == ps2NetLocalPlayer()) g_netLeaveHint.store(true, std::memory_order_relaxed);
++                }
+             }
+             p[0] = b0; p[1] = b1; p[2] = rx; p[3] = ry; p[4] = lx; p[5] = ly;
+             return;
+@@ -4499,6 +4649,8 @@ namespace
          static const int s_env = [](){ const char *v = ::getenv("PS2X_NETVIEW");
                                         return (v && v[0]) ? std::atoi(v) : 0; }();
          const int s_player = s_env ? s_env : (ps2NetActive() ? ps2NetLocalPlayer() : 0);
@@ -720,7 +799,7 @@ index 3c3d250..3f76252 100644
          if (s_player == 1 || s_player == 2)
          {
              const uint32_t mode = getRegU32(ctx, 5);
-@@ -5267,7 +5391,36 @@ namespace
+@@ -5267,7 +5419,73 @@ namespace
      // EE RAM only, deliberately: guest state lives there, while the CPU context is transient
      // between frames and the R5900Context holds host pointers that would hash differently by
      // construction. ~2-3 ms/frame for 32 MB, which is fine for a diagnostic.
@@ -754,11 +833,48 @@ index 3c3d250..3f76252 100644
 +        return out;
 +    }
 +
++    // [dethash] The gameplay hash: EE RAM minus what legitimately differs between two machines running the same game
++    // (see the notes inside). The per-frame desync check and the [meet] at the multiplayer menu both use it.
++    static uint64_t ps2DetGameplayHash(const uint8_t *rdram, uint32_t mainSp)
++    {
++        constexpr uint32_t kStreamLo = 0x002c0000u, kStreamHi = 0x00300000u;   // sndblk dumps reach 0x2f72a0
++        // [dethash] also minus the memory a GS readback filled with pixels from this machine's GPU (measured
++        // 2026-10-20: 633 KB at 0x1bc7ee6.. differed at frame 10320 of a fight while the RNG, timer and health
++        // matched). Two machines -- above all Windows vs macOS -- never render bit for bit alike.
++        std::vector<std::pair<uint32_t, uint32_t>> skip = ps2xHostDataRanges(rdram);
++        skip.emplace_back(kStreamLo, kStreamHi);
++        // [dethash] and minus the dead part of every thread stack (below its $sp): Mac vs Windows at frame 60,
++        // the only gameplay-hash difference was 0x1effa00-0x1effbff, below the main thread's $sp -- residue of a
++        // disc lookup on one machine, of the next thread's creation on the other, the same work done either side
++        // of the frame boundary. The live frames above $sp stay in.
++        {
++            const uint32_t mainLo = g_ps2MainStackTop - g_ps2MainStackSize;
++            if (g_ps2MainStackSize && mainSp > mainLo && mainSp <= g_ps2MainStackTop)
++                skip.emplace_back(mainLo, mainSp);
++            uint32_t lo[64], hi[64];
++            const int n = ps2xThreadDeadStacks(lo, hi, 64);
++            for (int i = 0; i < n; ++i) skip.emplace_back(lo[i], hi[i]);
++        }
++        std::sort(skip.begin(), skip.end());
++        XXH3_state_t *st = XXH3_createState();
++        XXH3_64bits_reset(st);
++        uint32_t at = 0;
++        for (const auto &r : skip)
++        {
++            if (r.first > at) XXH3_64bits_update(st, rdram + at, r.first - at);
++            at = std::max(at, r.second);
++        }
++        if (at < PS2_RAM_SIZE) XXH3_64bits_update(st, rdram + at, PS2_RAM_SIZE - at);
++        const uint64_t g = XXH3_64bits_digest(st);
++        XXH3_freeState(st);
++        return g;
++    }
++
 +    static void ps2DetHashFrame(const uint8_t *rdram, __m128 ctxR, uint32_t mainSp)
      {
          static const int s_every = [](){ const char *v = std::getenv("PS2X_DETHASH");
                                           const int n = (v && v[0]) ? std::atoi(v) : 0;
-@@ -5277,6 +5430,23 @@ namespace
+@@ -5277,6 +5495,23 @@ namespace
          const unsigned long long f = g_bt3FrameCount.load(std::memory_order_relaxed);
          if (f % (unsigned long long)s_every) return;
          const uint64_t h = XXH3_64bits(rdram, PS2_RAM_SIZE);
@@ -782,59 +898,91 @@ index 3c3d250..3f76252 100644
          // Second hash EXCLUDING the sound-stream / disc-stream window. Measured 2026-09-14: two
          // identical-input runs differ by only 12 bytes at frame 1 and 432 at frame 600, ALL of it
          // inside the sound stream control block at 0x2c9350 and its neighbours -- stream position
-@@ -5289,10 +5459,33 @@ namespace
+@@ -5288,13 +5523,7 @@ namespace
+                                          return !(v && v[0] == '0'); }();
          if (s_skip)
          {
-             constexpr uint32_t kStreamLo = 0x002c0000u, kStreamHi = 0x00300000u;   // sndblk dumps reach 0x2f72a0
-+            // [dethash] also minus the memory a GS readback filled with pixels from this machine's GPU (measured
-+            // 2026-10-20: 633 KB at 0x1bc7ee6.. differed at frame 10320 of a fight while the RNG, timer and health
-+            // matched). Two machines -- above all Windows vs macOS -- never render bit for bit alike.
-+            std::vector<std::pair<uint32_t, uint32_t>> skip = ps2xHostDataRanges(rdram);
-+            skip.emplace_back(kStreamLo, kStreamHi);
-+            // [dethash] and minus the dead part of every thread stack (below its $sp): Mac vs Windows at frame 60,
-+            // the only gameplay-hash difference was 0x1effa00-0x1effbff, below the main thread's $sp -- residue of a
-+            // disc lookup on one machine, of the next thread's creation on the other, the same work done either side
-+            // of the frame boundary. The live frames above $sp stay in.
-+            {
-+                const uint32_t mainLo = g_ps2MainStackTop - g_ps2MainStackSize;
-+                if (g_ps2MainStackSize && mainSp > mainLo && mainSp <= g_ps2MainStackTop)
-+                    skip.emplace_back(mainLo, mainSp);
-+                uint32_t lo[64], hi[64];
-+                const int n = ps2xThreadDeadStacks(lo, hi, 64);
-+                for (int i = 0; i < n; ++i) skip.emplace_back(lo[i], hi[i]);
-+            }
-+            std::sort(skip.begin(), skip.end());
-             XXH3_state_t *st = XXH3_createState();
-             XXH3_64bits_reset(st);
+-            constexpr uint32_t kStreamLo = 0x002c0000u, kStreamHi = 0x00300000u;   // sndblk dumps reach 0x2f72a0
+-            XXH3_state_t *st = XXH3_createState();
+-            XXH3_64bits_reset(st);
 -            XXH3_64bits_update(st, rdram, kStreamLo);
 -            XXH3_64bits_update(st, rdram + kStreamHi, PS2_RAM_SIZE - kStreamHi);
-+            uint32_t at = 0;
-+            for (const auto &r : skip)
-+            {
-+                if (r.first > at) XXH3_64bits_update(st, rdram + at, r.first - at);
-+                at = std::max(at, r.second);
-+            }
-+            if (at < PS2_RAM_SIZE) XXH3_64bits_update(st, rdram + at, PS2_RAM_SIZE - at);
-             const uint64_t g = XXH3_64bits_digest(st);
-             XXH3_freeState(st);
+-            const uint64_t g = XXH3_64bits_digest(st);
+-            XXH3_freeState(st);
++            const uint64_t g = ps2DetGameplayHash(rdram, mainSp);
              // [dethash] also report the RNG STREAM. The user's concern is the classic desync
-@@ -6107,8 +6300,15 @@ namespace
+             // cause: if particles/effects draw from the same rand() sequence as gameplay and the
+             // two machines consume it at different rates, every later gameplay roll drifts.
+@@ -6071,7 +6300,26 @@ namespace
+         // thing that says what is happening.
+         if (!ps2xNetOverlayEnabled())
+             return;
+-        const bool live = ps2NetActive() && ps2NetPeerConnected();
++        // [meet] booting alone towards the meeting at the multiplayer menu counts as live: there is no peer yet, by design
++        const bool live = ps2NetActive() && (ps2NetPeerConnected() || ps2NetMeetPending());
++        // [meet] The banner over the game (drawn by the GS host): "preparing" while booting, "waiting" at the menu,
++        // then "connected" or "could not connect" for a few seconds. Host-only: nothing here touches the guest.
++        // 0 none, 1 preparing, 2 waiting, 3 connected, 4 could not connect, 5 how to leave, 6 connection lost.
++        static uint32_t s_banner = 0; static uint64_t s_bannerUntil = 0;
++        static bool s_prepared = false, s_wasMet = false;
++        auto banner = [&](uint32_t st, uint64_t frames) {
++            s_banner = st; s_bannerUntil = frames ? g_bt3FrameCount.load(std::memory_order_relaxed) + frames : 0;
++            ps2_gslive::setNetStatus(st); };
++        if (ps2NetMeetMode())
++        {
++            if (!s_prepared && ps2NetMeetPending()) { s_prepared = true; banner(1u, 0); }
++            const bool metNow = ps2NetActive() && !ps2NetMeetPending();
++            if (s_wasMet && !metNow) banner(6u, 420u);   // the session ended after the meeting
++            s_wasMet = metNow;
++            if (g_netLeaveHint.exchange(false, std::memory_order_relaxed) && metNow) banner(5u, 300u);
++            if (s_bannerUntil && g_bt3FrameCount.load(std::memory_order_relaxed) >= s_bannerUntil) banner(0u, 0);
++            ps2_gslive::setNetStatus(s_banner);   // every frame: the host's ring may open after the first one
++        }
+         // [netjump] `live` is NOT an entry gate any more, and that is the fix for the curtain that
+         // never came down. It used to be one, and every path that CLEARS the curtain sits below
+         // here -- so the moment the session died (Disconnect, the peer leaving, the fake switched
+@@ -6107,8 +6355,19 @@ namespace
          // this state machine has to be reset per session, the armed gate flag included -- a gate
          // left armed from a failed attempt fires on the NEXT connect before the duel module is up.
          static uint64_t s_pulseStart = 0;
+-        if (s_session != ps2NetSession())
+-        { s_session = ps2NetSession(); s_step = 0; s_waitUntil = 0; s_pulseStart = 0; s_sawDuel = false;
 +        // [netjump] PS2X_NET_JUMP_STOP=menu: stop at the battle-type menu (see step 2); its one press, per session
 +        // (=vs, for tests: stop one screen earlier, on the versus-mode screen, with no press at all)
 +        static const int s_menuStopEnv = [](){ const char *v = std::getenv("PS2X_NET_JUMP_STOP");
 +                                               return !v ? 0 : std::strcmp(v, "menu") == 0 ? 1 : std::strcmp(v, "vs") == 0 ? 2 : 0; }();
 +        static const bool s_menuStop = s_menuStopEnv != 0;
 +        static bool s_menuPressed = false; static uint64_t s_menuPressAt = 0;
-         if (s_session != ps2NetSession())
-         { s_session = ps2NetSession(); s_step = 0; s_waitUntil = 0; s_pulseStart = 0; s_sawDuel = false;
-+          s_menuPressed = false; s_menuPressAt = 0;
++        static uint64_t s_meetAt = 0;   // [meet] the frame the "waiting" banner went up
++        // [meet] One session for the whole match: the connect happens at some wall-clock moment of each boot, and a reset
++        // there would land on different frames of the two games. The meeting decides instead.
++        const uint32_t sessionKey = ps2NetMeetMode() ? 1u : ps2NetSession();
++        if (s_session != sessionKey)
++        { s_session = sessionKey; s_step = 0; s_waitUntil = 0; s_pulseStart = 0; s_sawDuel = false;
++          s_menuPressed = false; s_menuPressAt = 0; s_meetAt = 0;
            s_desyncBase = ps2NetDesyncFrame();
            s_returnStart = 0;
            s_saidEntry = false;
-@@ -6236,8 +6436,13 @@ namespace
+@@ -6219,6 +6478,10 @@ namespace
+             const uint32_t duelObj = rd32(rdram, 0x3b38e8u) & 0x1FFFFFFFu;
+             if (!duelObj) return;                       // module still coming up: wait
+             wr32(rdram, duelObj + 0x110u, 1u);          // 1P VS 2P
++            // [meet] Nothing else when the games meet at the menu: player 1 picks the battle type there and the time
++            // limit in the game's own "Ajustes", and the host's settings reach player 2 over the wire at some moment of
++            // its boot -- writing them here would make the two menus differ by when that packet happened to land.
++            if (!ps2NetMeetMode()) {
+             // Take the battle type from the netplay session (the host stamps its choice into
+             // every packet) instead of forcing Single -- this write is what the versus menu would
+             // have made had the player navigated it, and the gate below reads it back out.
+@@ -6226,6 +6489,7 @@ namespace
+             wr32(rdram, duelObj + 0x118u, (uint32_t)ps2NetDpLimit());
+             wr32(rdram, duelObj + 0x13cu, (uint32_t)ps2NetTimeLimit());
+             bt3NetCommitTimeLimit(rdram, duelObj, &rd32, &wr32);
++            }
+             std::fprintf(stderr, "[netjump] duelObj=0x%x: mode -> 1 (1P VS 2P), type -> %u, dp -> %u\n",
+                          duelObj, (unsigned)ps2NetBattleType(), (unsigned)ps2NetDpLimit());
+             // Advance with a PLAIN WRITE, not bt3MenuGoto: that helper needs the MAIN-MENU object
+@@ -6236,8 +6500,13 @@ namespace
              // branches on this very slot -- 0x27 goes to the character-select handler at 0x352dd8.
              // Do NOT write the state here: the module must run its own 0x26 -> 0x27 path so
              // func_356090 loads the screen. Press confirm and let the game do it.
@@ -850,7 +998,7 @@ index 3c3d250..3f76252 100644
              s_step = 2; return;
          }
          if (s_step == 2)
-@@ -6328,6 +6533,37 @@ namespace
+@@ -6328,6 +6597,52 @@ namespace
                      g_netJumpState.store(3, std::memory_order_relaxed);   // 3 = returning: "Aborting..."
                      return;
                  }
@@ -876,6 +1024,21 @@ index 3c3d250..3f76252 100644
 +                    }
 +                    if (s_menuPressed && now - s_menuPressAt >= 45u)
 +                    {
++                        // [meet] Booted alone: meet the other game here. The menu comes into view with "waiting for
++                        // <name>" over it for a few frames (that is the picture that stays up during the wait), then
++                        // ps2NetMeet blocks until both are here and agree -- or gives up, and this one plays offline.
++                        if (ps2NetMeetPending())
++                        {
++                            g_netJumpHold.store(0, std::memory_order_relaxed);
++                            g_netCurtainWant.store(0, std::memory_order_relaxed);
++                            if (!s_meetAt) { s_meetAt = now; banner(2u, 0); }
++                            if (now - s_meetAt < 10u) return;
++                            const char *why = "";
++                            const bool ok = ps2NetMeet(static_cast<uint32_t>(now), ps2DetGameplayHash(rdram, getRegU32(ctx, 29)), &why);
++                            banner(ok ? 3u : 4u, ok ? 240u : 420u);
++                            std::fprintf(stderr, "[netjump] %s\n", ok ? "met the other game at the multiplayer menu"
++                                                                      : "no meeting: this game plays on offline");
++                        }
 +                        g_netJumpHold.store(0, std::memory_order_relaxed);
 +                        g_netCurtainWant.store(0, std::memory_order_relaxed);
 +                        ps2xNetMenuGate(0, 0);
@@ -888,7 +1051,7 @@ index 3c3d250..3f76252 100644
                  if (duel && ((now - s_pulseStart) % 8u) == 0u)
                  {
                      // The project's own synthetic press, not g_netJumpPressCross: the retired page's
-@@ -6821,7 +7057,7 @@ namespace
+@@ -6821,7 +7136,7 @@ namespace
          // runs every frame whatever the UI is doing, and it is the only place with the guest RAM in
          // hand -- which the box's `dump` verb needs. The module throttles the actual stat().
          ps2xNotifyPollDropBox(ps2xDropBoxDir(), rdram);
@@ -897,7 +1060,7 @@ index 3c3d250..3f76252 100644
          if (g_ps2StepCensus.load(std::memory_order_relaxed)) ps2StepCensusFrame(ctx);   // [stepcensus]
          ps2HalfStepFrame(ctx);        // [halfstep] (no-op unless configured; raises the macro switch on fight frames only)
          {   // [findclock] PS2X_FINDCLOCK=<start value>: when the fight gate opens, remember every 32-bit slot holding a value
-@@ -8348,3 +8584,6 @@ extern "C" int ps2xMenuSePlay(int bank, int idx)
+@@ -8348,3 +8663,6 @@ extern "C" int ps2xMenuSePlay(int bank, int idx)
  }
  
  
@@ -1058,7 +1221,7 @@ index c086d76..3a39975 100644
          else if (kind == 'j') { g_hs[(pc - kBase) >> 2] = 5; ++ni; }
          else if (kind == 'D') { g_hs[(pc - kBase) >> 2] = 6; ++ni; }   // duration assignment: value * 2 (pairs with a 'd' countdown)   // integer step: store old + (new - old) / 2 (ki drain/charge)
 diff --git a/ps2xRuntime/src/lib/ps2_netplay.cpp b/ps2xRuntime/src/lib/ps2_netplay.cpp
-index 33b15d8..947c35d 100644
+index 33b15d8..ae7b76d 100644
 --- a/ps2xRuntime/src/lib/ps2_netplay.cpp
 +++ b/ps2xRuntime/src/lib/ps2_netplay.cpp
 @@ -18,7 +18,10 @@
@@ -1081,7 +1244,7 @@ index 33b15d8..947c35d 100644
      SOCKET      sock     = INVALID_SOCKET;
      sockaddr_in peer{};
      bool        peerKnown = false;
-@@ -140,11 +143,39 @@ struct Net
+@@ -140,11 +143,49 @@ struct Net
      SOCKET      syncListen = INVALID_SOCKET;
      bool        envDefaults = false;   // PS2X_NET_ROLLBACK / PS2X_NET_SYNC read once; the overlay may override
      uint32_t    desyncFrame = 0;       // [desyncdump] first frame whose confirmed hash differed (0 = none yet)
@@ -1092,6 +1255,11 @@ index 33b15d8..947c35d 100644
 +    char        relayToken[33] = {};
 +    std::chrono::steady_clock::time_point lastRelayReg{};
      uint32_t    checkEvery = 60;       // PS2X_NET_CHECKEVERY: confirmed-state checksum interval in frames
++    // [meet] PS2X_NET_MEET=menu: each game boots on its own (no wait before the boot, no pads: the boot is the same
++    // on both machines) and the two meet at the multiplayer menu, where lockstep starts once both are there and their
++    // states agree. Until then nothing is numbered or exchanged but keep-alives.
++    bool        meet = false;
++    bool        met = false;
  };
  
  Net g;
@@ -1103,6 +1271,11 @@ index 33b15d8..947c35d 100644
 +std::vector<uint64_t> g_rttUs;         // round trips measured by player 1
 +uint32_t g_peerDelay = 0;              // player 2: the delay player 1 announced (0 = none yet)
 +bool     g_delayAcked = false;         // player 1: player 2 confirmed it
++// [meet] 7 MEET (frame, state hash at the multiplayer menu), 8 its ACK
++bool     g_peerMeet = false;
++uint32_t g_peerMeetFrame = 0;
++uint64_t g_peerMeetHash = 0;
++bool     g_meetAcked = false;
 +static bool autoDelayWanted() { const char *d = std::getenv("PS2X_NET_DELAY"); return d && std::strcmp(d, "auto") == 0; }
 +
 +// [nettrace] PS2X_NET_TRACE=<n>: the first n netplay events (frame ticks, pad submissions, input waits, packets by
@@ -1121,7 +1294,7 @@ index 33b15d8..947c35d 100644
  // [flush] Whether the session has entered the match flow, and how many frames it has then sat on the
  // main menu. Per-session, so both are reset on connect and on teardown: a latch that outlived its
  // session would fire on the next connect and drop a session that never left. It lives here, with
-@@ -198,6 +229,19 @@ bool parseHostPort(const char *v, sockaddr_in &out)
+@@ -198,6 +239,19 @@ bool parseHostPort(const char *v, sockaddr_in &out)
  void sendOurs(uint32_t frame)
  {
      if (!g.peerKnown) return;
@@ -1141,7 +1314,7 @@ index 33b15d8..947c35d 100644
      NetPkt p{};
      p.magic = kMagic; p.version = kVersion;
      p.player = static_cast<uint8_t>(g.localPlayer);
-@@ -344,6 +388,7 @@ void pump()
+@@ -344,6 +398,7 @@ void pump()
              }
          }
          g.rx.fetch_add(1, std::memory_order_relaxed);
@@ -1149,7 +1322,7 @@ index 33b15d8..947c35d 100644
          if (p.kind == 1u)
          {   // [statesync] the host's offer (the joiner adopts it at a comparable boundary; an offer for a
              // frame we already adopted means our DONE was lost: answer again)
-@@ -362,6 +407,22 @@ void pump()
+@@ -362,6 +417,29 @@ void pump()
              if (g.listening && p.baseFrame == g.syncFrame) g.syncDone = true;
              continue;
          }
@@ -1169,10 +1342,17 @@ index 33b15d8..947c35d 100644
 +            continue;
 +        }
 +        if (p.kind == 6u) { g_delayAcked = true; continue; }
++        if (p.kind == 7u)
++        {
++            g_peerMeet = true; g_peerMeetFrame = p.baseFrame; g_peerMeetHash = p.checksum;
++            sendSyncCtl(8u, p.baseFrame, 0u, nullptr);
++            continue;
++        }
++        if (p.kind == 8u) { g_meetAcked = true; continue; }
          if (g.fakeLagMs) g.held.emplace_back(std::chrono::steady_clock::now(), p);
          else applyInputs(p);
      }
-@@ -418,7 +479,7 @@ static bool netStart(const char *conn, int listenPort, int player)
+@@ -418,7 +496,7 @@ static bool netStart(const char *conn, int listenPort, int player)
      (void)s_wsa;
  #endif
      g.localPlayer = (player == 2) ? 2 : 1;
@@ -1181,7 +1361,7 @@ index 33b15d8..947c35d 100644
      if (const char *t = std::getenv("PS2X_NET_TIMEOUT")) { const int v = std::atoi(t); if (v > 0) g.timeoutMs = (uint32_t)v; }
  
      g.sock = ::socket(AF_INET, SOCK_DGRAM, 0);
-@@ -681,9 +742,19 @@ void ps2NetInit()
+@@ -681,9 +759,20 @@ void ps2NetInit()
      done = true;
      const char *conn = std::getenv("PS2X_NET");
      const char *lis  = std::getenv("PS2X_NET_LISTEN");
@@ -1190,6 +1370,7 @@ index 33b15d8..947c35d 100644
 +    const char *tok  = std::getenv("PS2X_NET_TOKEN");
      int player = 1;
      if (const char *p = std::getenv("PS2X_NET_PLAYER")) player = (std::atoi(p) == 2) ? 2 : 1;
++    if (const char *m = std::getenv("PS2X_NET_MEET")) g.meet = std::strcmp(m, "menu") == 0;
 +    if (rel && rel[0] && tok && std::strlen(tok) == 32)
 +    {   // [relay] both sides join the relay; the player number (1 = host of the match) comes from the server
 +        g.relay = true;
@@ -1202,7 +1383,7 @@ index 33b15d8..947c35d 100644
      if (lis && lis[0]) ps2NetHost(std::atoi(lis), player);
      else               ps2NetJoin(conn, player);
  }
-@@ -700,6 +771,18 @@ static void sendHello()
+@@ -700,6 +789,18 @@ static void sendHello()
      // -- the listener learns the peer address from this. Gating sends on g.connected (which is
      // only set BY a receive) deadlocked both sides at tx 0, waiting for each other forever.
      if (!g.peerKnown) return;
@@ -1221,7 +1402,7 @@ index 33b15d8..947c35d 100644
      NetPkt p{};
      p.magic = kMagic; p.version = kVersion;
      p.player = static_cast<uint8_t>(g.localPlayer);
-@@ -762,9 +845,86 @@ uint32_t ps2NetRollbackPoll(uint32_t frameAbs, bool *mustStall)
+@@ -762,9 +863,148 @@ uint32_t ps2NetRollbackPoll(uint32_t frameAbs, bool *mustStall)
      return rb;
  }
  
@@ -1229,6 +1410,7 @@ index 33b15d8..947c35d 100644
 +// to be ready (frame 67 on one, 2 on the other) applied the same inputs to different moments of the boot; waiting at
 +// the first pad read was not enough either: the game's other threads (sound, disc) kept running during the wait, on
 +// the host's clock, and the two RAMs differed by frame 60. PS2X_NET_WAIT_MS bounds the wait (default 120 s).
++static void negotiateDelay();
 +static void netWaitConnected(const char *where)
 +{
 +    static const long s_waitMs = [](){ const char *v = std::getenv("PS2X_NET_WAIT_MS"); return v && v[0] ? std::atol(v) : 120000L; }();
@@ -1243,6 +1425,13 @@ index 33b15d8..947c35d 100644
 +    if (!g.connected) { std::fprintf(stderr, "[netplay] the other player never came: playing offline\n"); ps2NetDisconnect("no peer"); return; }
 +    std::fprintf(stderr, "[netplay] the other player is here after %.1f s\n",
 +                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
++    negotiateDelay();
++}
++
++// [autodelay] Player 1 measures the round trip and announces the input delay; player 2 waits for it. Both sides
++// must be pumping: before the boot (netWaitConnected) or at the multiplayer menu (ps2NetMeet).
++static void negotiateDelay()
++{
 +    if (!autoDelayWanted()) return;
 +    using clock = std::chrono::steady_clock;
 +    auto nowUs = [] { return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(clock::now().time_since_epoch()).count()); };
@@ -1297,19 +1486,76 @@ index 33b15d8..947c35d 100644
 +        std::this_thread::sleep_for(std::chrono::milliseconds(std::atol(s)));
 +    }
 +    ps2NetInit();
++    if (g.meet) { std::fprintf(stderr, "[meet] booting on our own: the two games meet at the multiplayer menu\n"); return; }
 +    if (g.active && !g.connected) netWaitConnected("before the boot");   // relay, or a direct host/join (tests)
++}
++
++bool ps2NetMeetMode()    { return g.meet; }
++bool ps2NetMeetPending() { return g.active && g.meet && !g.met; }
++
++// [meet] Called by the netjump on the frame it reaches the multiplayer menu, on both machines. Blocks (the game
++// presents nothing meanwhile, so the "waiting" banner set just before stays up) until the other game is there too,
++// then both compare the frame and the state hash: equal, and lockstep starts on the next pad read, at the same frame
++// on both; different, or nobody within PS2X_NET_MEET_MS (default 120 s), and the session ends -- each one plays on
++// offline from the same menu.
++bool ps2NetMeet(uint32_t frameAbs, uint64_t hash, const char **why)
++{
++    static const char *s_why = "";
++    if (why) *why = s_why;
++    if (!ps2NetMeetPending()) { s_why = "no online session"; if (why) *why = s_why; return false; }
++    static const long s_waitMs = [](){ const char *v = std::getenv("PS2X_NET_MEET_MS"); return v && v[0] ? std::atol(v) : 120000L; }();
++    using clock = std::chrono::steady_clock;
++    const auto t0 = clock::now();
++    auto fail = [&](const char *w) { s_why = w; if (why) *why = w;
++                                     std::fprintf(stderr, "[meet] %s: playing offline\n", w); ps2NetDisconnect(w); return false; };
++    std::fprintf(stderr, "[meet] at the multiplayer menu on frame %u (state %016llx): waiting for the other player\n",
++                 frameAbs, (unsigned long long)hash);
++    auto lastSend = clock::time_point{};
++    while (!(g_peerMeet && g_meetAcked))
++    {
++        if (!g.active) return fail("the other player left");
++        if (clock::now() - t0 > std::chrono::milliseconds(s_waitMs)) return fail("the other player did not arrive");
++        if (!g.connected) sendHello();
++        else if (clock::now() - lastSend > std::chrono::milliseconds(50)) { lastSend = clock::now(); sendSyncCtl(7u, frameAbs, hash, nullptr); }
++        pump();
++        std::this_thread::sleep_for(std::chrono::milliseconds(2));
++    }
++    std::fprintf(stderr, "[meet] the other player is here after %.1f s: their frame %u state %016llx\n",
++                 std::chrono::duration<double>(clock::now() - t0).count(), g_peerMeetFrame, (unsigned long long)g_peerMeetHash);
++    {   // answer a repeated MEET for a moment, in case our ACK was the packet that got lost
++        const auto until = clock::now() + std::chrono::milliseconds(150);
++        while (clock::now() < until) { sendSyncCtl(7u, frameAbs, hash, nullptr); pump(); std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
++    }
++    if (g_peerMeetFrame != frameAbs) return fail("the two games reached the menu on different frames");
++    if (g_peerMeetHash != hash) return fail("the two games are not in the same state");
++    negotiateDelay();
++    if (!g.active) return fail("the input delay was not agreed");
++    {
++        std::lock_guard<std::mutex> lk(g.mtx);
++        g.local.clear(); g.remote.clear(); g.predicted.clear(); g.peerHash.clear(); g.ourHash.clear(); g.held.clear();
++        g.needBase = true; g.checkFrame = 0; g.checkValue = 0; g.lastSent = 0;
++        g.lastRx = clock::now();
++    }
++    g.met = true;
++    std::fprintf(stderr, "[meet] in step at frame %u: lockstep from the next frame, input delay %u\n", frameAbs, g.delay);
++    s_why = "";
++    return true;
 +}
 +
  void ps2NetSubmitLocal(uint32_t frameAbs, const Ps2xNetInput &in)
  {
      if (!g.active) return;
 +    netTrace("submit abs %u connected %d", frameAbs, (int)g.connected);
++    if (g.meet && !g.met) { pump(); return; }   // [meet] not numbered until the two meet (ps2NetFrame keeps it alive)
 +    if (g.relay && !g.connected) netWaitConnected("first pad read");   // only if the boot-time wait did not run
      if (!g.connected || !g.synced) { sendHello(); pump(); return; }   // handshake / state sync only, no frame numbering yet
      const uint32_t frame = relFrame(frameAbs);
      Ps2xNetInput use = in;
-@@ -784,7 +944,11 @@ bool ps2NetGetInput(uint32_t frameAbs, int player, Ps2xNetInput &out)
+@@ -782,9 +1022,14 @@ void ps2NetSubmitLocal(uint32_t frameAbs, const Ps2xNetInput &in)
+ bool ps2NetGetInput(uint32_t frameAbs, int player, Ps2xNetInput &out)
+ {
      if (!g.active || !g.connected || !g.synced) return false;   // pre-connection / pre-sync: leave the pads alone
++    if (g.meet && !g.met) return false;                          // [meet] the boot's pads are neutral (game_overrides)
      const uint32_t frame = relFrame(frameAbs);
      const bool wantLocal = (player == g.localPlayer);
 -    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(g.timeoutMs);
@@ -1321,7 +1567,7 @@ index 33b15d8..947c35d 100644
      const auto t0 = std::chrono::steady_clock::now();
      bool stalled = false;
      for (;;)
-@@ -815,11 +979,24 @@ bool ps2NetGetInput(uint32_t frameAbs, int player, Ps2xNetInput &out)
+@@ -815,11 +1060,24 @@ bool ps2NetGetInput(uint32_t frameAbs, int player, Ps2xNetInput &out)
              break;
          }
          pump();
@@ -1349,7 +1595,7 @@ index 33b15d8..947c35d 100644
          }
          stalled = true;
          std::this_thread::sleep_for(std::chrono::microseconds(250));
-@@ -851,8 +1028,7 @@ void ps2NetSetChecksum(uint32_t frame, uint64_t hash)
+@@ -851,8 +1109,7 @@ void ps2NetSetChecksum(uint32_t frame, uint64_t hash)
      {
          for (auto i = g.ourHash.begin(); i != g.ourHash.end();) i = (i->first + 600 < frame) ? g.ourHash.erase(i) : ++i;
          for (auto i = g.peerHash.begin(); i != g.peerHash.end();) i = (i->first + 600 < frame) ? g.peerHash.erase(i) : ++i;
@@ -1359,14 +1605,22 @@ index 33b15d8..947c35d 100644
  }
  
  // [flush] Why this exists at all.
-@@ -913,6 +1089,7 @@ static void netFlushCheck()
+@@ -913,8 +1170,15 @@ static void netFlushCheck()
  void ps2NetFrame(uint32_t frame)
  {
      if (!g.active) return;
 +    netTrace("frame tick %u", frame);
      netFlushCheck();
      if (!g.active) return;   // [flush] netFlushCheck may have torn the session down
++    if (g.meet && !g.met)
++    {   // [meet] during the boot: register / say hello until the other game answers, then a keep-alive four times a
++        // second so neither side's watchdog drops the other while both are still on their way to the menu
++        static uint32_t s_n = 0;
++        if (!g.connected || (s_n++ % 15u) == 0u) sendHello();
++    }
      pump();
+     if (g.connected)
+     {   // Watchdog: a peer that vanishes (crash, closed window, cable out) would otherwise make
 diff --git a/ps2xRuntime/src/lib/pad_config.cpp b/ps2xRuntime/src/lib/pad_config.cpp
 index 65db527..f8e639d 100644
 --- a/ps2xRuntime/src/lib/pad_config.cpp
@@ -1417,13 +1671,16 @@ index 65db527..f8e639d 100644
          ly = pkt.ly;
          rx = pkt.rx;
 diff --git a/ps2xRuntime/include/runtime/ps2_gs_live.h b/ps2xRuntime/include/runtime/ps2_gs_live.h
-index 0fb445c..67a9423 100644
+index 0fb445c..000a6a5 100644
 --- a/ps2xRuntime/include/runtime/ps2_gs_live.h
 +++ b/ps2xRuntime/include/runtime/ps2_gs_live.h
-@@ -27,6 +27,9 @@ namespace ps2_gslive
+@@ -27,6 +27,12 @@ namespace ps2_gslive
      // Host window state, read by the pad code: active-high libpad buttons, lx|ly<<8|rx<<16|ry<<24.
      bool remotePad(uint32_t &buttons, uint32_t &axes);
      bool hostMenuOpen();
++    // The online banner the host draws (ps2live::RingHeader::netStatus): 0 none, 1 preparing, 2 waiting for the
++    // other player, 3 connected, 4 could not connect, 5 how to leave, 6 connection lost.
++    void setNetStatus(uint32_t status);
 +    // The GS host's window (or the runtime's own) is the one in front: the controller counts only then, so a
 +    // launcher over the game or another window can be used with the pad without moving the fighter.
 +    bool hostFocused();
@@ -1431,16 +1688,20 @@ index 0fb445c..67a9423 100644
      void transfer(int path, const uint8_t *data, uint32_t sizeBytes);
      // A register the runtime's HLE stubs write straight into its GS parse: sent as an A+D packet.
 diff --git a/ps2xRuntime/include/runtime/ps2_netplay.h b/ps2xRuntime/include/runtime/ps2_netplay.h
-index 06198b9..51de717 100644
+index 06198b9..20dbda9 100644
 --- a/ps2xRuntime/include/runtime/ps2_netplay.h
 +++ b/ps2xRuntime/include/runtime/ps2_netplay.h
-@@ -8,6 +8,9 @@ struct Ps2xNetInput { uint16_t buttons; uint8_t rx, ry, lx, ly; };   // 6 bytes
+@@ -8,6 +8,13 @@ struct Ps2xNetInput { uint16_t buttons; uint8_t rx, ry, lx, ly; };   // 6 bytes
  #pragma pack(pop)
  
  void     ps2NetInit();
 +// [netwait] Online through the relay: block until the other player is connected, BEFORE the guest runs its first
 +// instruction, so both machines run the whole boot in lockstep from the same state. No-op otherwise.
 +void     ps2NetWaitPeer();
++// [meet] PS2X_NET_MEET=menu: boot alone, meet at the multiplayer menu (see ps2_netplay.cpp)
++bool     ps2NetMeetMode();
++bool     ps2NetMeetPending();                          // online, not met yet: the pads are neutral
++bool     ps2NetMeet(uint32_t frameAbs, uint64_t hash, const char **why);
  
  // The Netplay overlay, as one switch: the corner label, the panel behind it, AND the automatic
  // character-select transition with its curtain. They are one feature, not three -- the panel without

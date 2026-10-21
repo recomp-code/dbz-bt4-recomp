@@ -1,5 +1,5 @@
 diff --git a/pcsx2/GSDumpReplayer.cpp b/pcsx2/GSDumpReplayer.cpp
-index 2259b89..89c6f8d 100644
+index 2259b89..ebe74b8 100644
 --- a/pcsx2/GSDumpReplayer.cpp
 +++ b/pcsx2/GSDumpReplayer.cpp
 @@ -10,6 +10,7 @@
@@ -129,7 +129,7 @@ index 2259b89..89c6f8d 100644
  #endif
  		}
  		break;
-@@ -929,12 +999,387 @@ static void RenderLiveMenu()
+@@ -929,13 +999,465 @@ static void RenderLiveMenu()
  	dl->AddText(font, font_size * 0.85f, ImVec2(p0.x + pad, y + line_h * 0.25f), IM_COL32(160, 160, 170, 255), s_menu_footer.c_str());
  }
  
@@ -507,6 +507,82 @@ index 2259b89..89c6f8d 100644
 +	dl->AddText(font, font_size, ImVec2(p0.x + pad, p0.y + pad + ts.y + std::ceil(6.0f * scale)), IM_COL32(230, 230, 240, 255), line.c_str());
 +}
 +
++// [invite] An online invitation received while playing (the launcher hands it to the host, pcsx2-gsrunner Main.cpp):
++// a box in the middle of the game window, answered with the pad (A accepts, B declines) without leaving the game.
++namespace
++{
++	std::mutex s_invite_mutex;
++	std::string s_invite_from;
++	std::string s_invite_line;
++} // namespace
++
++void GSDumpReplayer::SetLiveInvite(std::string from, std::string line)
++{
++	std::lock_guard lock(s_invite_mutex);
++	s_invite_from = std::move(from);
++	s_invite_line = std::move(line);
++}
++
++static void RenderLiveInvite()
++{
++	std::string from, line;
++	{
++		std::lock_guard lock(s_invite_mutex);
++		if (s_invite_from.empty())
++			return;
++		from = s_invite_from;
++		line = s_invite_line;
++	}
++	const std::string title = from + " te invita a pelear";
++	const std::string keys = "A: aceptar      B: rechazar";
++	const ImVec2 display = ImGui::GetIO().DisplaySize;
++	ImDrawList* dl = ImGui::GetForegroundDrawList();
++	dl->AddRectFilled(ImVec2(0, 0), display, IM_COL32(0, 0, 0, 110));
++	if (bt4font::Ready())
++	{
++		// the game's own look, as the online banner: gold title bar over a blue description box
++		const float s = std::max(1.0f, display.y / 448.0f);
++		const float cell = static_cast<float>(bt4font::s_font.cellH ? bt4font::s_font.cellH : 20) * s;
++		const float pad = std::ceil(10.0f * s);
++		const float width = std::max({bt4font::Width(title, s), bt4font::Width(line, s), bt4font::Width(keys, s)}) + pad * 4.0f;
++		const float barH = cell + pad, boxH = cell * 2.0f + pad * 3.0f;
++		const ImVec2 p0((display.x - width) * 0.5f, (display.y - barH - boxH) * 0.5f);
++		const ImVec2 bar1(p0.x + width, p0.y + barH);
++		const ImVec2 box1(p0.x + width, bar1.y + boxH);
++		const float r = 6.0f * s;
++		dl->AddRectFilled(ImVec2(p0.x, bar1.y - r), box1, IM_COL32(12, 52, 92, 240), r);
++		dl->AddRect(ImVec2(p0.x, bar1.y - r), box1, IM_COL32(70, 160, 200, 255), r, 2.0f * s);
++		const ImU32 goldTop = IM_COL32(255, 222, 96, 255), goldBot = IM_COL32(214, 150, 24, 255);
++		dl->AddRectFilledMultiColor(p0, bar1, goldTop, goldTop, goldBot, goldBot);
++		dl->AddRect(p0, bar1, IM_COL32(90, 50, 0, 255), 0.0f, 2.0f * s);
++		bt4font::Draw(dl, ImVec2(p0.x + pad * 2.0f, p0.y + (barH - cell) * 0.5f), s, title, IM_COL32(255, 255, 255, 255), IM_COL32(110, 40, 0, 255));
++		bt4font::Draw(dl, ImVec2(p0.x + pad * 2.0f, bar1.y + pad), s, line, IM_COL32(255, 255, 255, 255), IM_COL32(0, 0, 0, 255));
++		bt4font::Draw(dl, ImVec2(p0.x + pad * 2.0f, bar1.y + pad * 2.0f + cell), s, keys, IM_COL32(255, 230, 120, 255), IM_COL32(0, 0, 0, 255));
++		return;
++	}
++	const float scale = ImGuiManager::GetGlobalScale();
++	ImFont* const font = ImGuiManager::GetStandardFont();
++	const float fs = ImGuiManager::GetFontSizeStandard() * 1.2f;
++	const float pad = std::ceil(18.0f * scale);
++	const ImVec2 ts = font->CalcTextSizeA(fs * 1.25f, FLT_MAX, -1.0f, title.c_str());
++	const ImVec2 ls = font->CalcTextSizeA(fs, FLT_MAX, -1.0f, line.c_str());
++	const ImVec2 ks = font->CalcTextSizeA(fs, FLT_MAX, -1.0f, keys.c_str());
++	const float gap = std::ceil(8.0f * scale);
++	const float width = std::max({ts.x, ls.x, ks.x}) + pad * 2.0f;
++	const float height = ts.y + ls.y + ks.y + gap * 2.0f + pad * 2.0f;
++	const ImVec2 p0((display.x - width) * 0.5f, (display.y - height) * 0.5f);
++	const ImVec2 p1(p0.x + width, p0.y + height);
++	const ImU32 accent = IM_COL32(255, 160, 40, 255);
++	dl->AddRectFilled(p0, p1, IM_COL32(10, 10, 20, 235), 12.0f * scale);
++	dl->AddRect(p0, p1, accent, 12.0f * scale, 2.0f * scale);
++	float y = p0.y + pad;
++	dl->AddText(font, fs * 1.25f, ImVec2(p0.x + pad, y), accent, title.c_str());
++	y += ts.y + gap;
++	dl->AddText(font, fs, ImVec2(p0.x + pad, y), IM_COL32(230, 230, 240, 255), line.c_str());
++	y += ls.y + gap;
++	dl->AddText(font, fs, ImVec2(p0.x + pad, y), IM_COL32(255, 230, 120, 255), keys.c_str());
++}
++
  void GSDumpReplayer::RenderUI()
  {
  #ifdef PS2X_LIVE_RING
@@ -515,9 +591,11 @@ index 2259b89..89c6f8d 100644
  	{
 +		RenderLiveNetBanner();
  		RenderLiveMenu();
++		RenderLiveInvite();
  		return;
  	}
-@@ -1040,6 +1485,7 @@ static bool AttachLiveRingMapping(Error* error)
+ #endif
+@@ -1040,6 +1562,7 @@ static bool AttachLiveRingMapping(Error* error)
  	s_live.events = ps2live::ringEvents(header);
  	if (!s_live_ring_suffix.empty())
  		s_live.producer_pid = static_cast<pid_t>(std::strtoul(s_live_ring_suffix.c_str(), nullptr, 10));
@@ -525,7 +603,7 @@ index 2259b89..89c6f8d 100644
  	return true;
  }
  #endif
-@@ -1107,11 +1553,21 @@ bool GSDumpReplayer::AttachLiveRing(Error* error)
+@@ -1107,11 +1630,21 @@ bool GSDumpReplayer::AttachLiveRing(Error* error)
  		ps2live::objectName(ps2live::kDataEventName, s_live_ring_suffix).c_str());
  	s_live.space_event = OpenEventW(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE,
  		ps2live::objectName(ps2live::kSpaceEventName, s_live_ring_suffix).c_str());
@@ -547,7 +625,7 @@ index 2259b89..89c6f8d 100644
  	}
  #else
  	if (!AttachLiveRingMapping(error))
-@@ -1140,6 +1596,23 @@ void GSDumpReplayer::SetLivePad(u32 buttons, u32 axes)
+@@ -1140,6 +1673,23 @@ void GSDumpReplayer::SetLivePad(u32 buttons, u32 axes)
  #endif
  }
  
@@ -572,11 +650,15 @@ index 2259b89..89c6f8d 100644
  {
  #ifdef PS2X_LIVE_RING
 diff --git a/pcsx2/GSDumpReplayer.h b/pcsx2/GSDumpReplayer.h
-index 1db531a..2429598 100644
+index 1db531a..20c5274 100644
 --- a/pcsx2/GSDumpReplayer.h
 +++ b/pcsx2/GSDumpReplayer.h
-@@ -45,6 +45,9 @@ namespace GSDumpReplayer
+@@ -43,8 +43,13 @@ namespace GSDumpReplayer
+ 	void SetLiveMenu(std::string title, std::vector<std::string> lines, int selected, std::string footer);
+ 	/// Tells the game (through the ring) that the options menu owns the pad.
  	void SetLiveMenuOpen(bool open);
++	/// [invite] An online invitation drawn over the game ("" hides it); the pad answers it (pcsx2-gsrunner).
++	void SetLiveInvite(std::string from, std::string line);
  	/// Pad state published back to the game (the host window has the keyboard focus).
  	void SetLivePad(u32 buttons, u32 axes);
 +	/// 60 fps fights (DBZ BT4): the game's mode, 0 = the game has no switch, 1 = 30 fps, 2 = 60 fps.
@@ -654,7 +736,7 @@ index 0045f01..e3729f4 100644
      // the same mapping, after the data area (macOS: os_sync_wait_on_address, Linux: futex).
      // macOS limits shm names to 31 characters, so the base name is short.
 diff --git a/pcsx2-gsrunner/Main.cpp b/pcsx2-gsrunner/Main.cpp
-index 3b93a4a..30b7540 100644
+index 3b93a4a..033eafa 100644
 --- a/pcsx2-gsrunner/Main.cpp
 +++ b/pcsx2-gsrunner/Main.cpp
 @@ -1397,6 +1397,7 @@ namespace
@@ -728,7 +810,120 @@ index 3b93a4a..30b7540 100644
  		GSDumpReplayer::SetLiveMenuOpen(s_menu_open.load());
  		LiveMenuPublish();
  		return;
-@@ -1963,6 +1983,10 @@ static bool LivePlatformReadGamepad(u16* buttons)
+@@ -1662,12 +1682,82 @@ static void LiveMenuDo(LiveMenuAction action)
+ 	LiveMenuPublish();
+ }
+ 
++// [invite] An online invitation received while playing. The launcher writes PS2X_INVITE_FILE ("<id>\n<from>\n<line>"),
++// the host takes it (removes the file: the launcher knows it is on screen) and draws it over the game; A / Enter
++// accepts, B / Escape declines, and the answer goes to PS2X_INVITE_ANSWER ("<id> accept|decline"). Meanwhile the
++// pad is the host's (like the options menu): the game does not see the press. 30 s without an answer hide it.
++namespace
++{
++	std::string s_invite_id;
++	std::chrono::steady_clock::time_point s_invite_since{};
++} // namespace
++
++static void LiveInviteFinish(const char* answer)
++{
++	if (s_invite_id.empty())
++		return;
++	if (answer)
++	{
++		if (const char* path = std::getenv("PS2X_INVITE_ANSWER"); path && path[0])
++		{
++			const std::string tmp = std::string(path) + ".tmp";
++			if (std::FILE* fp = FileSystem::OpenCFile(tmp.c_str(), "wb"))
++			{
++				std::fprintf(fp, "%s %s\n", s_invite_id.c_str(), answer);
++				std::fclose(fp);
++				FileSystem::RenamePath(tmp.c_str(), path);
++			}
++		}
++	}
++	s_invite_id.clear();
++	GSDumpReplayer::SetLiveInvite({}, {});
++	GSDumpReplayer::SetLiveMenuOpen(s_menu_open.load());
++}
++
++// Every vsync on the CPU thread: a new invitation file, and the timeout.
++static void LiveInvitePoll()
++{
++	static const char* s_path = [] { const char* v = std::getenv("PS2X_INVITE_FILE"); return (v && v[0]) ? v : nullptr; }();
++	if (!s_path)
++		return;
++	if (!s_invite_id.empty() && std::chrono::steady_clock::now() - s_invite_since > std::chrono::seconds(30))
++		LiveInviteFinish(nullptr);
++	static int s_tick = 0;
++	if (++s_tick % 15 != 0)
++		return;
++	std::optional<std::string> text = FileSystem::ReadFileToString(s_path);
++	if (!text.has_value())
++		return;
++	FileSystem::DeleteFilePath(s_path);
++	std::vector<std::string> parts;
++	std::string cur;
++	for (char c : *text)
++	{
++		if (c == '\n')
++		{
++			parts.push_back(cur);
++			cur.clear();
++		}
++		else if (c != '\r')
++			cur += c;
++	}
++	if (!cur.empty())
++		parts.push_back(cur);
++	if (parts.size() < 2 || parts[0].empty() || parts[0].size() > 64 || parts[1].empty())
++		return;
++	s_invite_id = parts[0];
++	s_invite_since = std::chrono::steady_clock::now();
++	GSDumpReplayer::SetLiveInvite(parts[1].substr(0, 24), parts.size() > 2 ? parts[2].substr(0, 80) : std::string("Se cierra esta partida y empieza la online."));
++	GSDumpReplayer::SetLiveMenuOpen(true);
++}
++
+ // Gamepad (polled at every vsync on the CPU thread): Back+Start or a long START toggles the menu.
+ static void LiveMenuPollGamepad()
+ {
+ #ifdef __APPLE__
+ 	LivePublishPad(); // the controller's state for the game, every vsync
+ #endif
++	LiveInvitePoll();
+ 	static u16 s_prev = 0;
+ 	u16 buttons = 0;
+ 	if (!LivePlatformReadGamepad(&buttons))
+@@ -1677,6 +1767,14 @@ static void LiveMenuPollGamepad()
+ 	}
+ 	const u16 pressed = buttons & ~s_prev;
+ 	s_prev = buttons;
++	if (!s_invite_id.empty()) // [invite] the pad answers the invitation first
++	{
++		if (pressed & LivePad::A)
++			LiveInviteFinish("accept");
++		else if (pressed & LivePad::B)
++			LiveInviteFinish("decline");
++		return;
++	}
+ 	constexpr u16 combo = LivePad::Back | LivePad::Start;
+ 	if ((buttons & combo) == combo && (pressed & combo))
+ 	{
+@@ -1726,6 +1824,14 @@ static void LiveMenuPollGamepad()
+ // Keyboard from the window thread: queued to the CPU thread. True when the key was the menu's.
+ static bool LiveMenuKey(LiveKey key)
+ {
++	if (!s_invite_id.empty()) // [invite] Enter accepts, Escape declines (on the CPU thread, where the invitation lives)
++	{
++		if (key == LiveKey::Return || key == LiveKey::Space)
++			Host::RunOnCPUThread([]() { LiveInviteFinish("accept"); });
++		else if (key == LiveKey::Escape || key == LiveKey::Backspace)
++			Host::RunOnCPUThread([]() { LiveInviteFinish("decline"); });
++		return true;
++	}
+ 	LiveMenuAction action;
+ 	if (key == LiveKey::F1)
+ 		action = LiveMenuAction::Toggle;
+@@ -1963,6 +2069,10 @@ static bool LivePlatformReadGamepad(u16* buttons)
  		if (get_state(pad, &state) == ERROR_SUCCESS)
  		{
  			*buttons = state.Gamepad.wButtons;

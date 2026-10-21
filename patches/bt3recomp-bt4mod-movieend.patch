@@ -1,0 +1,61 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+index d9ae13d..00d5914 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -19,6 +19,7 @@ extern "C"
+ extern std::atomic<uint32_t> g_ps2FmvActive; // [fmvphase] defined in ps2_gs_gpu.cpp
+ void ps2GsEmitFmvFrame();                   // [fmvblit] defined in ps2_gs_gpu.cpp
+ extern std::atomic<uint32_t> g_ps2MovieActive;  // [movsync] defined in ps2_gs_gpu.cpp
++extern std::atomic<uint32_t> g_ps2ForceSkipFrames; // [movieend] defined in ps2_gs_gpu.cpp (pad reads to force skip on)
+ extern std::atomic<uint64_t> g_ps2MovieSession; // [movsync] defined in ps2_gs_gpu.cpp
+ void ps2xHostDataMark(const uint8_t *p, uint32_t bytes);   // [dethash] game_overrides.cpp
+ 
+@@ -457,6 +458,7 @@ namespace ps2_stubs
+             bool noFrameStallArmed = false;
+             std::chrono::steady_clock::time_point noFrameStallStart{};
+             uint32_t consecutiveEmptyGetPicture = 0u;
++            uint32_t emptyCallsSincePicture = 0u; // [movieend] GetPicture calls with no picture since the last one served
+             bool waitingForVideoSequenceHeader = true;
+             std::vector<uint8_t> videoSequenceSyncBuffer;
+             std::vector<uint8_t> pssBuffer;
+@@ -2197,6 +2199,7 @@ namespace ps2_stubs
+                 frameCount = playback.picturesServed;
+                 playback.picturesServed += 1u;
+                 playback.consecutiveEmptyGetPicture = 0u;
++                playback.emptyCallsSincePicture = 0u;
+                 playback.lastFrame = frame;
+                 playback.hasLastFrame = true;
+                 haveFrame = true;
+@@ -2229,6 +2232,7 @@ namespace ps2_stubs
+                 frameCount = playback.picturesServed;
+                 playback.picturesServed += 1u;
+                 playback.consecutiveEmptyGetPicture = 0u;
++                playback.emptyCallsSincePicture = 0u;
+                 haveFrame = true;
+ 
+                 static uint32_t s_duplicateFrameLogCount = 0u;
+@@ -2249,6 +2253,24 @@ namespace ps2_stubs
+                 width = playback.width;
+                 height = playback.height;
+                 frameCount = playback.picturesServed;
++                // [movieend] A movie the game reads with plain sceCdRead (DBZ BT4's opening, ~2802 pictures) never
++                // reaches the sceCdSt* stream end, and the game does not ask sceMpegIsEnd: once the pictures run out it
++                // keeps calling GetPicture on a black screen until the player presses a button. The native-movie
++                // override (ps2_fmv_override.cpp) ends its movies the same way, by pulsing the skip button; do that here
++                // once the movie has shown pictures and ~2 s of calls (60) brought none. Counted in calls, not wall
++                // time, so both games of an online match press it at the same point.
++                // (its own counter: maybeFinishNoFrameStall zeroes consecutiveEmptyGetPicture at every call once the
++                // stream has ended, which is exactly this case)
++                ++playback.emptyCallsSincePicture;
++                if (playback.picturesServed > 0u && playback.emptyCallsSincePicture >= 60u &&
++                    (playback.emptyCallsSincePicture % 12u) == 0u)
++                {
++                    g_ps2ForceSkipFrames.store(4u, std::memory_order_relaxed);
++                    static std::atomic<uint32_t> s_logged{0};
++                    if (s_logged.fetch_add(1u) < 4u)
++                        std::fprintf(stderr, "[movieend] mpeg=0x%x: no picture for %u calls after %u served (ended=%d) -> pressing skip\n",
++                                     mpegAddr, playback.emptyCallsSincePicture, playback.picturesServed, playback.streamEnded ? 1 : 0);
++                }
+             }
+ 
+             framesBuffered = getPlaybackState(mpegAddr).decodedFrames.size();

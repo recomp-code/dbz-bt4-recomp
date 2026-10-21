@@ -47,7 +47,7 @@ while (-not $p.HasExited -and ((Get-Date) - $t0).TotalSeconds -lt $Seconds) {
 }
 $exited = $p.HasExited
 $code = if ($exited) { $p.ExitCode } else { $null }
-Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'pcsx2-gsrunner.exe' -and $_.CommandLine -match 'DBZBT4Recomp' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'pcsx2-gsrunner.exe' -and $_.CommandLine -match "-livering $($p.Id)\b" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }   # only our host
 if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
 "exited_by_itself=$exited code=$code after {0:N0}s" -f ((Get-Date) - $t0).TotalSeconds
 Get-ChildItem $out | Select-Object Length, Name | Format-Table -AutoSize

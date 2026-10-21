@@ -1,4 +1,4 @@
-﻿param([string]$Out, [string]$Card, [int]$Frame = 60, [hashtable]$Extra = @{})
+param([string]$Out, [string]$Card, [int]$Frame = 60, [hashtable]$Extra = @{})
 # Boots the game offline in the online conditions (virtual clock, fixed seed and clock, a given memory card, no
 # input) until $Frame, logging [dethash]/[detblock] and dumping RAM there. Two runs of this must match exactly; it
 # is the quick determinism check (about 30 s) before any two-machine match.
@@ -20,6 +20,6 @@ $deadline = (Get-Date).AddSeconds(90)
 while ((Get-Date) -lt $deadline -and -not (Test-Path "$Out\ram_$Frame.bin")) { Start-Sleep 1 }
 Start-Sleep 2
 Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'pcsx2-gsrunner.exe' -and $_.CommandLine -match 'prueba_crossplay' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'pcsx2-gsrunner.exe' -and $_.CommandLine -match "-livering $($p.Id)\b" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }   # only our host, never a real match's window
 Select-String "$Out\run.log" -Pattern "^\[dethash\] frame $Frame " | Select-Object -First 1 | ForEach-Object { $_.Line -replace ' vu0r=.*', '' }
 

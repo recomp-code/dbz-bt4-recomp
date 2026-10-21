@@ -44,8 +44,8 @@ while (-not $proc.HasExited -and (Get-Date) -lt $deadline) {
     Start-Sleep 2
     if ((Test-Path $emulog) -and (Select-String $emulog -Pattern 'capture finished' -Quiet)) { Start-Sleep 3; break }
 }
-Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'pcsx2-gsrunner.exe' -and $_.CommandLine -match 'DBZBT4Recomp' } |
-    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'pcsx2-gsrunner.exe' -and $_.CommandLine -match "-livering $($proc.Id)\b" } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }   # only our host, never a real match's window
 if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
 Copy-Item $emulog "$out\emulog.txt" -ErrorAction SilentlyContinue
 Select-String "$out\emulog.txt" -Pattern 'capture' | ForEach-Object Line

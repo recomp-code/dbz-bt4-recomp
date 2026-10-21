@@ -42,7 +42,9 @@ while (((Get-Date) - $t0).TotalSeconds -lt $Seconds -and ($procs | Where-Object 
     Start-Sleep -Milliseconds 300
 }
 foreach ($pr in $procs) { if (-not $pr.HasExited) { Stop-Process -Id $pr.Id -Force -ErrorAction SilentlyContinue } }
-Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'pcsx2-gsrunner.exe' -and $_.CommandLine -match 'DBZBT4Recomp' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+# only the hosts of OUR two games (-livering <their pid>), never the window of a real match running beside the test
+$ours = $procs | ForEach-Object { $_.Id }
+Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'pcsx2-gsrunner.exe' -and ($_.CommandLine -match '-livering (\d+)') -and ($ours -contains [int]$Matches[1]) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 foreach ($p in 1, 2) {
     "== p$p"
     Select-String "$R\logs\online\p$p\runtime.log" -Pattern '\[netplay\]|\[netview\]|DESYNC|\[netjump\]' | Select-Object -First 12 | ForEach-Object Line

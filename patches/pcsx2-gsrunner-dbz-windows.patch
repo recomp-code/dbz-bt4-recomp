@@ -1,8 +1,23 @@
 diff --git a/pcsx2/GSDumpReplayer.cpp b/pcsx2/GSDumpReplayer.cpp
-index 2259b89..08e1c01 100644
+index 2259b89..97cc0b4 100644
 --- a/pcsx2/GSDumpReplayer.cpp
 +++ b/pcsx2/GSDumpReplayer.cpp
-@@ -119,6 +119,7 @@ namespace
+@@ -31,8 +31,14 @@
+ #include "common/Threading.h"
+ #include "common/Timer.h"
+ 
++#include "GS/Renderers/Common/GSDevice.h"
++
+ #include <atomic>
+ #include <cfloat>
++#include <chrono>
++#include <string>
++#include <unordered_map>
++#include <vector>
+ #include <cmath>
+ #include <mutex>
+ #include <string>
+@@ -119,6 +125,7 @@ namespace
  		HANDLE mapping = nullptr;
  		HANDLE data_event = nullptr;
  		HANDLE space_event = nullptr;
@@ -10,7 +25,64 @@ index 2259b89..08e1c01 100644
  		HANDLE producer_process = nullptr; // the game (its pid is the ring suffix)
  #else
  		int mapping_fd = -1;
-@@ -712,6 +713,18 @@ static void GSDumpReplayerLiveStep()
+@@ -128,6 +135,8 @@ namespace
+ 		ps2live::RingHeader* header = nullptr;
+ 		u8* data = nullptr;
+ 		u64 capacity = 0;
++		u32 known_pid = 0; // [handover] the producer being watched (RingHeader::producerPid once it changes)
++		std::chrono::steady_clock::time_point handover_since{}; // [handover] when the old game left
+ 		bool stream_header_done = false;
+ 		std::vector<u8> buffer;
+ 	};
+@@ -145,6 +154,23 @@ namespace
+ 
+ 	bool LiveReadRing(void* dst, size_t size);
+ 
++	// [handover] A new game took the ring over (RingHeader::producerPid): watch that process from now on.
++	void LiveAdoptProducer()
++	{
++		const u32 pid = s_live.header->producerPid;
++		if (pid == 0 || pid == s_live.known_pid)
++			return;
++		s_live.known_pid = pid;
++#ifdef _WIN32
++		if (s_live.producer_process)
++			CloseHandle(s_live.producer_process);
++		s_live.producer_process = OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(pid));
++#else
++		s_live.producer_pid = static_cast<pid_t>(pid);
++#endif
++		Console.WriteLn("(GSDumpReplayer) Live ring: now fed by game pid %u.", pid);
++	}
++
+ 	// The game process is gone (killed without clearing producerAlive).
+ 	bool LiveProducerGone()
+ 	{
+@@ -211,6 +237,23 @@ namespace
+ 			{
+ 				if (!s_dump_running)
+ 					return false;
++				// [handover] The game is being replaced under this window: keep it open while the new one starts
++				// (it attaches by the ring's name, then clears handover), for up to 60 s.
++				LiveAdoptProducer();
++				if (s_live.header->handover)
++				{
++					const auto now = std::chrono::steady_clock::now();
++					if (s_live.handover_since == std::chrono::steady_clock::time_point{})
++						s_live.handover_since = now;
++					if (now - s_live.handover_since < std::chrono::seconds(60))
++					{
++						LiveWaitData(10);
++						continue;
++					}
++					Console.Error("(GSDumpReplayer) Live ring: no game took over in 60 s, closing.");
++				}
++				else
++					s_live.handover_since = {};
+ 				// The game exited (or was killed without clearing producerAlive): close too.
+ 				if (!s_live.header->producerAlive || LiveProducerGone())
+ 				{
+@@ -712,6 +755,18 @@ static void GSDumpReplayerLiveStep()
  				__atomic_fetch_add(&s_live.events->readbackSeq, 1u, __ATOMIC_RELEASE);
  				ps2live::eventSet(&s_live.events->readback);
  			}
@@ -29,10 +101,311 @@ index 2259b89..08e1c01 100644
  #endif
  		}
  		break;
-@@ -929,12 +942,54 @@ static void RenderLiveMenu()
+@@ -929,12 +984,381 @@ static void RenderLiveMenu()
  	dl->AddText(font, font_size * 0.85f, ImVec2(p0.x + pad, y + line_h * 0.25f), IM_COL32(160, 160, 170, 255), s_menu_footer.c_str());
  }
  
++// [gamefont] DBZ BT4's own text font (the menu description boxes), read from the player's ISO on this machine
++// (PS2X_CD_IMAGE, inherited from the game) the first time a banner is drawn -- never shipped, never cached on disk.
++// The format (tools/fontprobe/bt4font.py is the reference): DATA/PZS4US1.AFS holds the game's sector-aligned packs;
++// the font pack ("PS2 Fnt5" at entry +0x40) is at byte 0x15E000 on this disc, and is found by a sector scan if not.
++// Its first font: a PSMT4 texture uploaded as PSMCT32 (so: CT32 swizzle in, T4 swizzle out), a CLUT whose four
++// 8x2 blocks each pick one 2-bit plane of the 4-bit texels, and a table of (UTF-16 code, x|w<<10|p0<<15,
++// y|h<<10|p1<<15) sorted by code.
++namespace bt4font
++{
++	struct Glyph { u16 x, y; u8 w, h, plane; };
++	struct Font
++	{
++		bool tried = false, ok = false;
++		u32 tw = 0, th = 0, cellH = 0;
++		std::unordered_map<u32, Glyph> glyphs;
++		std::vector<u32> rgba; // tw x (th * 4): white, alpha from each plane, planes stacked
++		GSTexture* texture = nullptr; // never freed: the GS device may be gone by the time statics are destroyed
++	};
++	Font s_font;
++
++	static constexpr u32 kSector = 2048;
++	static constexpr u8 kMagic[8] = {0x35, 0x74, 0x6E, 0x46, 0x20, 0x32, 0x53, 0x50};
++
++	static const u8 kBlock32[4][8] = {{0, 1, 4, 5, 16, 17, 20, 21}, {2, 3, 6, 7, 18, 19, 22, 23},
++		{8, 9, 12, 13, 24, 25, 28, 29}, {10, 11, 14, 15, 26, 27, 30, 31}};
++	static const u8 kCol32[8][8] = {{0, 1, 4, 5, 8, 9, 12, 13}, {2, 3, 6, 7, 10, 11, 14, 15},
++		{16, 17, 20, 21, 24, 25, 28, 29}, {18, 19, 22, 23, 26, 27, 30, 31}, {32, 33, 36, 37, 40, 41, 44, 45},
++		{34, 35, 38, 39, 42, 43, 46, 47}, {48, 49, 52, 53, 56, 57, 60, 61}, {50, 51, 54, 55, 58, 59, 62, 63}};
++	static const u8 kBlock4[8][4] = {{0, 2, 8, 10}, {1, 3, 9, 11}, {4, 6, 12, 14}, {5, 7, 13, 15},
++		{16, 18, 24, 26}, {17, 19, 25, 27}, {20, 22, 28, 30}, {21, 23, 29, 31}};
++	static const u16 kCol4[8][32] = {
++		{0, 8, 32, 40, 64, 72, 96, 104, 2, 10, 34, 42, 66, 74, 98, 106, 4, 12, 36, 44, 68, 76, 100, 108, 6, 14, 38, 46, 70, 78, 102, 110},
++		{16, 24, 48, 56, 80, 88, 112, 120, 18, 26, 50, 58, 82, 90, 114, 122, 20, 28, 52, 60, 84, 92, 116, 124, 22, 30, 54, 62, 86, 94, 118, 126},
++		{65, 73, 97, 105, 1, 9, 33, 41, 67, 75, 99, 107, 3, 11, 35, 43, 69, 77, 101, 109, 5, 13, 37, 45, 71, 79, 103, 111, 7, 15, 39, 47},
++		{81, 89, 113, 121, 17, 25, 49, 57, 83, 91, 115, 123, 19, 27, 51, 59, 85, 93, 117, 125, 21, 29, 53, 61, 87, 95, 119, 127, 23, 31, 55, 63},
++		{192, 200, 224, 232, 128, 136, 160, 168, 194, 202, 226, 234, 130, 138, 162, 170, 196, 204, 228, 236, 132, 140, 164, 172, 198, 206, 230, 238, 134, 142, 166, 174},
++		{208, 216, 240, 248, 144, 152, 176, 184, 210, 218, 242, 250, 146, 154, 178, 186, 212, 220, 244, 252, 148, 156, 180, 188, 214, 222, 246, 254, 150, 158, 182, 190},
++		{129, 137, 161, 169, 193, 201, 225, 233, 131, 139, 163, 171, 195, 203, 227, 235, 133, 141, 165, 173, 197, 205, 229, 237, 135, 143, 167, 175, 199, 207, 231, 239},
++		{145, 153, 177, 185, 209, 217, 241, 249, 147, 155, 179, 187, 211, 219, 243, 251, 149, 157, 181, 189, 213, 221, 245, 253, 151, 159, 183, 191, 215, 223, 247, 255}};
++
++	static u32 Ct32Word(u32 x, u32 y, u32 bw)
++	{
++		const u32 page = (y >> 5) * bw + (x >> 6);
++		return page * 2048 + kBlock32[(y >> 3) & 3][(x >> 3) & 7] * 64 + kCol32[y & 7][x & 7];
++	}
++	static u32 T4Nibble(u32 x, u32 y, u32 tbw)
++	{
++		const u32 page = (y >> 7) * (tbw >> 1) + (x >> 7);
++		const u32 row = y & 15;
++		const u32 col = kCol4[row & 7][x & 31] + (row >= 8 ? 256u : 0u);
++		return page * 16384 + kBlock4[(y >> 4) & 7][(x >> 5) & 3] * 512 + col;
++	}
++	static u32 Rd32(const std::vector<u8>& b, size_t o) { u32 v = 0; if (o + 4 <= b.size()) std::memcpy(&v, &b[o], 4); return v; }
++	static u64 Rd64(const std::vector<u8>& b, size_t o) { u64 v = 0; if (o + 8 <= b.size()) std::memcpy(&v, &b[o], 8); return v; }
++
++	static bool ReadAt(std::FILE* f, u64 off, void* dst, size_t n)
++	{
++		return FileSystem::FSeek64(f, static_cast<s64>(off), SEEK_SET) == 0 && std::fread(dst, 1, n, f) == n;
++	}
++
++	// ISO9660: the extent of DATA/PZS4US1.AFS
++	static bool IsoFind(std::FILE* f, u64* lba, u32* size)
++	{
++		u8 pvd[kSector];
++		if (!ReadAt(f, 16ull * kSector, pvd, sizeof(pvd)))
++			return false;
++		u32 dirLba, dirSize;
++		std::memcpy(&dirLba, pvd + 156 + 2, 4);
++		std::memcpy(&dirSize, pvd + 156 + 10, 4);
++		const char* path[2] = {"DATA", "PZS4US1.AFS"};
++		for (int depth = 0; depth < 2; depth++)
++		{
++			std::vector<u8> dir(dirSize);
++			if (dirSize == 0 || dirSize > (1u << 20) || !ReadAt(f, static_cast<u64>(dirLba) * kSector, dir.data(), dir.size()))
++				return false;
++			bool found = false;
++			for (size_t pos = 0; pos < dir.size();)
++			{
++				const u8 len = dir[pos];
++				if (len == 0) { pos = (pos / kSector + 1) * kSector; continue; }
++				if (pos + len > dir.size() || len < 34) break;
++				const u8 nlen = dir[pos + 32];
++				std::string name(reinterpret_cast<const char*>(&dir[pos + 33]), std::min<size_t>(nlen, len - 33));
++				if (const size_t semi = name.find(';'); semi != std::string::npos) name.resize(semi);
++				if (StringUtil::Strcasecmp(name.c_str(), path[depth]) == 0)
++				{
++					std::memcpy(&dirLba, &dir[pos + 2], 4);
++					std::memcpy(&dirSize, &dir[pos + 10], 4);
++					found = true;
++					break;
++				}
++				pos += len;
++			}
++			if (!found)
++				return false;
++		}
++		*lba = dirLba;
++		*size = dirSize;
++		return true;
++	}
++
++	// a valid font pack at off (count, offsets, "PS2 Fnt5" at entry 0): the first entry's offset and size
++	static bool CheckPack(std::FILE* f, u64 off, u64* e0, u32* e0size)
++	{
++		u8 h[0x48];
++		if (!ReadAt(f, off, h, sizeof(h)) || std::memcmp(h + 0x40, kMagic, 8) != 0)
++			return false;
++		u32 n, o0, o1;
++		std::memcpy(&n, h, 4); std::memcpy(&o0, h + 4, 4); std::memcpy(&o1, h + 8, 4);
++		if (n < 1 || n > 15 || o0 != 0x40 || o1 <= o0 || o1 - o0 > (1u << 20))
++			return false;
++		*e0 = off + o0;
++		*e0size = o1 - o0;
++		return true;
++	}
++
++	static bool Decode(const std::vector<u8>& raw, Font& out)
++	{
++		if (raw.size() < 0x80 || std::memcmp(raw.data(), kMagic, 8) != 0)
++			return false;
++		const u32 texOff = Rd32(raw, 0x0c), gtab = Rd32(raw, 0x14), ng = Rd32(raw, 0x18);
++		out.cellH = Rd32(raw, 0x20);
++		const u64 tex0 = Rd64(raw, texOff + 0x30);
++		if (((tex0 >> 20) & 63) != 0x14 || gtab <= texOff || gtab > raw.size() || gtab + 6ull * ng > raw.size())
++			return false;
++		out.tw = 1u << ((tex0 >> 26) & 15);
++		out.th = 1u << ((tex0 >> 30) & 15);
++		const u32 tbw = static_cast<u32>((tex0 >> 14) & 63);
++		if (out.tw > 1024 || out.th > 1024)
++			return false;
++		// the GIF packets of the texture block: TRXREG then an IMAGE tag, once for the texels, once for the CLUT
++		struct Img { u32 w, h; size_t off; };
++		std::vector<Img> imgs;
++		u32 trxW = 0, trxH = 0;
++		for (size_t q = texOff; q + 16 <= gtab && imgs.size() < 2;)
++		{
++			const u64 lo = Rd64(raw, q), hi = Rd64(raw, q + 8);
++			if ((hi & 0xff) == 0x52) { trxW = lo & 0xfff; trxH = (lo >> 32) & 0xfff; }
++			const u64 nloop = lo & 0x7fff, flg = (lo >> 58) & 3;
++			if (trxW && flg == 2 && nloop * 16 == static_cast<u64>(trxW) * trxH * 4 && q + 16 + nloop * 16 <= gtab)
++			{
++				imgs.push_back({trxW, trxH, q + 16});
++				q += 16 + static_cast<size_t>(nloop) * 16;
++				trxW = trxH = 0;
++				continue;
++			}
++			q += (q % 16 == 0) ? 16 : 4;
++		}
++		if (imgs.size() < 2)
++			return false;
++		std::vector<u8> mem(std::max<size_t>(1u << 20, static_cast<size_t>(imgs[0].w) * imgs[0].h * 8));
++		const u32 bw = std::max<u32>(1, imgs[0].w / 64);
++		for (u32 y = 0, i = 0; y < imgs[0].h; y++)
++			for (u32 x = 0; x < imgs[0].w; x++, i++)
++			{
++				const size_t a = static_cast<size_t>(Ct32Word(x, y, bw)) * 4;
++				if (a + 4 <= mem.size()) std::memcpy(&mem[a], &raw[imgs[0].off + i * 4], 4);
++			}
++		std::vector<u8> cmem(64 * 1024);
++		for (u32 y = 0, i = 0; y < imgs[1].h; y++)
++			for (u32 x = 0; x < imgs[1].w; x++, i++)
++			{
++				const size_t a = static_cast<size_t>(Ct32Word(x, y, 1)) * 4;
++				if (a + 4 <= cmem.size()) std::memcpy(&cmem[a], &raw[imgs[1].off + i * 4], 4);
++			}
++		u8 alpha[4][16];
++		static const u32 kBlk[4][2] = {{0, 0}, {8, 0}, {0, 8}, {8, 8}};
++		for (int p = 0; p < 4; p++)
++			for (u32 i = 0; i < 16; i++)
++			{
++				const size_t a = static_cast<size_t>(Ct32Word(kBlk[p][0] + (i & 7), kBlk[p][1] + (i >> 3), 1)) * 4;
++				alpha[p][i] = static_cast<u8>(std::min<u32>(255, cmem[a + 3] * 255u / 128u));
++			}
++		out.rgba.assign(static_cast<size_t>(out.tw) * out.th * 4, 0);
++		for (u32 y = 0; y < out.th; y++)
++			for (u32 x = 0; x < out.tw; x++)
++			{
++				const u32 n = T4Nibble(x, y, tbw);
++				const u8 b = (n >> 1) < mem.size() ? mem[n >> 1] : 0;
++				const u8 idx = (n & 1) ? (b >> 4) : (b & 15);
++				for (int p = 0; p < 4; p++)
++					out.rgba[(static_cast<size_t>(p) * out.th + y) * out.tw + x] = 0x00FFFFFFu | (static_cast<u32>(alpha[p][idx]) << 24);
++			}
++		for (u32 i = 0; i < ng; i++)
++		{
++			u16 code, a, b;
++			std::memcpy(&code, &raw[gtab + 6 * i], 2);
++			std::memcpy(&a, &raw[gtab + 6 * i + 2], 2);
++			std::memcpy(&b, &raw[gtab + 6 * i + 4], 2);
++			const Glyph g{static_cast<u16>(a & 0x3ff), static_cast<u16>(b & 0x3ff), static_cast<u8>((a >> 10) & 0x1f),
++				static_cast<u8>((b >> 10) & 0x1f), static_cast<u8>(((b >> 15) << 1) | (a >> 15))};
++			out.glyphs.emplace(code, g); // the first of a duplicate, like the game's binary search
++		}
++		return !out.glyphs.empty();
++	}
++
++	static void Load()
++	{
++		Font& f = s_font;
++		f.tried = true;
++		const char* iso = std::getenv("PS2X_CD_IMAGE");
++		if (!iso || !iso[0])
++			return;
++		std::FILE* fp = FileSystem::OpenCFile(iso, "rb");
++		if (!fp)
++			return;
++		u64 lba = 0, entry = 0;
++		u32 size = 0, entrySize = 0;
++		bool found = false;
++		if (IsoFind(fp, &lba, &size))
++		{
++			const u64 base = lba * kSector;
++			found = 0x15E000u < size && CheckPack(fp, base + 0x15E000u, &entry, &entrySize);
++			for (u64 s = 0; !found && s + 0x48 < size && s < (64ull << 20); s += kSector) // not where expected: scan
++				found = CheckPack(fp, base + s, &entry, &entrySize);
++		}
++		std::vector<u8> raw(entrySize);
++		if (found && ReadAt(fp, entry, raw.data(), raw.size()) && Decode(raw, f))
++			f.ok = true;
++		std::fclose(fp);
++		Console.WriteLn("(GSDumpReplayer) Game font: %s (%zu glyphs).", f.ok ? "loaded from the disc" : "not found, using ImGui's",
++			f.glyphs.size());
++	}
++
++	static bool Ready()
++	{
++		if (!s_font.tried)
++			Load();
++		if (!s_font.ok)
++			return false;
++		if (!s_font.texture && g_gs_device)
++		{
++			s_font.texture = g_gs_device->CreateTexture(s_font.tw, s_font.th * 4, 1, GSTexture::Format::Color);
++			if (!s_font.texture || !s_font.texture->Update(GSVector4i(0, 0, s_font.tw, s_font.th * 4), s_font.rgba.data(), s_font.tw * 4))
++			{
++				s_font.texture = nullptr;
++				s_font.ok = false;
++				return false;
++			}
++		}
++		return s_font.texture != nullptr;
++	}
++
++	static std::u32string Utf32(const std::string& s)
++	{
++		std::u32string out;
++		for (size_t i = 0; i < s.size();)
++		{
++			const u8 c = static_cast<u8>(s[i]);
++			const int n = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : 4;
++			char32_t cp = n == 1 ? c : n == 2 ? (c & 0x1f) : n == 3 ? (c & 0x0f) : (c & 0x07);
++			for (int k = 1; k < n && i + k < s.size(); k++)
++				cp = (cp << 6) | (static_cast<u8>(s[i + k]) & 0x3f);
++			out.push_back(cp);
++			i += n;
++		}
++		return out;
++	}
++
++	static float Width(const std::string& text, float scale)
++	{
++		float w = 0.0f;
++		for (char32_t c : Utf32(text))
++			if (auto it = s_font.glyphs.find(c == 0xa0 ? 0x20 : c); it != s_font.glyphs.end())
++				w += it->second.w * scale;
++		return w;
++	}
++
++	// like the game's description text: an 8-direction outline first (sub_0023BE08's mode 2), then the glyphs
++	static void Draw(ImDrawList* dl, ImVec2 pos, float scale, const std::string& text, ImU32 color, ImU32 outline)
++	{
++		const ImTextureID tex = reinterpret_cast<ImTextureID>(s_font.texture->GetNativeHandle());
++		const float iw = 1.0f / s_font.tw, ih = 1.0f / (s_font.th * 4.0f);
++		const std::u32string cps = Utf32(text);
++		const float o = std::max(1.0f, std::floor(scale + 0.5f));
++		for (int pass = 0; pass < 2; pass++)
++		{
++			float x = pos.x;
++			for (char32_t c : cps)
++			{
++				const auto it = s_font.glyphs.find(c == 0xa0 ? 0x20 : c);
++				if (it == s_font.glyphs.end())
++					continue;
++				const Glyph& g = it->second;
++				const ImVec2 uv0(g.x * iw, (g.plane * s_font.th + g.y) * ih), uv1((g.x + g.w) * iw, (g.plane * s_font.th + g.y + g.h) * ih);
++				const ImVec2 p0(x, pos.y), p1(x + g.w * scale, pos.y + g.h * scale);
++				if (pass == 0)
++				{
++					for (int dy = -1; dy <= 1; dy++)
++						for (int dx = -1; dx <= 1; dx++)
++							if (dx || dy)
++								dl->AddImage(tex, ImVec2(p0.x + dx * o, p0.y + dy * o), ImVec2(p1.x + dx * o, p1.y + dy * o), uv0, uv1, outline);
++				}
++				else
++					dl->AddImage(tex, p0, p1, uv0, uv1, color);
++				x += g.w * scale;
++			}
++		}
++	}
++} // namespace bt4font
++
 +// The online banner (RingHeader::netStatus, set by the game): a box at the top centre with what the online match
 +// is doing. Drawn with each frame the game presents; while the game waits for the other player it presents none,
 +// so the banner set just before that wait stays on screen.
@@ -50,11 +423,39 @@ index 2259b89..08e1c01 100644
 +	switch (status)
 +	{
 +		case 1: title = "Partida online"; line = "Preparando la partida con " + s_peer + "..."; break;
-+		case 2: title = "Esperando a " + s_peer; line = "En el menu Multijugador. Empezais en cuanto llegue."; break;
++		case 2: title = "Esperando a " + s_peer; line = "En el menú Multijugador. Empezáis en cuanto llegue."; break;
 +		case 3: title = "Conectado con " + s_peer; line = "El jugador 1 elige el modo."; accent = IM_COL32(90, 210, 120, 255); break;
-+		case 4: title = "No se pudo conectar con " + s_peer; line = "Sigues jugando sin conexion."; accent = IM_COL32(230, 80, 70, 255); break;
-+		case 5: title = "Estas en una partida online"; line = "Para salir, abre el launcher (Back + Start o Shift + Tab)."; break;
-+		default: title = "Se perdio la conexion con " + s_peer; line = "Sigues jugando sin conexion."; accent = IM_COL32(230, 80, 70, 255); break;
++		case 4: title = "No se pudo conectar con " + s_peer; line = "Sigues jugando sin conexión."; accent = IM_COL32(230, 80, 70, 255); break;
++		case 5: title = "Estás en una partida online"; line = "Para salir, abre el launcher (Back + Start o Shift + Tab)."; break;
++		default: title = "Se perdió la conexión con " + s_peer; line = "Sigues jugando sin conexión."; accent = IM_COL32(230, 80, 70, 255); break;
++	}
++	const ImVec2 display = ImGui::GetIO().DisplaySize;
++	ImDrawList* dl = ImGui::GetForegroundDrawList();
++	if (bt4font::Ready())
++	{
++		// The game's own look: its text font at the size the game draws it (a 20 px cell in a 448-line picture), the
++		// white text with a black outline of the description boxes, under a gold bar like the selected menu row.
++		const float s = std::max(1.0f, display.y / 448.0f);
++		const float cell = static_cast<float>(bt4font::s_font.cellH ? bt4font::s_font.cellH : 20) * s;
++		const float pad = std::ceil(10.0f * s);
++		const float tw = bt4font::Width(title, s), lw = bt4font::Width(line, s);
++		const float width = std::max(tw, lw) + pad * 4.0f;
++		const float barH = cell + pad, boxH = cell + pad * 2.0f;
++		const ImVec2 p0((display.x - width) * 0.5f, std::ceil(16.0f * s));
++		const ImVec2 bar1(p0.x + width, p0.y + barH);
++		const ImVec2 box1(p0.x + width, bar1.y + boxH);
++		const float r = 6.0f * s;
++		// the description box: deep blue, a lighter blue rim
++		dl->AddRectFilled(ImVec2(p0.x, bar1.y - r), box1, IM_COL32(12, 52, 92, 235), r);
++		dl->AddRect(ImVec2(p0.x, bar1.y - r), box1, IM_COL32(70, 160, 200, 255), r, 2.0f * s);
++		// the title bar: gold gradient (status colour at the edge), dark rim
++		const ImU32 goldTop = IM_COL32(255, 222, 96, 255), goldBot = IM_COL32(214, 150, 24, 255);
++		dl->AddRectFilledMultiColor(p0, bar1, goldTop, goldTop, goldBot, goldBot);
++		dl->AddRect(p0, bar1, IM_COL32(90, 50, 0, 255), 0.0f, 2.0f * s);
++		dl->AddRectFilled(ImVec2(bar1.x - pad * 1.2f, p0.y + 2.0f * s), ImVec2(bar1.x - pad * 0.4f, bar1.y - 2.0f * s), accent, 2.0f * s);
++		bt4font::Draw(dl, ImVec2(p0.x + pad * 2.0f, p0.y + (barH - cell) * 0.5f), s, title, IM_COL32(255, 255, 255, 255), IM_COL32(110, 40, 0, 255));
++		bt4font::Draw(dl, ImVec2(p0.x + pad * 2.0f, bar1.y + pad), s, line, IM_COL32(255, 255, 255, 255), IM_COL32(0, 0, 0, 255));
++		return;
 +	}
 +	const float scale = ImGuiManager::GetGlobalScale();
 +	ImFont* const font = ImGuiManager::GetStandardFont();
@@ -64,10 +465,8 @@ index 2259b89..08e1c01 100644
 +	const ImVec2 ls = font->CalcTextSizeA(font_size, FLT_MAX, -1.0f, line.c_str());
 +	const float width = std::max(ts.x, ls.x) + pad * 2.0f;
 +	const float height = ts.y + ls.y + pad * 2.0f + std::ceil(6.0f * scale);
-+	const ImVec2 display = ImGui::GetIO().DisplaySize;
 +	const ImVec2 p0((display.x - width) * 0.5f, std::ceil(24.0f * scale));
 +	const ImVec2 p1(p0.x + width, p0.y + height);
-+	ImDrawList* dl = ImGui::GetForegroundDrawList();
 +	dl->AddRectFilled(p0, p1, IM_COL32(10, 10, 20, 225), 10.0f * scale);
 +	dl->AddRect(p0, p1, accent, 10.0f * scale, 2.0f * scale);
 +	dl->AddText(font, font_size * 1.2f, ImVec2(p0.x + pad, p0.y + pad), accent, title.c_str());
@@ -84,7 +483,15 @@ index 2259b89..08e1c01 100644
  		RenderLiveMenu();
  		return;
  	}
-@@ -1107,6 +1162,15 @@ bool GSDumpReplayer::AttachLiveRing(Error* error)
+@@ -1040,6 +1464,7 @@ static bool AttachLiveRingMapping(Error* error)
+ 	s_live.events = ps2live::ringEvents(header);
+ 	if (!s_live_ring_suffix.empty())
+ 		s_live.producer_pid = static_cast<pid_t>(std::strtoul(s_live_ring_suffix.c_str(), nullptr, 10));
++	s_live.known_pid = static_cast<u32>(s_live.producer_pid);
+ 	return true;
+ }
+ #endif
+@@ -1107,11 +1532,21 @@ bool GSDumpReplayer::AttachLiveRing(Error* error)
  		ps2live::objectName(ps2live::kDataEventName, s_live_ring_suffix).c_str());
  	s_live.space_event = OpenEventW(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE,
  		ps2live::objectName(ps2live::kSpaceEventName, s_live_ring_suffix).c_str());
@@ -100,7 +507,13 @@ index 2259b89..08e1c01 100644
  	if (!s_live_ring_suffix.empty())
  	{
  		const DWORD pid = static_cast<DWORD>(std::wcstoul(s_live_ring_suffix.c_str(), nullptr, 10));
-@@ -1140,6 +1204,23 @@ void GSDumpReplayer::SetLivePad(u32 buttons, u32 axes)
+ 		if (pid != 0)
+ 			s_live.producer_process = OpenProcess(SYNCHRONIZE, FALSE, pid);
++		s_live.known_pid = pid;
+ 	}
+ #else
+ 	if (!AttachLiveRingMapping(error))
+@@ -1140,6 +1575,23 @@ void GSDumpReplayer::SetLivePad(u32 buttons, u32 axes)
  #endif
  }
  
@@ -139,10 +552,10 @@ index 1db531a..2429598 100644
  	/// Writes a minimal dump (header + registers, no packets) to boot the replayer with.
  	bool WriteLiveBootDump(const std::string& path, Error* error);
 diff --git a/pcsx2/Ps2LiveRing.h b/pcsx2/Ps2LiveRing.h
-index 0045f01..73e2da5 100644
+index 0045f01..e3729f4 100644
 --- a/pcsx2/Ps2LiveRing.h
 +++ b/pcsx2/Ps2LiveRing.h
-@@ -53,7 +53,19 @@ namespace ps2live
+@@ -53,7 +53,26 @@ namespace ps2live
          volatile uint32_t consumerWaiting; // host blocked on the data event
          volatile uint32_t producerFlags;
          volatile uint32_t producerWaiting; // game blocked on the space event (ring full)
@@ -157,12 +570,19 @@ index 0045f01..73e2da5 100644
 +        // menu), 6 the connection was lost after the meeting. The other player's name is in the host's
 +        // environment (PS2X_NET_PEER_NAME). Also in the padding: the layout is unchanged.
 +        volatile uint32_t netStatus;
++        // [handover] The game can be replaced under the same window: the old game sets handover = 1 and exits, a new
++        // game opens this ring by name (PS2X_LIVE_ATTACH=<suffix>), writes its pid into producerPid and clears
++        // handover. Meanwhile the host keeps its window and waits instead of closing; it watches producerPid, not the
++        // pid in the ring's name. (An online match accepted during an offline game: the new game boots from zero, as
++        // lockstep needs, and the player never sees the window close.) The last two words of the padding.
++        volatile uint32_t handover;
++        volatile uint32_t producerPid;
      };
 +    static_assert(sizeof(RingHeader) == 192, "the ring header layout is shared with older builds");
  
      // Object names for one game instance: base name + "_" + suffix (the game's process id, passed
      // to the host as "-livering <suffix>"), so several instances never share a ring.
-@@ -67,7 +79,35 @@ namespace ps2live
+@@ -67,7 +86,35 @@ namespace ps2live
          return reinterpret_cast<uint8_t *>(header) + sizeof(RingHeader);
      }
  

@@ -103,7 +103,7 @@ runners hold the game's code already recompiled from the Beta 14 Rev2 ELF (no IS
 
 ## Download and play (Mac, nothing to compile)
 
-**[⬇ DBZ_BT4_Mac.zip](https://github.com/recomp-code/dbz-bt4-recomp/releases/latest/download/DBZ_BT4_Mac.zip)** (36 MB, Apple Silicon, macOS 14 or newer, from the [latest release](https://github.com/recomp-code/dbz-bt4-recomp/releases/latest))
+**[⬇ DBZ_BT4_Mac.zip](https://github.com/recomp-code/dbz-bt4-recomp/releases/latest/download/DBZ_BT4_Mac.zip)** (38 MB, Apple Silicon, macOS 14 or newer, from the [latest release](https://github.com/recomp-code/dbz-bt4-recomp/releases/latest))
 
 1. Unzip it and drag `DBZ_BT4.app` to Applications (or anywhere).
 2. The app is not signed with an Apple developer account, so macOS blocks the first start. Open it once like this:

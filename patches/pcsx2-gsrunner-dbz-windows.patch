@@ -1,8 +1,16 @@
 diff --git a/pcsx2/GSDumpReplayer.cpp b/pcsx2/GSDumpReplayer.cpp
-index 2259b89..97cc0b4 100644
+index 2259b89..89c6f8d 100644
 --- a/pcsx2/GSDumpReplayer.cpp
 +++ b/pcsx2/GSDumpReplayer.cpp
-@@ -31,8 +31,14 @@
+@@ -10,6 +10,7 @@
+ #include "Gif.h"
+ #include "Gif_Unit.h"
+ #include "Host.h"
++#include "MTGS.h"
+ #include "PerformanceMetrics.h"
+ #include "ImGui/ImGuiManager.h"
+ #include "ImGui/ImGuiOverlays.h"
+@@ -31,8 +32,15 @@
  #include "common/Threading.h"
  #include "common/Timer.h"
  
@@ -11,13 +19,14 @@ index 2259b89..97cc0b4 100644
  #include <atomic>
  #include <cfloat>
 +#include <chrono>
++#include <cstring>
 +#include <string>
 +#include <unordered_map>
 +#include <vector>
  #include <cmath>
  #include <mutex>
  #include <string>
-@@ -119,6 +125,7 @@ namespace
+@@ -119,6 +127,7 @@ namespace
  		HANDLE mapping = nullptr;
  		HANDLE data_event = nullptr;
  		HANDLE space_event = nullptr;
@@ -25,7 +34,7 @@ index 2259b89..97cc0b4 100644
  		HANDLE producer_process = nullptr; // the game (its pid is the ring suffix)
  #else
  		int mapping_fd = -1;
-@@ -128,6 +135,8 @@ namespace
+@@ -128,6 +137,8 @@ namespace
  		ps2live::RingHeader* header = nullptr;
  		u8* data = nullptr;
  		u64 capacity = 0;
@@ -34,7 +43,7 @@ index 2259b89..97cc0b4 100644
  		bool stream_header_done = false;
  		std::vector<u8> buffer;
  	};
-@@ -145,6 +154,23 @@ namespace
+@@ -145,6 +156,23 @@ namespace
  
  	bool LiveReadRing(void* dst, size_t size);
  
@@ -58,7 +67,7 @@ index 2259b89..97cc0b4 100644
  	// The game process is gone (killed without clearing producerAlive).
  	bool LiveProducerGone()
  	{
-@@ -211,6 +237,23 @@ namespace
+@@ -211,12 +239,42 @@ namespace
  			{
  				if (!s_dump_running)
  					return false;
@@ -82,7 +91,26 @@ index 2259b89..97cc0b4 100644
  				// The game exited (or was killed without clearing producerAlive): close too.
  				if (!s_live.header->producerAlive || LiveProducerGone())
  				{
-@@ -712,6 +755,18 @@ static void GSDumpReplayerLiveStep()
+ 					Host::RequestVMShutdown(false, false, false);
+ 					return false;
+ 				}
++				// [netplay] While the game waits for the other player it sends no frames: present the last one again
++				// (10 times a second) so the online banner shows and changes. Bloody Roar 4 waits at its very first
++				// frame, before anything was drawn.
++				if (s_live.header->netStatus != 0u)
++				{
++					static auto s_lastPresent = std::chrono::steady_clock::time_point{};
++					const auto now = std::chrono::steady_clock::now();
++					if (now - s_lastPresent > std::chrono::milliseconds(100))
++					{
++						s_lastPresent = now;
++						MTGS::PresentCurrentFrame();
++					}
++				}
+ 				const u64 waitStart = GetCPUTicks();
+ 				// Announce the wait so the game signals the event (it skips SetEvent otherwise),
+ 				// then re-check: data written before the announcement was seen would not wake us.
+@@ -712,6 +770,18 @@ static void GSDumpReplayerLiveStep()
  				__atomic_fetch_add(&s_live.events->readbackSeq, 1u, __ATOMIC_RELEASE);
  				ps2live::eventSet(&s_live.events->readback);
  			}
@@ -101,7 +129,7 @@ index 2259b89..97cc0b4 100644
  #endif
  		}
  		break;
-@@ -929,12 +984,381 @@ static void RenderLiveMenu()
+@@ -929,12 +999,387 @@ static void RenderLiveMenu()
  	dl->AddText(font, font_size * 0.85f, ImVec2(p0.x + pad, y + line_h * 0.25f), IM_COL32(160, 160, 170, 255), s_menu_footer.c_str());
  }
  
@@ -418,13 +446,19 @@ index 2259b89..97cc0b4 100644
 +		const char* v = std::getenv("PS2X_NET_PEER_NAME");
 +		return std::string((v && v[0]) ? v : "el otro jugador");
 +	}();
++	// DBZ BT4 meets at its multiplayer menu and player 1 picks the mode there; other games (Bloody Roar 4) meet at
++	// their first frame and both play the menus together.
++	static const bool s_dbz = [] {
++		const char* v = std::getenv("PS2X_LIVE_SERIAL");
++		return !v || !v[0] || std::strcmp(v, "SLUS-21978") == 0;
++	}();
 +	std::string title, line;
 +	ImU32 accent = IM_COL32(255, 160, 40, 255);
 +	switch (status)
 +	{
 +		case 1: title = "Partida online"; line = "Preparando la partida con " + s_peer + "..."; break;
-+		case 2: title = "Esperando a " + s_peer; line = "En el menú Multijugador. Empezáis en cuanto llegue."; break;
-+		case 3: title = "Conectado con " + s_peer; line = "El jugador 1 elige el modo."; accent = IM_COL32(90, 210, 120, 255); break;
++		case 2: title = "Esperando a " + s_peer; line = s_dbz ? "En el menú Multijugador. Empezáis en cuanto llegue." : "Empezáis en cuanto llegue."; break;
++		case 3: title = "Conectado con " + s_peer; line = s_dbz ? "El jugador 1 elige el modo." : "Jugáis los dos con vuestro mando."; accent = IM_COL32(90, 210, 120, 255); break;
 +		case 4: title = "No se pudo conectar con " + s_peer; line = "Sigues jugando sin conexión."; accent = IM_COL32(230, 80, 70, 255); break;
 +		case 5: title = "Estás en una partida online"; line = "Para salir, abre el launcher (Back + Start o Shift + Tab)."; break;
 +		default: title = "Se perdió la conexión con " + s_peer; line = "Sigues jugando sin conexión."; accent = IM_COL32(230, 80, 70, 255); break;
@@ -483,7 +517,7 @@ index 2259b89..97cc0b4 100644
  		RenderLiveMenu();
  		return;
  	}
-@@ -1040,6 +1464,7 @@ static bool AttachLiveRingMapping(Error* error)
+@@ -1040,6 +1485,7 @@ static bool AttachLiveRingMapping(Error* error)
  	s_live.events = ps2live::ringEvents(header);
  	if (!s_live_ring_suffix.empty())
  		s_live.producer_pid = static_cast<pid_t>(std::strtoul(s_live_ring_suffix.c_str(), nullptr, 10));
@@ -491,7 +525,7 @@ index 2259b89..97cc0b4 100644
  	return true;
  }
  #endif
-@@ -1107,11 +1532,21 @@ bool GSDumpReplayer::AttachLiveRing(Error* error)
+@@ -1107,11 +1553,21 @@ bool GSDumpReplayer::AttachLiveRing(Error* error)
  		ps2live::objectName(ps2live::kDataEventName, s_live_ring_suffix).c_str());
  	s_live.space_event = OpenEventW(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE,
  		ps2live::objectName(ps2live::kSpaceEventName, s_live_ring_suffix).c_str());
@@ -513,7 +547,7 @@ index 2259b89..97cc0b4 100644
  	}
  #else
  	if (!AttachLiveRingMapping(error))
-@@ -1140,6 +1575,23 @@ void GSDumpReplayer::SetLivePad(u32 buttons, u32 axes)
+@@ -1140,6 +1596,23 @@ void GSDumpReplayer::SetLivePad(u32 buttons, u32 axes)
  #endif
  }
  

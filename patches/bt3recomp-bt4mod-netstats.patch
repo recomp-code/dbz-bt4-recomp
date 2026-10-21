@@ -1,0 +1,68 @@
+diff --git a/ps2xRuntime/src/lib/game_overrides.cpp b/ps2xRuntime/src/lib/game_overrides.cpp
+index 6cc6c0e..6eb2e59 100644
+--- a/ps2xRuntime/src/lib/game_overrides.cpp
++++ b/ps2xRuntime/src/lib/game_overrides.cpp
+@@ -7018,6 +7018,55 @@ namespace
+                      (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed), save, steps);
+     }
+ 
++    // [netstats] PS2X_NET_STATS_FILE=<path>: the result of every fight of an online match, one line each, for the
++    // launcher's statistics (wins, losses, characters):
++    //   fight <n> winner=<1|2|0> c1=<P1 character> c2=<P2 character> hp1=<life> hp2=<life> frame=<game frame>
++    // The battle object (*(u32 *)0x2feb48) holds the phase at -0x50 (31 while the fighters fight, 4 once a fighter
++    // is down, 0 after) and the life of each side at +0x30/+0x34 (0..50000, the fighters' own value; +0x28/+0x2c is
++    // the bar's, which drains behind it). The fighters (character id at +0) are *(u32 *)0x2feb14 + 0xc64 and the
++    // next one 0x1600 on. When the phase leaves 31 the side with no life left lost; winner=0 when that does not tell
++    // (ring out, time up), and the launcher does not count those. Only while the two games are connected (after the
++    // meeting): a game that went on offline counts nothing. PS2X_NET_STATS_OFFLINE=1 also counts offline fights
++    // (tests). Read from the game thread at the frame tick: both games of a match see the same values.
++    static void bt3NetStats(uint8_t *rdram)
++    {
++        static const char *s_path = std::getenv("PS2X_NET_STATS_FILE");
++        if (!s_path || !s_path[0] || !rdram) return;
++        static const bool s_offline = [](){ const char *v = std::getenv("PS2X_NET_STATS_OFFLINE"); return v && v[0] == '1'; }();
++        static bool s_inFight = false;
++        static uint32_t s_n = 0, s_c1 = 0, s_c2 = 0;
++        const bool online = s_offline || (ps2NetActive() && ps2NetPeerConnected() && !ps2NetMeetPending());
++        const uint32_t b = rd32(rdram, 0x2feb48u) & 0x1FFFFFFFu;
++        const uint32_t phase = (b >= 0x50u) ? rd32(rdram, b - 0x50u) : 0u;
++        if (!online || !b) { s_inFight = false; return; }
++        if (phase == 31u)
++        {
++            if (!s_inFight)
++            {
++                const uint32_t f = rd32(rdram, 0x2feb14u) & 0x1FFFFFFFu;
++                s_c1 = f ? rd32(rdram, f + 0xc64u) : 0u;
++                s_c2 = f ? rd32(rdram, f + 0xc64u + 0x1600u) : 0u;
++                if (s_c1 > 0xffffu) s_c1 = 0u;
++                if (s_c2 > 0xffffu) s_c2 = 0u;
++            }
++            s_inFight = true;
++            return;
++        }
++        if (!s_inFight) return;
++        s_inFight = false;
++        const uint32_t hp1 = rd32(rdram, b + 0x30u), hp2 = rd32(rdram, b + 0x34u);
++        const int winner = (hp1 == 0u && hp2 != 0u) ? 2 : (hp2 == 0u && hp1 != 0u) ? 1 : 0;
++        ++s_n;
++        const unsigned long long fr = (unsigned long long)g_bt3FrameCount.load(std::memory_order_relaxed);
++        if (std::FILE *fp = std::fopen(s_path, "ab"))
++        {
++            std::fprintf(fp, "fight %u winner=%d c1=%u c2=%u hp1=%u hp2=%u frame=%llu\n", s_n, winner, s_c1, s_c2, hp1, hp2, fr);
++            std::fclose(fp);
++        }
++        std::fprintf(stderr, "[netstats] fight %u: winner=%d c1=%u c2=%u hp1=%u hp2=%u phase=%u frame=%llu\n",
++                     s_n, winner, s_c1, s_c2, hp1, hp2, phase, fr);
++    }
++
+     extern "C" void ps2xFrameGateWait(uint64_t frame, uint8_t *rdram, R5900Context *ctx);   // [rollback] ps2_runtime.cpp
+     extern "C" bool ps2xFrameStepOn();                                                        // [rollback] ps2_runtime.cpp
+     extern "C" bool ps2xRenderSkipOn();                                                       // [rollback] ps2_memory.cpp
+@@ -7146,6 +7195,7 @@ namespace
+         }
+         bt3StateWatch(rdram, ctx);   // [statewatch]
+         bt3UnlockAll(rdram, ctx, runtime);   // [unlockall]
++        bt3NetStats(rdram);                 // [netstats]
+         bt3MatchWatch(rdram);        // [matchwatch]
+         bt3MatchScan(rdram);         // [matchwatch] level 2
+         bt3MemWatch(rdram);          // [memwatch]

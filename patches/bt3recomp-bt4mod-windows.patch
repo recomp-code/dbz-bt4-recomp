@@ -1247,10 +1247,10 @@ index 33b15d8..0663a36 100644
  
  // [flush] Why this exists at all.
 diff --git a/ps2xRuntime/src/lib/pad_config.cpp b/ps2xRuntime/src/lib/pad_config.cpp
-index 65db527..bca1fc8 100644
+index 65db527..f8e639d 100644
 --- a/ps2xRuntime/src/lib/pad_config.cpp
 +++ b/ps2xRuntime/src/lib/pad_config.cpp
-@@ -644,10 +644,27 @@ namespace ps2_stubs
+@@ -644,10 +644,36 @@ namespace ps2_stubs
          axis(pkt.ry, (axes >> 24) & 0xFFu);
      }
  
@@ -1260,6 +1260,15 @@ index 65db527..bca1fc8 100644
 +    // Back + Start opens that launcher: with SELECT held, START is dropped, so the combo never pauses the game.
 +    static void gateLocalPad(PadPacket &pkt)
 +    {
++        // PS2X_NO_GAMEPAD=1 (automated runs, determinism checks): no physical pad at all, here too -- the GS host
++        // honoured it but the runtime still read SDL, and a connected controller's stick drift (0x7d / 0x84 around
++        // the centre) made two offline runs on the same Mac differ.
++        static const bool s_noPad = [](){ const char *v = std::getenv("PS2X_NO_GAMEPAD"); return v && v[0] && v[0] != '0'; }();
++        if (s_noPad)
++        {
++            pkt = PadPacket{};
++            return;
++        }
 +        if (ps2_gslive::liveActive() && !ps2_gslive::hostFocused())
 +        {
 +            pkt = PadPacket{};
@@ -1278,7 +1287,7 @@ index 65db527..bca1fc8 100644
          return pkt;
      }
  
-@@ -671,6 +688,7 @@ namespace ps2_stubs
+@@ -671,6 +697,7 @@ namespace ps2_stubs
      {
          PadPacket pkt = PadConfig::instance().poll(static_cast<size_t>(player));
          mergeLivePad(pkt, static_cast<size_t>(player));

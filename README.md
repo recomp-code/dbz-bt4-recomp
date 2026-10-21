@@ -24,7 +24,11 @@ with `windows/record_video.ps1` + `windows/mux_video.ps1`.
 
 ## Download and play (Windows, nothing to compile)
 
-**[⬇ DBZ_BT4_Windows.zip](https://github.com/recomp-code/dbz-bt4-recomp/releases/latest/download/DBZ_BT4_Windows.zip)** (96 MB, from the [latest release](https://github.com/recomp-code/dbz-bt4-recomp/releases/latest))
+**[⬇ DBZ_BT4_Windows.zip](https://github.com/recomp-code/dbz-bt4-recomp/releases/latest/download/DBZ_BT4_Windows.zip)** (97 MB, from the [latest release](https://github.com/recomp-code/dbz-bt4-recomp/releases/latest))
+
+| | |
+| --- | --- |
+| ![The launcher](docs/screenshots/launcher_library.jpg) | ![Online in the launcher](docs/screenshots/launcher_online.jpg) |
 
 1. Unzip it in a folder you can write to (Desktop, Documents, Downloads; not Program Files).
 2. Open `DBZ_BT4.exe`, press **Seleccionar ISO...** and pick your own image of the mod: `SLUS-219.78`, Beta 14 Rev2.
@@ -58,18 +62,30 @@ ports to open** on your router.
 2. You see who is online. Press **Invitar** on someone (or on a friend in the left column), turn on **Buscar partida**
    so others see you want to play, or create a **room** (with a password if you like, 2 to 4 players taking turns, with
    chat). **Buscar jugador por nombre** finds anyone, online or not; the star adds them to your friends.
-3. When the invitation is accepted, both games open by themselves, already connected: each player sees their own
-   fighter full screen (the split screen is gone), at the same 30 or 60 fps.
+3. When the invitation is accepted, each game boots on its own (*"Preparando la partida con …"*) and goes straight to
+   the game's **Multijugador** menu. The first one there shows *"Esperando a …"* until the other arrives; then both
+   check they are identical, measure the connection and start (*"Conectado con …"*). **Player 1 picks Simple / Equipos
+   / Equipos (PD)**, as on the console, and both go to character select together. If the other player doesn't arrive
+   within 2 minutes, you keep playing offline from that menu.
 4. During the match, **Back + Start** on the controller (or **Shift+Tab**) brings the launcher over the game: who is
-   online, invitations, the room's chat. **B** (or Back + Start again) goes back. While the launcher is in front the pad
-   does not move your fighter, and the combo never pauses the game.
-5. An invitation that arrives while you play alone shows over the game: **A** accepts (your current game closes;
-   anything not saved is lost), **B** says not now.
+   online, invitations, the room's chat, and **Salir de la partida online**. **B** (or Back + Start again) goes back.
+   While the launcher is in front the pad does not move your fighter, and the combo never pauses the game. Circle on the
+   Duel menus doesn't throw you out of the match by accident.
+5. An invitation that arrives while you play alone shows over the game: **A** accepts (the game window stays: the match
+   starts in it; anything not saved is lost), **B** says not now.
+
+| | |
+| --- | --- |
+| ![Waiting for the other player at the Multiplayer menu](docs/screenshots/online_waiting.jpg) | ![The same fight on both screens](docs/screenshots/online_fight.jpg) |
+
+**[▶ Video, 1:42: two copies online on one PC](docs/videos/dbz_bt4_online_windows.mp4)**: the second one starts 10 s
+later, the first waits at the Multiplayer menu, they meet, pick and fight; both screens show the same fight frame by
+frame. The messages are drawn in the game's own font, read from your ISO.
 
 Both players need the same release (the launcher says so otherwise). The match is lockstep: both games run the same
-frames with both players' inputs, a few frames late (the input delay, 3 by default) so they have time to cross the
-internet through the relay; the two sides compare a hash of the game state as they go. If the fight stutters because
-you are far apart, raise **Retraso de controles** in AJUSTES (the inviter's value is used).
+frames with both players' inputs, a few frames late (the input delay, measured automatically when the two meet) so they
+have time to cross the internet through the relay; the two sides compare a hash of the game state as they go. If the
+fight stutters because you are far apart, raise **Retraso de controles** in AJUSTES (the inviter's value is used).
 
 > **The mod is the work of Team BT4.** Get it, its updates and the PCSX2 extras (the `GameIndex.yaml` with the
 > SLUS-21978 fixes) from their official page: **https://teambt4.wixsite.com/teambt4projects**

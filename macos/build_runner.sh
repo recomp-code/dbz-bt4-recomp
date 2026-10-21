@@ -3,7 +3,7 @@
 # libarchive without Homebrew's lz4/zstd/libb2, so ps2EntryRunner loads only system libraries.
 # The bt3mod tree is BT3-Recomp e22a34b + patches/bt3recomp-bt4mod-full.patch + bt3recomp-bt4mod-windows.patch +
 # bt3recomp-bt4mod-macos.patch + bt3recomp-bt4mod-perf.patch + bt3recomp-bt4mod-unlock.patch
-# + bt3recomp-bt4mod-netstats.patch + bt3recomp-bt4mod-movieend.patch, with the game code generated as in the README's "Native macOS" section.
+# + bt3recomp-bt4mod-netstats.patch + bt3recomp-bt4mod-movieend.patch + bt3recomp-bt4mod-livebatch.patch, with the game code generated as in the README's "Native macOS" section.
 set -e
 cd ~/NBAStreetRecomp/bt3mod
 export PKG_CONFIG_PATH=~/NBAStreetRecomp/dbz/macdist/ffmpeg/lib/pkgconfig

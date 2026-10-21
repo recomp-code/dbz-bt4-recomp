@@ -21,6 +21,8 @@ foreach ($p in 1, 2) {
         PS2X_AUTOSTART = '1'; PS2X_AUTOSTART_LEFT = '1'
         PS2X_NET_RELAY = $Relay; PS2X_NET_TOKEN = $Token; PS2X_NET_PLAYER = "$p"; NET_OVERLAY = '1'; PS2X_NET_JUMP = '1'
         PS2X_FPS60 = $(if ($Fps60) { '1' } else { '0' }); PS2X_HALFSTEP = "$rt\fps60_sites.txt"; PS2X_DETHASH = '60'
+        # what the launcher sets online (profiles.go dbzEnv, game.go): without it the two games differ from frame 60
+        PS2X_FRAMESTEP = '1'; PS2X_FIBERS = '1'; PS2X_RANDSEED = '12345'; PS2X_RTC = '1767225600'; PS2X_UNLOCK_ALL = '1'
     }
     foreach ($k in $Env.Keys) { $e[$k] = $Env[$k] }
     $side = if ($p -eq 1) { $EnvP1 } else { $EnvP2 }

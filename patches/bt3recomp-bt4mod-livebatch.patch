@@ -1,0 +1,279 @@
+diff --git a/ps2xRuntime/src/lib/ps2_gs_gpu.cpp b/ps2xRuntime/src/lib/ps2_gs_gpu.cpp
+index 0357e7c..e609bcd 100644
+--- a/ps2xRuntime/src/lib/ps2_gs_gpu.cpp
++++ b/ps2xRuntime/src/lib/ps2_gs_gpu.cpp
+@@ -2569,8 +2569,8 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+                     const uint32_t q = nloop * nreg;
+                     off += q * 8u + ((q & 1u) ? 8u : 0u);
+                 }
+-                else if (flg == GIF_FMT_IMAGE)
+-                    off += nloop * 16u;   // texture data: PCSX2's VRAM, not ours
++                else   // GIF_FMT_IMAGE, and FLG=3, which the GIF also treats as IMAGE: texture data, PCSX2's VRAM, not ours
++                    off += nloop * 16u;
+             }
+             return;
+         }
+diff --git a/ps2xRuntime/src/lib/ps2_gs_live.cpp b/ps2xRuntime/src/lib/ps2_gs_live.cpp
+index aefd6e4..807c5df 100644
+--- a/ps2xRuntime/src/lib/ps2_gs_live.cpp
++++ b/ps2xRuntime/src/lib/ps2_gs_live.cpp
+@@ -178,6 +178,15 @@ namespace ps2_gslive
+             return v && v[0] && v[0] != '0';
+         }
+ 
++        // [livebatch] the host, idle-waiting for data, is woken once this many bytes are unread (VSync and ReadFIFO2
++        // wake it at once). PS2X_GSLIVE_WAKE_BYTES=0: wake it for every packet, as before.
++        uint64_t wakeBytes()
++        {
++            static const uint64_t s_bytes = [](){ const char *v = std::getenv("PS2X_GSLIVE_WAKE_BYTES");
++                                                  return v && v[0] ? std::strtoull(v, nullptr, 10) : 65536ull; }();
++            return s_bytes;
++        }
++
+         std::string serial()
+         {
+             const char *v = std::getenv("PS2X_LIVE_SERIAL");
+@@ -202,6 +211,8 @@ namespace ps2_gslive
+             uint64_t capacity = 0;
+             std::wstring suffix = std::to_wstring(GetCurrentProcessId()); // this instance's ring names
+             uint64_t waitNs = 0; // time the game blocked on a full ring ([gslive] stats)
++            uint64_t wakes = 0;  // host wake-ups ([gslive] stats)
++            int64_t staged = -1; // [livebatch] end of the bytes copied but not yet published (-1: none)
+ 
+             bool open()
+             {
+@@ -331,12 +342,13 @@ namespace ps2_gslive
+                 return hostExited;
+             }
+ 
+-            // Blocks while the ring is full (the host draws slower than the game produces).
+-            bool write(const uint8_t *src, size_t size)
++            // Blocks while the ring is full (the host draws slower than the game produces). publish = false leaves the
++            // bytes staged, so a packet's header and data reach the host with one writePos store ([livebatch]).
++            bool write(const uint8_t *src, size_t size, bool publish = true)
+             {
+                 while (size != 0u)
+                 {
+-                    const int64_t w = header->writePos;
++                    const int64_t w = staged >= 0 ? staged : header->writePos;
+                     const int64_t r = header->readPos;
+                     const uint64_t used = static_cast<uint64_t>(w - r);
+                     const uint64_t freeBytes = capacity - used;
+@@ -344,6 +356,7 @@ namespace ps2_gslive
+                     {
+                         if (hostGone())
+                             return false;
++                        flush();
+                         SetEvent(dataEvent);
+                         const auto t0 = std::chrono::steady_clock::now();
+                         header->producerWaiting = 1u;
+@@ -357,20 +370,37 @@ namespace ps2_gslive
+                     const uint64_t offset = static_cast<uint64_t>(w) % capacity;
+                     const size_t chunk = static_cast<size_t>(std::min<uint64_t>({size, freeBytes, capacity - offset}));
+                     std::memcpy(data + offset, src, chunk);
+-                    MemoryBarrier();
+-                    header->writePos = w + static_cast<int64_t>(chunk);
++                    staged = w + static_cast<int64_t>(chunk);
+                     src += chunk;
+                     size -= chunk;
+                 }
++                if (publish)
++                    flush();
+                 return true;
+             }
+ 
+-            // Only wake the host when it is actually blocked on the data event.
+-            void signal()
++            void flush()
++            {
++                if (staged < 0)
++                    return;
++                MemoryBarrier();
++                header->writePos = staged;
++                staged = -1;
++            }
++
++            // Only wake the host when it is actually blocked on the data event, and then ([livebatch]) only once it has
++            // wakeBytes() to read, unless forced (VSync, ReadFIFO2: the game is about to wait for the host).
++            // Waking it for every packet cost a system call per draw.
++            void signal(bool force)
+             {
+                 MemoryBarrier(); // writePos store before the consumerWaiting load
+-                if (!header->consumerFlags || header->consumerWaiting)
+-                    SetEvent(dataEvent);
++                if (header->consumerFlags && !header->consumerWaiting)
++                    return;
++                if (!force && header->consumerFlags &&
++                    static_cast<uint64_t>(header->writePos - header->readPos) < wakeBytes())
++                    return;
++                SetEvent(dataEvent);
++                ++wakes;
+             }
+ 
+             // Shared by every platform's ring (readFifoInto, the vsync lag wait, the exit message).
+@@ -423,8 +453,9 @@ namespace ps2_gslive
+             bool hostGone() { return header && header->consumerQuit; }
+ 
+             // Blocks while the ring is full. The page never blocks: it reads whole packets once per browser frame.
+-            bool write(const uint8_t *src, size_t size)
++            bool write(const uint8_t *src, size_t size, bool publish = true)
+             {
++                (void)publish;   // every chunk is published: the page reads whole packets only
+                 while (size != 0u)
+                 {
+                     const int64_t w = header->writePos;
+@@ -453,7 +484,8 @@ namespace ps2_gslive
+                 return true;
+             }
+ 
+-            void signal() {} // the page polls once per browser frame
++            void signal(bool) {} // the page polls once per browser frame
++            uint64_t wakes = 0;
+ 
+             static void fence() { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
+             void waitSpace(uint32_t ms) { ps2live::eventWait(&events->space, ms); }
+@@ -479,6 +511,8 @@ namespace ps2_gslive
+             std::string suffix = std::to_string(getpid()); // this instance's ring name
+             std::string mappingName = ps2live::objectName(ps2live::kPosixMappingName, suffix);
+             uint64_t waitNs = 0; // time the game blocked on a full ring ([gslive] stats)
++            uint64_t wakes = 0;  // host wake-ups ([gslive] stats)
++            int64_t staged = -1; // [livebatch] end of the bytes copied but not yet published (-1: none)
+ 
+             ~LiveRing()
+             {
+@@ -611,12 +645,13 @@ namespace ps2_gslive
+                 return hostExited;
+             }
+ 
+-            // Blocks while the ring is full (the host draws slower than the game produces).
+-            bool write(const uint8_t *src, size_t size)
++            // Blocks while the ring is full (the host draws slower than the game produces). publish = false leaves the
++            // bytes staged, so a packet's header and data reach the host with one writePos store ([livebatch]).
++            bool write(const uint8_t *src, size_t size, bool publish = true)
+             {
+                 while (size != 0u)
+                 {
+-                    const int64_t w = header->writePos;
++                    const int64_t w = staged >= 0 ? staged : header->writePos;
+                     const int64_t r = header->readPos;
+                     const uint64_t used = static_cast<uint64_t>(w - r);
+                     const uint64_t freeBytes = capacity - used;
+@@ -624,6 +659,7 @@ namespace ps2_gslive
+                     {
+                         if (hostGone())
+                             return false;
++                        flush();
+                         ps2live::eventSet(&events->data);
+                         const auto t0 = std::chrono::steady_clock::now();
+                         header->producerWaiting = 1u;
+@@ -637,20 +673,36 @@ namespace ps2_gslive
+                     const uint64_t offset = static_cast<uint64_t>(w) % capacity;
+                     const size_t chunk = static_cast<size_t>(std::min<uint64_t>({size, freeBytes, capacity - offset}));
+                     std::memcpy(data + offset, src, chunk);
+-                    __atomic_thread_fence(__ATOMIC_RELEASE);
+-                    header->writePos = w + static_cast<int64_t>(chunk);
++                    staged = w + static_cast<int64_t>(chunk);
+                     src += chunk;
+                     size -= chunk;
+                 }
++                if (publish)
++                    flush();
+                 return true;
+             }
+ 
+-            // Only wake the host when it is actually blocked on the data event.
+-            void signal()
++            void flush()
++            {
++                if (staged < 0)
++                    return;
++                __atomic_thread_fence(__ATOMIC_RELEASE);
++                header->writePos = staged;
++                staged = -1;
++            }
++
++            // Only wake the host when it is actually blocked on the data event, and then ([livebatch]) only once it has
++            // wakeBytes() to read, unless forced (VSync, ReadFIFO2: the game is about to wait for the host).
++            void signal(bool force)
+             {
+                 __atomic_thread_fence(__ATOMIC_SEQ_CST); // writePos store before the consumerWaiting load
+-                if (!header->consumerFlags || header->consumerWaiting)
+-                    ps2live::eventSet(&events->data);
++                if (header->consumerFlags && !header->consumerWaiting)
++                    return;
++                if (!force && header->consumerFlags &&
++                    static_cast<uint64_t>(header->writePos - header->readPos) < wakeBytes())
++                    return;
++                ps2live::eventSet(&events->data);
++                ++wakes;
+             }
+ 
+             static void fence() { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
+@@ -695,14 +747,14 @@ namespace ps2_gslive
+ 
+             bool enabled() const { return liveActive || file != nullptr; }
+ 
+-            void write(const void *data, size_t size)
++            void write(const void *data, size_t size, bool publish = true)
+             {
+                 if (size == 0)
+                     return;
+ #if defined(PS2X_GS_LIVE_RING)
+                 if (liveActive)
+                 {
+-                    if (!live.write(static_cast<const uint8_t *>(data), size))
++                    if (!live.write(static_cast<const uint8_t *>(data), size, publish))
+                     {
+                         std::fprintf(stderr, "[gslive] GS host closed (%s), exiting\n", live.exitDescription().c_str());
+                         std::fflush(stderr);
+@@ -718,12 +770,13 @@ namespace ps2_gslive
+             void writeByte(uint8_t value) { write(&value, 1); }
+             void writeWord(uint32_t value) { write(&value, 4); }
+ 
+-            void endPacket()
++            // force = false (GS transfers): the host is woken only once enough is queued ([livebatch]).
++            void endPacket(bool force = true)
+             {
+                 ++statPackets;
+ #if defined(PS2X_GS_LIVE_RING)
+                 if (liveActive)
+-                    live.signal();
++                    live.signal(force);
+ #endif
+             }
+ 
+@@ -885,11 +938,11 @@ namespace ps2_gslive
+ 
+         void writeTransferLocked(Writer &w, int path, const uint8_t *data, uint32_t size)
+         {
+-            w.writeByte(kTypeTransfer);
+-            w.writeByte(path == 1 ? kPath1New : (path == 2 ? kPath2 : kPath3));
+-            w.writeWord(size);
++            uint8_t head[6] = {kTypeTransfer, path == 1 ? kPath1New : (path == 2 ? kPath2 : kPath3)};
++            std::memcpy(head + 2, &size, 4);
++            w.write(head, sizeof(head), false); // [livebatch] header and data published together
+             w.write(data, size);
+-            w.endPacket();
++            w.endPacket(false);
+         }
+     }
+ 
+@@ -1254,13 +1307,15 @@ namespace ps2_gslive
+         const double dt = std::chrono::duration<double>(now - w.statT0).count();
+         if (dt >= 5.0)
+         {
+-            uint64_t waitNs = 0;
++            uint64_t waitNs = 0, wakes = 0;
+ #if defined(PS2X_GS_LIVE_RING)
+             waitNs = w.live.waitNs;
+             w.live.waitNs = 0;
++            wakes = w.live.wakes;
++            w.live.wakes = 0;
+ #endif
+-            std::fprintf(stderr, "[gslive] %.1f frames/s, %.0f packets/s, %.1f MB/s, waited for the host %.1f ms/s (ring full %.1f)\n",
+-                         w.statFrames / dt, w.statPackets / dt, w.statBytes / dt / (1024.0 * 1024.0), (waitNs + w.lagWaitNs) / 1e6 / dt, waitNs / 1e6 / dt);
++            std::fprintf(stderr, "[gslive] %.1f frames/s, %.0f packets/s, %.1f MB/s, waited for the host %.1f ms/s (ring full %.1f), %.0f host wake-ups/s\n",
++                         w.statFrames / dt, w.statPackets / dt, w.statBytes / dt / (1024.0 * 1024.0), (waitNs + w.lagWaitNs) / 1e6 / dt, waitNs / 1e6 / dt, wakes / dt);
+             w.lagWaitNs = 0;
+             w.statFrames = w.statPackets = w.statBytes = 0;
+             w.statT0 = now;

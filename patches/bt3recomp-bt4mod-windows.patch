@@ -1378,3 +1378,27 @@ index ee80bab..54455bf 100644
          setReturnU32(ctx, sp);
      }
  
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+index 11f63d2..d9ae13d 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -20,6 +20,7 @@ extern std::atomic<uint32_t> g_ps2FmvActive; // [fmvphase] defined in ps2_gs_gpu
+ void ps2GsEmitFmvFrame();                   // [fmvblit] defined in ps2_gs_gpu.cpp
+ extern std::atomic<uint32_t> g_ps2MovieActive;  // [movsync] defined in ps2_gs_gpu.cpp
+ extern std::atomic<uint64_t> g_ps2MovieSession; // [movsync] defined in ps2_gs_gpu.cpp
++void ps2xHostDataMark(const uint8_t *p, uint32_t bytes);   // [dethash] game_overrides.cpp
+ 
+ // [movsync] FMV session tracker: INIT on the first served picture, END on Reset/Delete/finish/IsEnd.
+ // Always maintained (the override reads g_ps2MovieActive); the log is gated by PS2X_MOVIEPROBE.
+@@ -1454,6 +1455,11 @@ namespace ps2_stubs
+             const uint32_t outWidth = align16(width);
+             const uint32_t outHeight = align16(height);
+             const uint32_t macroblockColumns = outWidth / 16u;
++            // [dethash] decoded by this machine's FFmpeg: pixels, not game state, and two builds (Windows vs macOS)
++            // need not round alike. Mac vs Windows, the first difference after the boot was the intro movie's
++            // picture buffer (0x8de000) at frame 1620.
++            if (uint8_t *img = getMemPtr(rdram, destAddr))
++                ps2xHostDataMark(img, outWidth * outHeight * 4u);
+ 
+             for (uint32_t mbx = 0u; mbx < macroblockColumns; ++mbx)
+             {

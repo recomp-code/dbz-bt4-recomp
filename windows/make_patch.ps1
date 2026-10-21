@@ -1,4 +1,4 @@
-# Regenera los parches propios de Windows:
+﻿# Regenera los parches propios de Windows:
 #  patches\bt3recomp-bt4mod-windows.patch  sobre BT3-Recomp e22a34b + dbz-bt4-recomp\patches\bt3recomp-bt4mod-full.patch
 #  patches\pcsx2-gsrunner-dbz-windows.patch sobre el arbol PCSX2 de NBA + dbz-bt4-recomp\patches\pcsx2-gsrunner-live-dbz.patch
 $g = "C:\NBAStreetRecomp\tools\mingit\cmd\git.exe"
@@ -26,7 +26,8 @@ $rt = @('ps2xRuntime/src/lib/ps2_gs_live.cpp', 'ps2xRuntime/src/lib/ps2_live_rin
         'ps2xRuntime/include/runtime/ps2_netplay.h', 'ps2xRuntime/src/lib/ps2_runtime.cpp', 'ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp',
         'ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp',
         # state hash: the dead part of the thread stacks (main stack from SetupThread, workers' [base, sp))
-        'ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp', 'ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp')
+        'ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp', 'ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp',
+        'ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp')
 Write-Diff 'C:/DBZBT4Recomp/tmp_base' 'C:/DBZBT4Recomp/bt3mod' $rt "$R\patches\bt3recomp-bt4mod-windows.patch"
 & $g -C $base apply --check "$R\patches\bt3recomp-bt4mod-windows.patch"
 $ok1 = $LASTEXITCODE -eq 0
@@ -46,3 +47,4 @@ $ok2 = $LASTEXITCODE -eq 0
 Remove-Item -Recurse -Force $hb
 
 if ($ok1 -and $ok2) { "OK: patches\bt3recomp-bt4mod-windows.patch, patches\pcsx2-gsrunner-dbz-windows.patch" } else { throw "algun parche generado no aplica ($ok1 / $ok2)" }
+

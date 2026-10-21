@@ -536,10 +536,21 @@ index 0045f01..fac0c83 100644
      // the same mapping, after the data area (macOS: os_sync_wait_on_address, Linux: futex).
      // macOS limits shm names to 31 characters, so the base name is short.
 diff --git a/ps2xRuntime/src/lib/game_overrides.cpp b/ps2xRuntime/src/lib/game_overrides.cpp
-index 3c3d250..2a59f21 100644
+index 3c3d250..41d7444 100644
 --- a/ps2xRuntime/src/lib/game_overrides.cpp
 +++ b/ps2xRuntime/src/lib/game_overrides.cpp
-@@ -664,6 +664,26 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
+@@ -38,6 +38,10 @@ extern std::atomic<uint64_t> g_seamHostChunks;  // [fightgate] the seam's host m
+ // [syncrelax] true while the frame gate is engaged (async kick on, gate on, worker frame > one vblank): the gate
+ // then owns the frame rate, so the busy-bit pacing and the sceGsSyncPath drain can let the guest run ahead.
+ std::atomic<bool> g_ps2xFrameGateHeavy{false};
++// [dethash] the main thread's stack (Kernel/Syscalls/System.cpp SetupThread) and the workers' dead stack ranges
++// (Kernel/Syscalls/Thread.cpp): the state hash leaves out everything below each thread's $sp.
++uint32_t g_ps2MainStackTop = 0u, g_ps2MainStackSize = 0u;
++extern "C" int ps2xThreadDeadStacks(uint32_t *lo, uint32_t *hi, int cap);
+ extern "C" bool ps2xFrameGateHeavy() { return g_ps2xFrameGateHeavy.load(std::memory_order_relaxed); }
+ 
+ // [guestbusy-tid] FILE SCOPE, not inside bt3FrameKick. Declaring this extern "C" inside a function
+@@ -664,6 +668,26 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
      extern "C" int ps2xNetJumpSettledFor(uint32_t session)
      { return g_netJumpSession.load(std::memory_order_relaxed) == session && g_netJumpState.load(std::memory_order_relaxed) == 2; }
  
@@ -566,7 +577,7 @@ index 3c3d250..2a59f21 100644
      void writeNeutralPadPacket(uint8_t *rdram, uint32_t bufAddr, uint32_t socket)
      {
          // TEST (env PS2X_SOUNDREADY): force the sound-ready flags that FUN_0026d9a0
-@@ -698,21 +718,40 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
+@@ -698,21 +722,40 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
          uint8_t b1 = static_cast<uint8_t>((buttons >> 8) & 0xffu);
          // TEST (env PS2X_AUTOSTART): also tap START+CROSS periodically to auto-advance.
          static const bool s_autostart = [](){ const char *v = std::getenv("PS2X_AUTOSTART"); return v && v[0] && v[0] != '0'; }();
@@ -612,7 +623,7 @@ index 3c3d250..2a59f21 100644
              }
              else
              {
-@@ -724,7 +763,86 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
+@@ -724,7 +767,86 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
                  if (phase == 6u) { b1 = static_cast<uint8_t>(b1 & ~0x40u); b1 = static_cast<uint8_t>(b1 & ~0x80u); }   // CROSS+SQUARE (ki blast / rush)
              }
          }
@@ -700,7 +711,7 @@ index 3c3d250..2a59f21 100644
          // live for the first <n> pad reads) or the g_ps2ForceSkipFrames countdown the FMV override
          // pokes to end the native movie. PS2X_FORCE_SKIP_BTNS=<hex> overrides the cleared bits.
          bool forceSkip = false;
-@@ -4499,6 +4617,8 @@ namespace
+@@ -4499,6 +4621,8 @@ namespace
          static const int s_env = [](){ const char *v = ::getenv("PS2X_NETVIEW");
                                         return (v && v[0]) ? std::atoi(v) : 0; }();
          const int s_player = s_env ? s_env : (ps2NetActive() ? ps2NetLocalPlayer() : 0);
@@ -709,10 +720,11 @@ index 3c3d250..2a59f21 100644
          if (s_player == 1 || s_player == 2)
          {
              const uint32_t mode = getRegU32(ctx, 5);
-@@ -5267,6 +5387,35 @@ namespace
+@@ -5267,7 +5391,36 @@ namespace
      // EE RAM only, deliberately: guest state lives there, while the CPU context is transient
      // between frames and the R5900Context holds host pointers that would hash differently by
      // construction. ~2-3 ms/frame for 32 MB, which is fine for a diagnostic.
+-    static void ps2DetHashFrame(const uint8_t *rdram, __m128 ctxR)
 +    // [dethash] Guest memory a GS readback filled from the host GPU, as host pointers (the readback only knows its
 +    // destination pointer). A buffer that once held pixels keeps holding pixels, so the ranges accumulate (merged,
 +    // capped) for the run.
@@ -742,10 +754,11 @@ index 3c3d250..2a59f21 100644
 +        return out;
 +    }
 +
-     static void ps2DetHashFrame(const uint8_t *rdram, __m128 ctxR)
++    static void ps2DetHashFrame(const uint8_t *rdram, __m128 ctxR, uint32_t mainSp)
      {
          static const int s_every = [](){ const char *v = std::getenv("PS2X_DETHASH");
-@@ -5277,6 +5426,23 @@ namespace
+                                          const int n = (v && v[0]) ? std::atoi(v) : 0;
+@@ -5277,6 +5430,23 @@ namespace
          const unsigned long long f = g_bt3FrameCount.load(std::memory_order_relaxed);
          if (f % (unsigned long long)s_every) return;
          const uint64_t h = XXH3_64bits(rdram, PS2_RAM_SIZE);
@@ -769,7 +782,7 @@ index 3c3d250..2a59f21 100644
          // Second hash EXCLUDING the sound-stream / disc-stream window. Measured 2026-09-14: two
          // identical-input runs differ by only 12 bytes at frame 1 and 432 at frame 600, ALL of it
          // inside the sound stream control block at 0x2c9350 and its neighbours -- stream position
-@@ -5289,10 +5455,21 @@ namespace
+@@ -5289,10 +5459,33 @@ namespace
          if (s_skip)
          {
              constexpr uint32_t kStreamLo = 0x002c0000u, kStreamHi = 0x00300000u;   // sndblk dumps reach 0x2f72a0
@@ -778,6 +791,18 @@ index 3c3d250..2a59f21 100644
 +            // matched). Two machines -- above all Windows vs macOS -- never render bit for bit alike.
 +            std::vector<std::pair<uint32_t, uint32_t>> skip = ps2xHostDataRanges(rdram);
 +            skip.emplace_back(kStreamLo, kStreamHi);
++            // [dethash] and minus the dead part of every thread stack (below its $sp): Mac vs Windows at frame 60,
++            // the only gameplay-hash difference was 0x1effa00-0x1effbff, below the main thread's $sp -- residue of a
++            // disc lookup on one machine, of the next thread's creation on the other, the same work done either side
++            // of the frame boundary. The live frames above $sp stay in.
++            {
++                const uint32_t mainLo = g_ps2MainStackTop - g_ps2MainStackSize;
++                if (g_ps2MainStackSize && mainSp > mainLo && mainSp <= g_ps2MainStackTop)
++                    skip.emplace_back(mainLo, mainSp);
++                uint32_t lo[64], hi[64];
++                const int n = ps2xThreadDeadStacks(lo, hi, 64);
++                for (int i = 0; i < n; ++i) skip.emplace_back(lo[i], hi[i]);
++            }
 +            std::sort(skip.begin(), skip.end());
              XXH3_state_t *st = XXH3_createState();
              XXH3_64bits_reset(st);
@@ -793,7 +818,16 @@ index 3c3d250..2a59f21 100644
              const uint64_t g = XXH3_64bits_digest(st);
              XXH3_freeState(st);
              // [dethash] also report the RNG STREAM. The user's concern is the classic desync
-@@ -8348,3 +8525,6 @@ extern "C" int ps2xMenuSePlay(int bank, int idx)
+@@ -6821,7 +7014,7 @@ namespace
+         // runs every frame whatever the UI is doing, and it is the only place with the guest RAM in
+         // hand -- which the box's `dump` verb needs. The module throttles the actual stat().
+         ps2xNotifyPollDropBox(ps2xDropBoxDir(), rdram);
+-        ps2DetHashFrame(rdram, ctx->vu0_r);   // [dethash]
++        ps2DetHashFrame(rdram, ctx->vu0_r, getRegU32(ctx, 29));   // [dethash] (this tick runs on the main thread)
+         if (g_ps2StepCensus.load(std::memory_order_relaxed)) ps2StepCensusFrame(ctx);   // [stepcensus]
+         ps2HalfStepFrame(ctx);        // [halfstep] (no-op unless configured; raises the macro switch on fight frames only)
+         {   // [findclock] PS2X_FINDCLOCK=<start value>: when the fight gate opens, remember every 32-bit slot holding a value
+@@ -8348,3 +8541,6 @@ extern "C" int ps2xMenuSePlay(int bank, int idx)
  }
  
  

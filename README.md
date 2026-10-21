@@ -1,7 +1,7 @@
-# DBZ Budokai Tenkaichi 4 (BT3 mod) — PS2Recomp
+# DBZ Budokai Tenkaichi 4 — PS2Recomp
 
-Static recompilation of *Dragon Ball Z: Budokai Tenkaichi 4* (the [Team BT4](https://teambt4.wixsite.com/teambt4projects)
-fan mod of BT3, disc `SLUS-219.78`, "Beta 14 Rev2") with [PS2Recomp](https://github.com/ran-j/PS2Recomp). It runs on these targets:
+*Dragon Ball Z: Budokai Tenkaichi 4*, the [Team BT4](https://teambt4.wixsite.com/teambt4projects) fan mod of BT3
+(disc `SLUS-219.78`, "Beta 14 Rev2"), statically recompiled to run natively on **Windows** and **Mac**, with online play.
 
 | | |
 | --- | --- |
@@ -14,278 +14,92 @@ fan mod of BT3, disc `SLUS-219.78`, "Beta 14 Rev2") with [PS2Recomp](https://git
 https://github.com/user-attachments/assets/f0d626ea-ad75-40a9-a4c0-8109d5d1ce4c
 
 *65 s of highlights (720p60; GitHub only plays videos up to 10 MB inline).*
-**[▶ Full video, 4:22: the mod's characters and stages, Jiren vs. Zamas (Fusion) at the Tournament of Power](docs/videos/dbz_bt4_mod.mp4)**
-(native Windows build, 6x internal resolution, 2560x1440 at 60 fps, game audio; AV1). It enters the mod's unlock-all
-code on the main menu (hold L1+R1, then Down, Right, Triangle, Down, Left, Triangle, Up: the seven Dragon Balls light up),
-goes through the roster rows that BT3 never had (Super Saiyan Blue forms, Beerus, Broly SSJ3, Cell Max, Goku Black,
-Zamas, Toppo, Jiren, Hit, Cabba, Caulifla, Kale...), the new stages (Tournament of Power, Champa's ring, Planet Tsufuru,
-Red Ribbon base, Muscle Tower, Baba's palace, Space...) and fights on the Tournament of Power stage. Recorded unattended
-with `windows/record_video.ps1` + `windows/mux_video.ps1`.
+**[▶ Full video, 4:22](docs/videos/dbz_bt4_mod.mp4)**: the mod's new characters (Super Saiyan Blue, Beerus, Goku Black,
+Zamas, Jiren, Hit, Caulifla, Kale...) and stages (Tournament of Power, Champa's ring...).
 
-## Download and play (Windows, nothing to compile)
+## Features
 
-**[⬇ DBZ_BT4_Windows.zip](https://github.com/recomp-code/dbz-bt4-recomp/releases/latest/download/DBZ_BT4_Windows.zip)** (97 MB, from the [latest release](https://github.com/recomp-code/dbz-bt4-recomp/releases/latest))
+- **Native on Windows and Mac (Apple Silicon)**: ready-to-play zips with a launcher. No emulator to set up.
+- **Sharp graphics**: PCSX2's GS renderer up to 6x internal resolution, NVIDIA DLSS or AMD FSR on Windows (and an
+  experimental DLSS 5 neural pass), Apple MetalFX on Mac.
+- **60 fps fights**, switchable at any time, even mid-fight.
+- **Online play**: accounts, friends, invitations, rooms of 2 to 4 players taking turns, with chat. Windows and Mac play
+  together. No ports to open. Both games run the same frames (lockstep) and check each other as they go.
+- **Online statistics**: fights won and lost, win rate, time played online and a table of the best players.
+- **Everything unlocked** from the start (an option, on by default): every character, stage and mode.
+- Controllers (Xbox, PlayStation, MFi) and keyboard; an in-game options menu (F1 or hold START).
+
+## Download and play
+
+| Windows 10/11 (64-bit, GPU with Vulkan) | Mac (Apple Silicon, macOS 14+) |
+| --- | --- |
+| **[⬇ DBZ_BT4_Windows.zip](https://github.com/recomp-code/dbz-bt4-recomp/releases/latest/download/DBZ_BT4_Windows.zip)** | **[⬇ DBZ_BT4_Mac.zip](https://github.com/recomp-code/dbz-bt4-recomp/releases/latest/download/DBZ_BT4_Mac.zip)** |
+
+1. **Unzip it.**
+   - Windows: into a folder you can write to (Desktop, Documents; not Program Files).
+   - Mac: drag `DBZ_BT4.app` to Applications. It isn't signed with an Apple developer account, so open it the first
+     time like this. macOS 15: double-click, **Done**, then System Settings > Privacy & Security > **Open Anyway**.
+     macOS 14: right-click > **Open**.
+2. **Open the launcher** (`DBZ_BT4.exe` / `DBZ_BT4.app`), press **Seleccionar ISO** and pick your own image of the mod
+   (`SLUS-219.78`, Beta 14 Rev2). Only the first time. Other versions of the mod don't work: the game was recompiled
+   for this one.
+3. **Press JUGAR.** It starts with 60 fps fights, fullscreen and a quality picked for your GPU. Change any of them in
+   the launcher; it remembers them.
 
 | | |
 | --- | --- |
 | ![The launcher](docs/screenshots/launcher_library.jpg) | ![Online in the launcher](docs/screenshots/launcher_online.jpg) |
 
-1. Unzip it in a folder you can write to (Desktop, Documents, Downloads; not Program Files).
-2. Open `DBZ_BT4.exe`, press **Seleccionar ISO...** and pick your own image of the mod: `SLUS-219.78`, Beta 14 Rev2.
-   Only the first time. Another version of the mod does not work: the game was recompiled for that one (the launcher
-   checks the ELF's SHA-256).
-3. Press **JUGAR**. Everything starts on: 60 fps fights, fullscreen and the best quality for your GPU (NVIDIA RTX:
-   DLSS, or "DLSS 5" when [DLSS 5 Swapper](#dlss-5-dlss-neural-rendering-experimental) is installed; other GPUs: 3x native).
-   The launcher lets you change each one (6x / 3x native, 2x + DLSS / FSR, DLSS 5) and remembers it.
-4. **Your own DLSS:** drop a newer `nvngx_dlss.dll` into the `DLSS` folder (or onto the launcher window) and the game
-   uses it from the next start; with several, the newest version wins, and removing it goes back to the bundled one
-   (310.9.1). Files are recognised by their version info, so the name does not matter, and ARM builds are ignored. For
-   DLSS 5 without DLSS 5 Swapper, the same folder takes `nvngx_dlssnr.dll`, `ReShade64.dll` and `renodx-dlss5.addon64`.
-   The launcher shows which version is in use.
+The zips have **no game data**: the launcher reads what it needs from your ISO. Get the mod and its updates from
+**[Team BT4's download page](https://teambt4.wixsite.com/teambt4projects/descarga)**.
 
-Needs Windows 10/11 64-bit and a GPU with Vulkan (DLSS on NVIDIA RTX, FSR on the rest). Xbox-style controllers and the
-keyboard work out of the box. **Hold START for 1.5 s** (or F1) for the options menu: internal resolution,
-DLSS / FSR, sharpness, anisotropic filtering, aspect ratio, fullscreen, FPS counter and **60 fps fights** (switched at
-once, mid-fight too; the launcher's checkbox sets the starting value). `DBZ_BT4.exe --jugar` starts straight away with the saved
-options (for a desktop shortcut). The zip has the recompiled runner and PCSX2's GS host, **not the disc**: the launcher
-copies the ELF and the IRX modules out of your ISO into `runtime\data\` and the game streams everything else from the ISO.
-Built with `windows/make_dist.ps1`; the launcher (Go + Wails, WebView2) is
-[recomp-code/recomp-online](https://github.com/recomp-code/recomp-online) `launcher/`.
+## Play online
 
-### Play online
+1. In the launcher, tab **EN LÍNEA**: create an account or sign in. Your session stays saved, encrypted; your password
+   is never stored.
+2. You see who is online. To start a match:
+   - press **Invitar** on someone;
+   - turn on **Buscar partida** so others see you want to play;
+   - or create a **room** (with a password if you like).
 
-The launcher has online play built in, against a server that is already up: **nothing to install or configure, and no
-ports to open** on your router.
+   **Buscar jugador por nombre** finds anyone, and the star adds them to your friends.
+3. When the invitation is accepted, both games open and meet at the game's **Multijugador** menu. Player 1 picks the
+   battle type, and both go to character select together.
+4. During the match, **Back + Start** (or **Shift+Tab**) brings the launcher over the game: invitations, the room's
+   chat, **Salir de la partida online**.
+5. **Estadísticas** (top of EN LÍNEA) shows your wins, losses, win rate, time played and place, and the table of the
+   best players. A fight only counts when both players' games saw the same result.
 
-1. In the launcher, tab **EN LÍNEA**: create an account (user and password) or sign in. The session is kept on this PC,
-   encrypted with Windows DPAPI; the password never is.
-2. You see who is online. Press **Invitar** on someone (or on a friend in the left column), turn on **Buscar partida**
-   so others see you want to play, or create a **room** (with a password if you like, 2 to 4 players taking turns, with
-   chat). **Buscar jugador por nombre** finds anyone, online or not; the star adds them to your friends.
-3. When the invitation is accepted, each game boots on its own (*"Preparando la partida con …"*) and goes straight to
-   the game's **Multijugador** menu. The first one there shows *"Esperando a …"* until the other arrives; then both
-   check they are identical, measure the connection and start (*"Conectado con …"*). **Player 1 picks Simple / Equipos
-   / Equipos (PD)**, as on the console, and both go to character select together. If the other player doesn't arrive
-   within 2 minutes, you keep playing offline from that menu.
-4. During the match, **Back + Start** on the controller (or **Shift+Tab**) brings the launcher over the game: who is
-   online, invitations, the room's chat, and **Salir de la partida online**. **B** (or Back + Start again) goes back.
-   While the launcher is in front the pad does not move your fighter, and the combo never pauses the game. Circle on the
-   Duel menus doesn't throw you out of the match by accident.
-5. An invitation that arrives while you play alone shows over the game: **A** accepts (the game window stays: the match
-   starts in it; anything not saved is lost), **B** says not now.
+Both players need the same release (the launcher tells you otherwise). If the fight stutters because you're far
+apart, raise **Retraso de controles** in AJUSTES.
 
 | | |
 | --- | --- |
 | ![Waiting for the other player at the Multiplayer menu](docs/screenshots/online_waiting.jpg) | ![The same fight on both screens](docs/screenshots/online_fight.jpg) |
 
-**[▶ Video, 1:42: two copies online on one PC](docs/videos/dbz_bt4_online_windows.mp4)**: the second one starts 10 s
-later, the first waits at the Multiplayer menu, they meet, pick and fight; both screens show the same fight frame by
-frame. The messages are drawn in the game's own font, read from your ISO.
+## Controls
 
-Both players need the same release (the launcher says so otherwise). The match is lockstep: both games run the same
-frames with both players' inputs, a few frames late (the input delay, measured automatically when the two meet) so they
-have time to cross the internet through the relay; the two sides compare a hash of the game state as they go. If the
-fight stutters because you are far apart, raise **Retraso de controles** in AJUSTES (the inviter's value is used).
+- **Controller**: works as on the PS2 (Xbox: A = Cross, B = Circle, X = Square, Y = Triangle).
+- **Keyboard**:
+  - arrows = d-pad, WASD = left stick;
+  - Z / X / C / V = Square / Cross / Circle / Triangle;
+  - Q / E = L1 / R1, 1 / 3 = L2 / R2;
+  - Enter = START, Backspace = SELECT.
+- **F1** or **hold START 1.5 s**: options (internal resolution, DLSS / FSR / MetalFX, 60 fps, FPS counter...).
+- **Fullscreen**: Alt+Enter (Windows) or Option+Return / Ctrl+Cmd+F (Mac).
+- The mod's unlock code also works on the main menu: hold L1+R1 and press Down, Right, Triangle, Down, Left, Triangle, Up.
 
-> **The mod is the work of Team BT4.** Get it, its updates and the PCSX2 extras (the `GameIndex.yaml` with the
-> SLUS-21978 fixes) from their official page: **https://teambt4.wixsite.com/teambt4projects**
-> ([download section](https://teambt4.wixsite.com/teambt4projects/descarga)).
+## Building from source
 
-- **Native Windows (playable)**: the same BT3-Recomp route, with PCSX2's GS on Vulkan (6x), NVIDIA DLSS (temporal, with
-  motion vectors estimated on the GPU) or AMD FSR 1, fights at 30 or 60 fps. See [Native Windows](#native-windows).
-- **Native macOS (recommended, playable)**: [z3xox/BT3-Recomp](https://github.com/z3xox/BT3-Recomp) adapted to the mod. By default the game is drawn by PCSX2's GS (`pcsx2-gsrunner`, Metal hardware renderer, 6x upscaling, Team BT4 hardware fixes) in its own window, at 30 fps in fights. The older route, paraLLEl-GS on MoltenVK with 2x supersampling, is still available (`DBZ_RENDERER=pgs`). Sound is correct. See `native/`, `patches/bt3recomp-bt4mod.patch` and `patches/bt3recomp-bt4mod-pcsx2gs.patch`.
-- Native macOS, our own recompilation with PCSX2's GS (`pcsx2-gsrunner`): experimental.
-- **Browser** (WebAssembly): the web runtime from [street-recomp-v3](https://github.com/recomp-code/street-recomp-v3) with Play!'s GS on WebGL2.
-
-**This repository contains no game data.** Bring your own disc image. The sources and patches contain no game code
-either: building generates it from your ELF. The exceptions are the ready-to-play Windows and Mac zips in the releases, whose
-runners hold the game's code already recompiled from the Beta 14 Rev2 ELF (no ISO, ELF or disc files are in it).
-
-## Download and play (Mac, nothing to compile)
-
-**[⬇ DBZ_BT4_Mac.zip](https://github.com/recomp-code/dbz-bt4-recomp/releases/latest/download/DBZ_BT4_Mac.zip)** (38 MB, Apple Silicon, macOS 14 or newer, from the [latest release](https://github.com/recomp-code/dbz-bt4-recomp/releases/latest))
-
-1. Unzip it and drag `DBZ_BT4.app` to Applications (or anywhere).
-2. The app is not signed with an Apple developer account, so macOS blocks the first start. Open it once like this:
-   macOS 15 or newer: double-click it, press **Done**, then System Settings > Privacy & Security > **Open Anyway**;
-   macOS 14: right-click (Ctrl+click) > **Open** > **Open**. Or in Terminal: `xattr -dr com.apple.quarantine /Applications/DBZ_BT4.app`.
-3. Press **Seleccionar ISO…** and pick your own image of the mod (`SLUS-219.78`, Beta 14 Rev2), only the first time.
-4. Press **JUGAR**. Defaults: 60 fps fights, fullscreen and a quality picked for the chip (M Max / Ultra: 6x native;
-   M Pro: 4x; others: 3x; Apple MetalFX upscaling to the screen is an option, at nearly twice the GPU of 3x). The launcher lets you change each one and remembers it.
-
-Same game and same in-game menu as on Windows (F1 or hold START: internal resolution, MetalFX, 60 fps fights, FPS
-counter...), drawn by PCSX2's GS on Metal. Controllers that macOS supports (Xbox, PlayStation, MFi) and the keyboard
-work. Saves, options and logs live in `~/Library/Application Support/DBZ_BT4` (the app itself stays read-only).
-`open -a DBZ_BT4 --args --jugar` starts straight away with the saved options. The app holds the recompiled runner,
-PCSX2's GS host and its libraries, **not the disc**: the launcher copies the ELF and the IRX modules out of your ISO and
-the game streams everything else from it. Built with `macos/make_dist.sh` (see [the `macos/` folder](#layout)); the
-launcher is the same Recomp launcher as on Windows ([recomp-code/recomp-online](https://github.com/recomp-code/recomp-online)
-`launcher/`, Go + Wails on WebKit), with the same [online play](#play-online): the session is kept encrypted with a key
-in your Keychain, **Shift+Tab** or **Back + Start** brings the launcher over the game, and the controller does not move
-your fighter while another window is in front. A Mac and a Windows copy with the same 60 fps table are paired (the
-compatibility key, `net1-…` in AJUSTES, is the same on both).
-
-## Status (2026-10-18)
-
-- Boots through the Spike logo, intro FMV, title, memory card and menus, then character and stage select into fights.
-- Browser: fights run at 60 fps with characters, HUD, specials and ki effects.
-- Still to do:
-  - **audio** is wrong: periodic stale chunks, mono output and extra content. The cause is localized in the EE-side CRI ring writes, probably another mistranslated instruction.
-  - Some graphics glitches remain: white areas on some stages, block rectangles and flashes.
-- Native macOS: work in progress.
-- The "still to do" items above are the **browser** build's (our own PS2Recomp runtime + Play!'s GS). The native builds
-  use BT3-Recomp's runtime, which does not have them.
-- Native Windows (2026-10-19): playable end to end (Team BT4 splash, title, Dragon History, Duel with the whole unlocked
-  roster, fights at 30 and 60 fps), with the fight-start fade drawn correctly (read-back answered by PCSX2) and DLSS/FSR.
-  Audio: real stereo (a 264 s recording of menus and a fight: side/mid RMS 0.41, 3 mono seconds; `windows/wav_stats.py`).
-  Graphics: no white areas or block rectangles seen on the stages visited so far (Wasteland, Tournament of Power); the
-  remaining stages have not been checked one by one. BT3-Recomp's lockstep netplay (`PS2X_NET_LISTEN` / `PS2X_NET`)
-  connects and stays in sync (0 desyncs over ~6400 frames between two instances on one PC); not tested between two PCs.
-
-## Native Windows
-
-The macOS route (BT3-Recomp + `patches/bt3recomp-bt4mod-full.patch` + PCSX2's GS in its own window) built with
-clang-cl + Ninja, plus `patches/bt3recomp-bt4mod-windows.patch` (runtime) and `patches/pcsx2-gsrunner-dbz-windows.patch`
-(host). The files in `windows/` assume the work folder `C:\DBZBT4Recomp` and the NBA Street V3 port's portable tools and
-PCSX2 deps in `C:\NBAStreetRecomp` (LLVM 20, Ninja, CMake, MinGit; VS 2022 Build Tools for the SDK).
-
-```bat
-:: runtime
-git clone https://github.com/z3xox/BT3-Recomp C:\DBZBT4Recomp\bt3mod && cd /d C:\DBZBT4Recomp\bt3mod && git checkout e22a34b
-git apply --exclude=ps2xRuntime/third_party/parallel-gs ..\dbz-bt4-recomp\patches\bt3recomp-bt4mod-full.patch
-git apply ..\dbz-bt4-recomp\patches\bt3recomp-bt4mod-windows.patch
-python ..\dbz-bt4-recomp\windows\iso_extract.py <iso> extract games\bt3\work   &:: 7-Zip fails on the three big AFS files
-set PS2X_SETUP_FORCE=1& set PS2X_SETUP_NO_SUBMODULES=1
-python games\bt3\setup.py games\bt3\work\SLUS_219.78 --stages 3-3 --jobs 20 --no-deps --non-interactive --no-package
-..\dbz-bt4-recomp\windows\reconfigure.cmd & ..\dbz-bt4-recomp\windows\build_runner.cmd   &:: GUI subsystem, llvm-rc
-:: host: a copy of the NBA port's PCSX2 tree + patches\pcsx2-gsrunner-live-dbz.patch + patches\pcsx2-gsrunner-dbz-windows.patch
-..\dbz-bt4-recomp\windows\build_pcsx2.cmd
-:: then gshost\ = pcsx2-gsrunner.exe + the NBA gshost DLLs and resources\ (Team BT4's GameIndex.yaml) + nvngx_dlss.dll,
-::               windows\gshost\dbz.ini and dbz_dlss.ini, and an empty portable.ini
-```
-
-Play with `windows\Jugar_DBZ.cmd` (30 fps), `Jugar_DBZ.cmd 60` / `Jugar_DBZ_60fps.cmd` (60 fps fights) or
-`Jugar_DBZ_DLSS.cmd` (2x + DLSS); `set DBZ_WINDOW=1` for a window. F1 in the game window opens the GS options
-(internal resolution, DLSS / FSR 1, sharpness, 60 fps fights; also Back+Start or holding START 1.5 s on a controller).
-The menu saves it as `DbzFps60` in its ini and the launcher takes it as the next start's default. The 60 fps switch goes through the live ring: the host writes `fps60Request` and the game, at its next VSync, calls
-BT3-Recomp's `ps2Set60Fps` and publishes its mode in `gameFps60` (two words in the padding of the header's third cache
-line, so the layout and older builds are unaffected; `windows/fps60_ring_test.ps1` drives it without the menu).
-paraLLEl-GS is off on Windows (`PS2X_DISABLE_PGS=ON` by default), so the
-Granite submodules are not needed.
-
-What the Windows patches change:
-- **Live ring on Windows** (`ps2_gs_live.cpp`, `ps2_live_ring.h`): the upstream ring was POSIX only (`shm_open`,
-  `posix_spawn`). On Windows it is a named mapping plus named auto-reset events (`Local\PS2RecompGsLiveRing_<pid>`, `...Data`,
-  `...Space` and, for version 2, `...Readback`), the protocol of the NBA Street V3 port; the host is started with
-  `CreateProcessW` + `CREATE_NO_WINDOW`. Version 2 on Windows: the readback block (`RingReadback` seq/bytes + 8 MB) follows
-  the data area directly, since the POSIX "events" words do not exist in the mapping. Version 1 rings are still accepted.
-  `PS2X_GSLIVE_READBACK=0` restores the old behaviour.
-- **Host** (`GSDumpReplayer.cpp`): ReadFIFO2 replies on Windows too (upstream had them under `#if !defined(_WIN32)`).
-- **PSMCT24 transfers are 3 bytes per pixel** (`Support.h` `bytesForPixels`; it said "treat as 32"). The fight-start fade
-  downloads a 512x224 PSMCT24 frame into a 344064-byte buffer; counted as 4 bytes per pixel, `sceGsExecStoreImage` wrote
-  458752 bytes. Once the GS host answers the download with real pixels, the overrun lands on the next heap block's header and
-  the game's pool walk (`FUN_00254fe0`, pc 0x255018) loops forever at the start of every fight. This one affects every
-  platform; it only went unnoticed while the overrun was filled with zeros from the runtime's own VRAM.
-- `PS2X_PAD_SCRIPT="12:START,15.5:LEFT,16:CROSS+SQUARE"` (+ `PS2X_PAD_SCRIPT_HOLD` ms): timed presses for unattended tests,
-  seconds since process start, or since the game first reaches a state with `PS2X_PAD_SCRIPT_STATE=0x4` (main menu);
-  `PS2X_AUTOSTART_LEFT=1` makes the auto-start also answer "Si" to the memory-card prompts (`windows\run_test.ps1`,
-  contact sheets with `windows\sheet.ps1`, the video script `windows\video_script.ps1`).
-- `[avsync]` lines (with `PS2X_WAVCAP`): the WAV position every 60 live GS frames, so the host's `PS2X_CAPTURE` video and
-  the runtime's audio can be muxed in sync (`windows\mux_video.ps1`, which retimes the audio piecewise where the game ran
-  below 60 fps, e.g. during loads).
-
-DLSS: the host from [street-recomp-v3](https://github.com/recomp-code/street-recomp-v3) (`4ca3ed7`): temporal DLSS with motion
-vectors estimated on the GPU from the frames (luma block matching at 1/4 and 1/2 resolution, sub-texel refinement) and a
-bias-current-colour mask where no good match exists, in Vulkan and D3D12; `PS2X_DLSS_MOTION=0`, `PS2X_DLSS_BIAS`,
-`PS2X_DLSS_PRESET`. Measured on an RTX 4090: 6x native fights 2-5 ms of GPU per frame at 30 and 60 fps; the DLSS preset
-(2x, 1024x896 -> 2400x1350) 4-10 ms. `nvngx_dlss.dll` 310.9.1 next to the host (DLSS Swapper can replace it).
-
-### "DLSS 5" (DLSS Neural Rendering, experimental)
-
-On an NVIDIA RTX card the DLSS output can go through NVIDIA's neural rendering pass with ReShade and the RenoDX
-"DLSS 5" add-on (third-party, not included here), exactly as in the NBA Street V3 port: Direct3D 12, 2x internal + DLSS,
-then the neural pass. In the zip it is the launcher's "DLSS 5" quality: when DLSS 5 Swapper is installed, the
-launcher builds `gshost_dlss5\` itself from `gshost\` plus Swapper's ReShade (`ReShade64.dll` as `dxgi.dll`), the RenoDX
-add-on and `nvngx_dlssnr.dll` (none of them ship in the zip), with `presets\ReShade.ini` and `presets\dbz_dlss_dx12.ini`.
-From the development tree, `windows\Jugar_DBZ_DLSS5.cmd` (`... 60` for 60 fps fights) runs the game with a test copy of the
-host, `gshost_hooktest\` = `gshost\` + ReShade's `dxgi.dll`, `renodx-dlss5.addon64`, its `ReShade.ini`,
-`nvngx_dlssnr.dll` (e.g. from DLSS 5 Swapper) and `dbz_dlss_dx12.ini` (`dbz_dlss.ini` with `Renderer = 15`). In game: F6
-toggles the pass, Home opens ReShade. DLSS, and so the pass, only runs while the window is larger than the 2x image
-(1024x896): the launcher opens a 1920x1080 window or fullscreen. Measured on an RTX 4090: the pass evaluates on every
-presented frame (`nr[evals]` = presents in `ReShade.log`), 59 fps in menus and 30 / 60 in fights.
-## Native macOS with BT3-Recomp (playable)
-
-The mod ELF has the same layout as BT3 USA (SLUS-216.78): 98.5% of BT3-Recomp's function starts match. The mod adds about 6 KB of code at the end of `BIN/DBZP.BIN` and patches roughly 70 jumps into the game.
-
-```sh
-git clone https://github.com/z3xox/BT3-Recomp bt3mod && cd bt3mod && git checkout e22a34b && git submodule update --init --recursive
-git apply ../dbz-bt4-recomp/patches/bt3recomp-bt4mod.patch
-(cd ps2xRuntime/third_party/parallel-gs && git apply ../../../../dbz-bt4-recomp/patches/parallel-gs-moltenvk.patch)
-(cd ps2xRuntime/third_party/parallel-gs/Granite && git apply ../../../../../dbz-bt4-recomp/patches/granite-moltenvk.patch)
-brew install cmake ninja pkg-config ffmpeg molten-vk vulkan-loader vulkan-headers
-mkdir -p games/bt3/work && (cd games/bt3/work && tar -xf /path/to/SLUS_219.78.DBZBT4B14REV2.iso)
-cp games/bt3/work/SLUS_219.78 /tmp/SLUS_219.78.elf
-PS2X_SETUP_FORCE=1 python3 games/bt3/setup.py /tmp/SLUS_219.78.elf --jobs 6 --stages 3-3
-cmake -S . -B build-vk -G Ninja -DCMAKE_BUILD_TYPE=Release -DPS2X_DISABLE_PGS=OFF && cmake --build build-vk --target ps2EntryRunner
-mkdir -p build-vk/ps2xRuntime/savedata && cp ../dbz-bt4-recomp/native/settings.toml build-vk/ps2xRuntime/savedata/
-../dbz-bt4-recomp/native/jugar_dbz.sh
-```
-
-What the patch does:
-- **Mod detection and setup:** `setup.py` recognizes the mod by the word at 0x1133f4. It moves the heap start to 0x3C1200, because the mod's overlay runs up to 0x3C01D4. It also adds about 470 function rows and about 1,900 entry points generated by `games/bt3/bt4mod/bt4mod_maps.py`.
-- **Recompiler:** a new `entry_points` config option, and functions that fall off their end now continue at the next address.
-- **Runtime:** `bt4mod_overrides.cpp` holds the mod-specific code. The built-in 16:9 projection constant is kept, since the mod already has it.
-- **Apple Silicon fixes:** sse2neon guards; ucontext `fpregs`, `link.h` and `dl_iterate_phdr` guarded to Linux; ImGui 1.93 tab color names; no-op seam markers when the native Vulkan seam renderer is off.
-- **MoltenVK:** `PS2X_PGS_SSAA` overrides the render-scale-derived supersampling. 4x/8x drop fights to about 20 fps on an M2 Pro; 2x holds 30 fps.
-
-### PCSX2 GS renderer (default)
-
-`patches/bt3recomp-bt4mod-pcsx2gs.patch` (on top of the mod patch) adds a live GS stream to the runtime: with `PS2X_GS_LIVE=1`, every GIF packet (PATH1/2/3, exactly as the game sent it, before any of BT3-Recomp's renderer rewrites), the registers the libgs stubs write directly, local-to-host reads, and one register snapshot + VSync per published frame go over a shared-memory ring to `pcsx2-gsrunner -live` (the host from the NBA Street V3 port, `patches/pcsx2-gsrunner-live-dbz.patch`). The runtime's own GS parse runs state-only (`PS2X_GS_NODRAW`), paraLLEl-GS is off, and its window stays hidden. Keyboard and gamepad come from the PCSX2 window.
-
-```sh
-cmake -S . -B build-live -G Ninja -DCMAKE_BUILD_TYPE=Release -DPS2X_DISABLE_PGS=OFF && cmake --build build-live --target ps2EntryRunner
-mkdir -p build-live/ps2xRuntime/savedata && cp ../dbz-bt4-recomp/native/settings-live.toml build-live/ps2xRuntime/savedata/settings.toml
-# PCSX2 (the NBA port's tree) + patches/pcsx2-gsrunner-live-dbz.patch: cmake --build build-mac --target pcsx2-gsrunner,
-# then copy pcsx2-gsrunner, its resources/ (with Team BT4's GameIndex.yaml) and gshost/dbz.ini into ~/NBAStreetRecomp/gshost-dbz
-../dbz-bt4-recomp/native/jugar_dbz.sh            # DBZ_WINDOW=1 windowed, DBZ_RENDERER=pgs for paraLLEl-GS
-```
-
-`gshost/dbz.ini`: 6x internal resolution, bilinear (PS2) filtering, 16x anisotropic, no FXAA/CAS, merge post-processing sprites, CPU CLUT render (the GameIndex fix for SLUS-21978) and texture offsets picked per internal resolution (`UserHacks_TCOffsetByScale`: 2x 345, 3x-5x 425, 6x 500), also when the scale is changed from F1. The values were measured on this PCSX2 build by replaying one recorded fight frame at every scale and offset and comparing each, downscaled, with the 1x render (which has no doubled outline); Team BT4's 4K values (425/410) leave a doubled cel outline at 6x. On an M2 Pro, fights run at 30 fps with the GPU at 21-25 ms per frame, fullscreen at 3456x1944. F1 in the PCSX2 window opens its options menu. "Reescalado a la ventana" = Apple MetalFX (spatial scaler, ~0.3 ms) enlarges the frame to the window when the internal resolution is smaller (e.g. 3x at 60 fps); it sharpens edges but adds faint halos on the cel outlines, so 6x without it stays the cleanest. Changes are saved back to `dbz.ini`, and keys the menu does not show are kept.
-
-Test helpers (`native/`): `lrun.sh` (run live), `lshot.sh` (the host saves its own frame), `lqshot.sh` (story-fight shots + fps), `ldump.sh`/`lreplay.sh`/`lcrop.py` (record the live stream as a `.gs` dump, then replay one identical frame with several `.ini` variants to compare settings).
-
-## Layout
-
-| Path | What |
-| --- | --- |
-| `config/config.toml`, `functions.csv`, `gap_*.txt` | Recompiler config and function map for the ELF + `BIN/DBZP.BIN` overlay (loaded at 0x334C00). `@ROOT@` is the work folder (`~/NBAStreetRecomp`). |
-| `overrides/dbz_bt3_overrides.cpp` | Game-specific runtime code: libpad2, `sceCdSearchFile`, heap fixes, diagnostics. |
-| `patches/ps2recomp-dbz.patch` | Engine changes on top of street-recomp-v3's patched PS2Recomp. These are generic fixes to be upstreamed there: VU0 macro LQI/SQI/LQD/SQD and VR* random-number ops, `ChangeThreadPriority`, IOP heap/sysmem alignment, SIF, and web options. |
-| `patches/play-dbz.patch` | Play! GS (WebGL2) changes: exact framebuffers sampled on the GPU, a depth-mask pass, and write-back skipping. |
-| `patches/pcsx2-live-serial.patch` | `pcsx2-gsrunner` live mode takes the game serial from `PS2X_LIVE_SERIAL`, so PCSX2's per-game GS fixes apply (superseded by `pcsx2-gsrunner-live-dbz.patch`, which includes it). |
-| `patches/pcsx2-gsrunner-live-dbz.patch` | The serial change, plus: window title from `PS2X_LIVE_TITLE`, on-demand host screenshots (`PS2X_SHOT_DIR/host.req`), the options menu keeps unmanaged `.ini` keys, game flips counted as PCSX2 internal FPS, GPU time in the `PS2X_FPS_LOG` line, `PS2X_DUMP_FRAMES` for `-dumpdir`. |
-| `patches/bt3recomp-bt4mod-pcsx2gs.patch` | BT3-Recomp runtime: the live GS stream to `pcsx2-gsrunner` (`PS2X_GS_LIVE=1`), `.gs` dumps (`PS2X_GS_DUMP`). |
-| `patches/bt3recomp-bt4mod-widescreen.patch` | BT3-Recomp runtime (applied last): the mod already has the community 16:9 values built in, so the runtime's widescreen scaling is skipped. Scaling them again narrowed the sky backdrop (uncovered strips at the sides) and zoomed the camera in. |
-| `patches/bt3recomp-bt4mod-fps60env.patch` | BT3-Recomp runtime: `PS2X_FPS60` (set by `native/jugar_dbz_60fps.sh`) wins over the saved 60 fps toggle, so the launcher can turn on BT3-Recomp's 60 fps fight mode (half-step table `games/bt3/fps60_sites.txt`; the mod keeps the USA layout). Story fight, M2 Pro, 3456x1944: 60 fps at 3x (GPU ~7 ms), 4x and 6x (GPU 12-16 ms, tight). |
-| `patches/bt3recomp-bt4mod-full.patch` | The whole current BT3-Recomp tree change on upstream `e22a34b` (`git apply` it alone; it contains every layered patch above plus the browser work). Adds GS -> EE downloads through the live ring: the game's frame read-backs (fight-start fade) are answered by PCSX2 (ring version 2, readback area after the events; version 1 rings are still accepted), and `sceGsExecLoadImage`/`StoreImage` take `vram_addr` as a block address (the old `* 2048 / 256` wrapped, so the fade drew texture data as garbage blocks for ~0.4 s). |
-| `patches/bt3recomp-bt4mod-windows.patch` | BT3-Recomp runtime, on top of `bt3recomp-bt4mod-full.patch`: the Windows live ring (version 2 with readback), PSMCT24 transfer size, `PS2X_PAD_SCRIPT`. See [Native Windows](#native-windows). |
-| `patches/pcsx2-gsrunner-dbz-windows.patch` | `pcsx2-gsrunner`, on top of the NBA port's tree + `pcsx2-gsrunner-live-dbz.patch`: ReadFIFO2 replies on Windows, the shared `Ps2LiveRing.h`. |
-| `patches/bt3recomp-bt4mod-macos.patch` | BT3-Recomp runtime for the Mac app, on top of `bt3recomp-bt4mod-windows.patch`: `PS2X_GSHOST_ARGS` takes "quoted" arguments (the app's `-ini` path has spaces); in live mode the runner drops its Dock icon (only the game window shows one); online, the controller counts only while the game's window is the frontmost app; the fibers of online's virtual clock (`_XOPEN_SOURCE` before every header). |
-| `patches/bt3recomp-bt4mod-perf.patch` | Performance, on top of the two above (shared code, macOS-only parts under `__APPLE__`): in live mode our GS parse keeps only what the game can observe (the GS thread ~34% -> ~12% of a core in a 60 fps fight); one per-thread block for the dispatcher's thread_locals; on macOS the vblank timer waits its last 2 ms with `mach_wait_until` at interactive QoS (timer coalescing made the frames 16-24 ms apart: ~10-15 repeated frames a second, now 0); `PS2X_PACEDIAG=1` frame pacing stats. Same state hashes as Windows. |
-| `patches/bt3recomp-bt4mod-unlock.patch` | BT3-Recomp runtime, on top of `bt3recomp-bt4mod-perf.patch`: `PS2X_UNLOCK_ALL=1` (the launcher's "Contenido desbloqueado", on by default and always on online) unlocks everything when the game first reaches the main menu, by running the game's own unlock routine `FUN_00266088` on the save data (what the main-menu cheat does: hold L1+R1, Down, Right, Triangle, Down, Left, Triangle, Up). Also fixes that cheat: its handler is the last instruction of `FUN_00299630` and the function bounds left out the jump's delay slot (`lw $a0, -0xd74($a0)`), so the recompiled cheat wrote its flags at 0x300000 instead of the save data (`apply_patches.py`, `[bt3 patch: cheatslot]`). |
-| `patches/bt3recomp-bt4mod-netstats.patch` | BT3-Recomp runtime, on top of `bt3recomp-bt4mod-unlock.patch`: `PS2X_NET_STATS_FILE=<path>` writes the result of every fight of an online match (`fight <n> winner=<1/2/0> c1= c2= hp1= hp2= frame=`) for the launcher's online statistics. The battle object (`*(u32 *)0x2feb48`) holds the phase at -0x50 (31 while fighting) and each side's life at +0x30/+0x34 (0..50000); the fighters' character ids are at `*(u32 *)0x2feb14 + 0xc64` and 0x1600 on. Only while the two games are connected; `PS2X_NET_STATS_OFFLINE=1` counts offline fights too (tests). |
-| `patches/pcsx2-gsrunner-macos-online.patch` | Mac GS host, on top of `pcsx2-gsrunner-live-dbz.patch`: Back + Start belongs to the launcher, so with Back held Start does not open the host's menu (F1 and holding START still do). Quit (Cmd+Q, Dock) stops the VM in order; `PS2X_HITCH_MS` sets the gap counted as a hitch (with `PS2X_FPS_LOG=1`); the live stream is read in blocks of whatever the game wrote (one ring publish per block, the host's ring reading ~4x cheaper), and the game's liveness is checked at most every 50 ms (`PS2X_LIVE_STAGE=0`: the old reads). `PS2X_HOST_NOACTIVATE=2` (tests on a Mac someone is using): the window is invisible, at the back, and lets clicks through. |
-| `macos/` | The Mac package: `build_launcher.sh` (the Recomp launcher from a recomp-online checkout, `RECOMP_ONLINE`, with the server built in), `build_ffmpeg.sh` (minimal static FFmpeg), `build_runner.sh` (runner for macOS 14+ with only system libraries), `make_dist.sh` (`DBZ_BT4.app`: dylibs into Frameworks, presets, icon, ad-hoc signature, zip), `Info.plist`, `settings.toml`, `LEEME.txt`. |
-| `windows/` | Windows launchers (`Jugar_DBZ*.cmd`), build scripts (`env.ps1`, `reconfigure.cmd`, `build_runner.cmd`, `build_pcsx2.cmd`, `make_patch.ps1`), `gshost/dbz.ini` (Vulkan, 6x) and `gshost/dbz_dlss.ini` (2x + DLSS), `iso_extract.py` (ISO9660 extractor), tests (`run_test.ps1`, `sheet.ps1`, `stack_snapshot.ps1`). |
-| `docs/screenshots/`, `docs/videos/` | Screenshots and the showcase video of the native Windows build. |
-| `gshost/dbz.ini` | PCSX2 GS settings, based on the Team BT4 1080p profile: 3x, merge PP sprites, TC offsets, 16:9. The `GameIndex.yaml` with the SLUS-21978 fixes comes from the Team BT4 PCSX2 extras. |
-| `tools/` | Map and recompile helpers (`mkcombined.py`, `fixcsv.py`, `gaps.py`, `recomp.sh`, `build.sh`), `play_native.sh`, analysis tools (`adxdec.py`, `gstrace.py`, `mdis.py`, `xref.py`), headless tests (`tools/test`), and the local web server and diagnostics receiver (`tools/web`). |
+This repository contains no game data or game code: building generates the code from your own ELF. The steps, the
+patches on top of [z3xox/BT3-Recomp](https://github.com/z3xox/BT3-Recomp) and the repository layout are in
+**[docs/BUILDING.md](docs/BUILDING.md)**. The launcher and the online server are
+[recomp-code/recomp-online](https://github.com/recomp-code/recomp-online).
 
 ## Credits
 
-- [PS2Recomp](https://github.com/ran-j/PS2Recomp), [Play!](https://github.com/jpd002/Play-), [PCSX2](https://github.com/PCSX2/pcsx2).
-- [z3xox/BT3-Recomp](https://github.com/z3xox/BT3-Recomp) (GPL-3.0): the VU0 macro and VR* translation fixes in `patches/ps2recomp-dbz.patch` come from its `ps2xRecomp/src/lib/vu_translation_helpers.cpp`.
-- [Team BT4](https://teambt4.wixsite.com/teambt4projects) for the mod (*Budokai Tenkaichi 4*, Beta 14 Rev2) and its PCSX2
-  settings and extras. Please get the mod and its updates from [their download page](https://teambt4.wixsite.com/teambt4projects/descarga).
+- [Team BT4](https://teambt4.wixsite.com/teambt4projects) for the mod and its PCSX2 settings and extras.
+- [z3xox/BT3-Recomp](https://github.com/z3xox/BT3-Recomp), [PS2Recomp](https://github.com/ran-j/PS2Recomp),
+  [PCSX2](https://github.com/PCSX2/pcsx2), [Play!](https://github.com/jpd002/Play-).
 
 License: GPL-3.0 (see `LICENSE`).

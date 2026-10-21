@@ -533,7 +533,7 @@ index 0045f01..fac0c83 100644
      // the same mapping, after the data area (macOS: os_sync_wait_on_address, Linux: futex).
      // macOS limits shm names to 31 characters, so the base name is short.
 diff --git a/ps2xRuntime/src/lib/game_overrides.cpp b/ps2xRuntime/src/lib/game_overrides.cpp
-index 3c3d250..f561c15 100644
+index 3c3d250..7edeade 100644
 --- a/ps2xRuntime/src/lib/game_overrides.cpp
 +++ b/ps2xRuntime/src/lib/game_overrides.cpp
 @@ -664,6 +664,26 @@ extern "C" int ps2xNetServeSwapRead(unsigned long long slotId, unsigned long lon
@@ -706,6 +706,24 @@ index 3c3d250..f561c15 100644
          if (s_player == 1 || s_player == 2)
          {
              const uint32_t mode = getRegU32(ctx, 5);
+@@ -5277,6 +5397,17 @@ namespace
+         const unsigned long long f = g_bt3FrameCount.load(std::memory_order_relaxed);
+         if (f % (unsigned long long)s_every) return;
+         const uint64_t h = XXH3_64bits(rdram, PS2_RAM_SIZE);
++        {   // [detdump] PS2X_DETDUMP=<frame> + PS2X_NET_DUMPDIR=<dir>: write EE RAM at that frame (ram_<frame>.bin), so the
++            // two machines' states can be diffed byte by byte when their hashes differ.
++            static const unsigned long long s_dumpAt = [](){ const char *v = std::getenv("PS2X_DETDUMP"); return (v && v[0]) ? std::strtoull(v, nullptr, 10) : ~0ull; }();
++            static const char *s_dir = std::getenv("PS2X_NET_DUMPDIR");
++            if (f == s_dumpAt && s_dir && s_dir[0])
++            {
++                const std::string path = std::string(s_dir) + "/ram_" + std::to_string(f) + ".bin";
++                if (FILE *fp = std::fopen(path.c_str(), "wb")) { std::fwrite(rdram, 1, PS2_RAM_SIZE, fp); std::fclose(fp); }
++                std::fprintf(stderr, "[detdump] frame %llu -> %s\n", f, path.c_str());
++            }
++        }
+         // Second hash EXCLUDING the sound-stream / disc-stream window. Measured 2026-09-14: two
+         // identical-input runs differ by only 12 bytes at frame 1 and 432 at frame 600, ALL of it
+         // inside the sound stream control block at 0x2c9350 and its neighbours -- stream position
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
 index ded5faa..4119bfe 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
@@ -860,7 +878,7 @@ index c086d76..3a39975 100644
          else if (kind == 'j') { g_hs[(pc - kBase) >> 2] = 5; ++ni; }
          else if (kind == 'D') { g_hs[(pc - kBase) >> 2] = 6; ++ni; }   // duration assignment: value * 2 (pairs with a 'd' countdown)   // integer step: store old + (new - old) / 2 (ki drain/charge)
 diff --git a/ps2xRuntime/src/lib/ps2_netplay.cpp b/ps2xRuntime/src/lib/ps2_netplay.cpp
-index 33b15d8..5efa2d6 100644
+index 33b15d8..919c21b 100644
 --- a/ps2xRuntime/src/lib/ps2_netplay.cpp
 +++ b/ps2xRuntime/src/lib/ps2_netplay.cpp
 @@ -140,6 +140,12 @@ struct Net
@@ -936,29 +954,53 @@ index 33b15d8..5efa2d6 100644
      NetPkt p{};
      p.magic = kMagic; p.version = kVersion;
      p.player = static_cast<uint8_t>(g.localPlayer);
-@@ -765,6 +806,22 @@ uint32_t ps2NetRollbackPoll(uint32_t frameAbs, bool *mustStall)
+@@ -762,9 +803,36 @@ uint32_t ps2NetRollbackPoll(uint32_t frameAbs, bool *mustStall)
+     return rb;
+ }
+ 
++// [relay] [netwait] Both games wait for each other before the guest runs at all. Connecting whenever each side happened
++// to be ready (frame 67 on one, 2 on the other) applied the same inputs to different moments of the boot; waiting at
++// the first pad read was not enough either: the game's other threads (sound, disc) kept running during the wait, on
++// the host's clock, and the two RAMs differed by frame 60. PS2X_NET_WAIT_MS bounds the wait (default 120 s).
++static void netWaitConnected(const char *where)
++{
++    static const long s_waitMs = [](){ const char *v = std::getenv("PS2X_NET_WAIT_MS"); return v && v[0] ? std::atol(v) : 120000L; }();
++    const auto t0 = std::chrono::steady_clock::now();
++    std::fprintf(stderr, "[netplay] waiting for the other player (%s)\n", where);
++    while (!g.connected && g.active &&
++           std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count() < s_waitMs)
++    {
++        sendHello(); pump();
++        std::this_thread::sleep_for(std::chrono::milliseconds(5));
++    }
++    if (!g.connected) { std::fprintf(stderr, "[netplay] the other player never came: playing offline\n"); ps2NetDisconnect("no peer"); return; }
++    std::fprintf(stderr, "[netplay] the other player is here after %.1f s\n",
++                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
++}
++
++void ps2NetWaitPeer()
++{
++    ps2NetInit();
++    if (g.active && !g.connected) netWaitConnected("before the boot");   // relay, or a direct host/join (tests)
++}
++
  void ps2NetSubmitLocal(uint32_t frameAbs, const Ps2xNetInput &in)
  {
      if (!g.active) return;
-+    if (g.relay && !g.connected)
-+    {   // [relay] [netwait] Both games stop at their FIRST pad read until the other one is there, so the lockstep starts
-+        // at the same point of the boot on both machines. Connecting whenever each side happened to be ready (frame 67
-+        // on one, 2 on the other) applied the same inputs to different moments of the boot, and the two machines ended
-+        // up in different fights with perfectly matching inputs. PS2X_NET_WAIT_MS bounds the wait (default 120 s).
-+        static const long s_waitMs = [](){ const char *v = std::getenv("PS2X_NET_WAIT_MS"); return v && v[0] ? std::atol(v) : 120000L; }();
-+        const auto t0 = std::chrono::steady_clock::now();
-+        std::fprintf(stderr, "[netplay] waiting for the other player at frame %u\n", frameAbs);
-+        while (!g.connected && g.active &&
-+               std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count() < s_waitMs)
-+        {
-+            sendHello(); pump();
-+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-+        }
-+        if (!g.connected) { std::fprintf(stderr, "[netplay] the other player never came: playing offline\n"); ps2NetDisconnect("no peer"); return; }
-+    }
++    if (g.relay && !g.connected) netWaitConnected("first pad read");   // only if the boot-time wait did not run
      if (!g.connected || !g.synced) { sendHello(); pump(); return; }   // handshake / state sync only, no frame numbering yet
      const uint32_t frame = relFrame(frameAbs);
      Ps2xNetInput use = in;
+@@ -851,8 +919,7 @@ void ps2NetSetChecksum(uint32_t frame, uint64_t hash)
+     {
+         for (auto i = g.ourHash.begin(); i != g.ourHash.end();) i = (i->first + 600 < frame) ? g.ourHash.erase(i) : ++i;
+         for (auto i = g.peerHash.begin(); i != g.peerHash.end();) i = (i->first + 600 < frame) ? g.peerHash.erase(i) : ++i;
+-        std::lock_guard<std::mutex> lk2(g.mtx);
+-    }
++    }   // (g.mtx is already held: a second lock_guard on it here would deadlock)
+ }
+ 
+ // [flush] Why this exists at all.
 diff --git a/ps2xRuntime/src/lib/pad_config.cpp b/ps2xRuntime/src/lib/pad_config.cpp
 index 65db527..bca1fc8 100644
 --- a/ps2xRuntime/src/lib/pad_config.cpp
@@ -1013,3 +1055,84 @@ index 0fb445c..67a9423 100644
      // path: 1, 2 or 3. Stream order is the caller's (GifArbiter::process on the GS thread).
      void transfer(int path, const uint8_t *data, uint32_t sizeBytes);
      // A register the runtime's HLE stubs write straight into its GS parse: sent as an A+D packet.
+diff --git a/ps2xRuntime/include/runtime/ps2_netplay.h b/ps2xRuntime/include/runtime/ps2_netplay.h
+index 06198b9..51de717 100644
+--- a/ps2xRuntime/include/runtime/ps2_netplay.h
++++ b/ps2xRuntime/include/runtime/ps2_netplay.h
+@@ -8,6 +8,9 @@ struct Ps2xNetInput { uint16_t buttons; uint8_t rx, ry, lx, ly; };   // 6 bytes
+ #pragma pack(pop)
+ 
+ void     ps2NetInit();
++// [netwait] Online through the relay: block until the other player is connected, BEFORE the guest runs its first
++// instruction, so both machines run the whole boot in lockstep from the same state. No-op otherwise.
++void     ps2NetWaitPeer();
+ 
+ // The Netplay overlay, as one switch: the corner label, the panel behind it, AND the automatic
+ // character-select transition with its curtain. They are one feature, not three -- the panel without
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 8fbc98c..99a13c5 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -2108,6 +2108,11 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
+         // icon.sys, dbzsm.ico, save).
+         paths.mcRoot = cdRoot.parent_path() / "savedata";
+     }
++    // [netcard] PS2X_MC_ROOT=<dir>: the memory cards come from there instead. Online, both players boot from the
++    // same card (a temporary copy of the host's, prepared by the launcher), so the save data the game loads at
++    // boot -- options, unlocks -- is identical on both machines and nobody's own card is written.
++    if (const char *mc = std::getenv("PS2X_MC_ROOT"); mc && mc[0])
++        paths.mcRoot = std::filesystem::path(mc);
+ 
+     // Allow pointing the CDVD backend at a disc image via environment variable.
+     if (const char *cdImageEnv = std::getenv("PS2X_CD_IMAGE"))
+@@ -7371,6 +7376,8 @@ void PS2Runtime::run()
+     m_debugSp.store(static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[29], 0)), std::memory_order_relaxed);
+     m_debugGp.store(static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[28], 0)), std::memory_order_relaxed);
+ 
++    ps2NetWaitPeer();   // [netwait] online: both games start the boot together, from the same state
++
+     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
+ 
+     // A blank image to use as a framebuffer
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
+index d6f75bd..866d2c4 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
+@@ -8,6 +8,7 @@
+ #include "CD.h"
+ #include "MPEG.h"
+ 
++extern std::atomic<uint64_t> g_bt3FrameCount;   // [netclock] game_overrides.cpp (global namespace)
+ std::atomic<uint64_t> g_cdLoadReads{0}, g_cdLoadBytes{0};
+ std::atomic<uint64_t> g_cdReadSerial{0};   // [cdedge3] every sceCdRead ever issued (never reset): "a read happened after X" for the CD state guard
+ namespace
+@@ -580,11 +581,27 @@ namespace ps2_stubs
+ 
+         std::time_t now = std::time(nullptr);
+         std::tm localTm{};
++        // [netclock] PS2X_RTC=<unix seconds>: online both games must read the same clock (the game seeds from it,
++        // and the two machines may be in different time zones). The clock starts there and advances with the
++        // game's own frames, never with the host's: identical on both sides whatever their speed.
++        static const long long s_rtc = [](){ const char *v = std::getenv("PS2X_RTC"); return (v && v[0]) ? std::atoll(v) : -1LL; }();
++        if (s_rtc >= 0)
++        {
++            now = static_cast<std::time_t>(s_rtc + static_cast<long long>(::g_bt3FrameCount.load(std::memory_order_relaxed) / 60u));
++#ifdef _WIN32
++            gmtime_s(&localTm, &now);
++#else
++            gmtime_r(&now, &localTm);
++#endif
++        }
++        else
++        {
+ #ifdef _WIN32
+-        localtime_s(&localTm, &now);
++            localtime_s(&localTm, &now);
+ #else
+-        localtime_r(&now, &localTm);
++            localtime_r(&now, &localTm);
+ #endif
++        }
+ 
+         // sceCdCLOCK format (BCD fields).
+         clockData[0] = 0;

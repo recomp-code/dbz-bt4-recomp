@@ -21,7 +21,9 @@ $rt = @('ps2xRuntime/src/lib/ps2_gs_live.cpp', 'ps2xRuntime/src/lib/ps2_live_rin
         'ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h', 'ps2xRuntime/src/lib/ps2_host_audio.cpp',
         'games/bt3/fps60_sites.txt', 'ps2xRuntime/src/lib/ps2_stepcensus.cpp',
         # online: the relay client and netwait, and the pad that only counts while the game is in front
-        'ps2xRuntime/src/lib/ps2_netplay.cpp', 'ps2xRuntime/src/lib/pad_config.cpp', 'ps2xRuntime/include/runtime/ps2_gs_live.h')
+        'ps2xRuntime/src/lib/ps2_netplay.cpp', 'ps2xRuntime/src/lib/pad_config.cpp', 'ps2xRuntime/include/runtime/ps2_gs_live.h',
+        # deterministic online boot: wait before the first instruction, per-match clock, shared memory card
+        'ps2xRuntime/include/runtime/ps2_netplay.h', 'ps2xRuntime/src/lib/ps2_runtime.cpp', 'ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp')
 Write-Diff 'C:/DBZBT4Recomp/tmp_base' 'C:/DBZBT4Recomp/bt3mod' $rt "$R\patches\bt3recomp-bt4mod-windows.patch"
 & $g -C $base apply --check "$R\patches\bt3recomp-bt4mod-windows.patch"
 $ok1 = $LASTEXITCODE -eq 0

@@ -2,7 +2,7 @@
 # build_runner.sh: the runner for the Mac package (bt3mod/build-mac-dist): macOS 14+, static FFmpeg (build_ffmpeg.sh),
 # libarchive without Homebrew's lz4/zstd/libb2, so ps2EntryRunner loads only system libraries.
 # The bt3mod tree is BT3-Recomp e22a34b + patches/bt3recomp-bt4mod-full.patch + bt3recomp-bt4mod-windows.patch +
-# bt3recomp-bt4mod-macos-app.patch, with the game code generated as in the README's "Native macOS" section.
+# bt3recomp-bt4mod-macos.patch + bt3recomp-bt4mod-perf.patch, with the game code generated as in the README's "Native macOS" section.
 set -e
 cd ~/NBAStreetRecomp/bt3mod
 export PKG_CONFIG_PATH=~/NBAStreetRecomp/dbz/macdist/ffmpeg/lib/pkgconfig

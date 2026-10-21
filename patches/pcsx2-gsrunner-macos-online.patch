@@ -65,3 +65,23 @@ index 4886320..8663e5c 100644
  	static PS2RecompLiveWindowDelegate* s_delegate = nil;
  	static id s_key_monitor = nil;
  
+diff --git a/pcsx2/GSDumpReplayer.cpp b/pcsx2/GSDumpReplayer.cpp
+index 97cc0b4..44ce030 100644
+--- a/pcsx2/GSDumpReplayer.cpp
++++ b/pcsx2/GSDumpReplayer.cpp
+@@ -708,11 +708,13 @@ static void GSDumpReplayerLiveStep()
+ 							s_max_ms = ms;
+ 							s_max_wait_ms = wait_ms;
+ 						}
+-						if (ms > 25.0)
++						// PS2X_HITCH_MS: the gap that counts as a hitch (default 25 ms; 20 shows the one-vsync-late frames)
++						static const double s_hitch_ms = [] { const char* v = std::getenv("PS2X_HITCH_MS"); return (v && *v) ? std::atof(v) : 25.0; }();
++						if (ms > s_hitch_ms)
+ 						{
+ 							s_hitches++;
+ 							static u32 s_hitch_logs = 0;
+-							if (s_hitch_logs++ < 200)
++							if (s_hitch_logs++ < (std::getenv("PS2X_HITCH_MS") ? 1000000u : 200u))
+ 								Console.WriteLn("(PS2Recomp) hitch %.1f ms (host waited for the game %.1f ms, host busy %.1f ms)", ms, wait_ms, ms - wait_ms);
+ 						}
+ 					}

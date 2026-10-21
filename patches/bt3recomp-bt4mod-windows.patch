@@ -536,7 +536,7 @@ index 0045f01..fac0c83 100644
      // the same mapping, after the data area (macOS: os_sync_wait_on_address, Linux: futex).
      // macOS limits shm names to 31 characters, so the base name is short.
 diff --git a/ps2xRuntime/src/lib/game_overrides.cpp b/ps2xRuntime/src/lib/game_overrides.cpp
-index 3c3d250..41d7444 100644
+index 3c3d250..3f76252 100644
 --- a/ps2xRuntime/src/lib/game_overrides.cpp
 +++ b/ps2xRuntime/src/lib/game_overrides.cpp
 @@ -38,6 +38,10 @@ extern std::atomic<uint64_t> g_seamHostChunks;  // [fightgate] the seam's host m
@@ -818,7 +818,77 @@ index 3c3d250..41d7444 100644
              const uint64_t g = XXH3_64bits_digest(st);
              XXH3_freeState(st);
              // [dethash] also report the RNG STREAM. The user's concern is the classic desync
-@@ -6821,7 +7014,7 @@ namespace
+@@ -6107,8 +6300,15 @@ namespace
+         // this state machine has to be reset per session, the armed gate flag included -- a gate
+         // left armed from a failed attempt fires on the NEXT connect before the duel module is up.
+         static uint64_t s_pulseStart = 0;
++        // [netjump] PS2X_NET_JUMP_STOP=menu: stop at the battle-type menu (see step 2); its one press, per session
++        // (=vs, for tests: stop one screen earlier, on the versus-mode screen, with no press at all)
++        static const int s_menuStopEnv = [](){ const char *v = std::getenv("PS2X_NET_JUMP_STOP");
++                                               return !v ? 0 : std::strcmp(v, "menu") == 0 ? 1 : std::strcmp(v, "vs") == 0 ? 2 : 0; }();
++        static const bool s_menuStop = s_menuStopEnv != 0;
++        static bool s_menuPressed = false; static uint64_t s_menuPressAt = 0;
+         if (s_session != ps2NetSession())
+         { s_session = ps2NetSession(); s_step = 0; s_waitUntil = 0; s_pulseStart = 0; s_sawDuel = false;
++          s_menuPressed = false; s_menuPressAt = 0;
+           s_desyncBase = ps2NetDesyncFrame();
+           s_returnStart = 0;
+           s_saidEntry = false;
+@@ -6236,8 +6436,13 @@ namespace
+             // branches on this very slot -- 0x27 goes to the character-select handler at 0x352dd8.
+             // Do NOT write the state here: the module must run its own 0x26 -> 0x27 path so
+             // func_356090 loads the screen. Press confirm and let the game do it.
+-            g_netJumpWantConfirm.store(true, std::memory_order_relaxed);
+-            std::fprintf(stderr, "[netjump] arming the versus-menu gate on frame %llu\n", (unsigned long long)now);
++            // Not with PS2X_NET_JUMP_STOP=menu: the armed gate confirms the battle type itself, which is
++            // the very choice player 1 makes there now.
++            if (!s_menuStop)
++            {
++                g_netJumpWantConfirm.store(true, std::memory_order_relaxed);
++                std::fprintf(stderr, "[netjump] arming the versus-menu gate on frame %llu\n", (unsigned long long)now);
++            }
+             s_step = 2; return;
+         }
+         if (s_step == 2)
+@@ -6328,6 +6533,37 @@ namespace
+                     g_netJumpState.store(3, std::memory_order_relaxed);   // 3 = returning: "Aborting..."
+                     return;
+                 }
++                // [netjump] PS2X_NET_JUMP_STOP=menu (the launcher's online matches): stop at the multiplayer
++                // battle-type menu (Simple / Equipos / Equipos PD) instead of going on to character select.
++                // ONE confirm gets past the versus-mode screen (1P VS 2P is already on the cursor, written in
++                // step 1); then the curtain comes down and the pads come back, and player 1 picks the mode as on
++                // the console (that menu listens to pad 1). Both machines run this on the same frames.
++                // The press waits 40 frames (PS2X_NET_JUMP_PRESS_AT) for the screen to finish opening: pressed 2
++                // frames in, it confirmed "Espectador" (CPU vs CPU) instead of the "Multijugador" under the cursor.
++                if (s_menuStop)
++                {
++                    static const uint64_t s_pressAt = [](){ const char *v = std::getenv("PS2X_NET_JUMP_PRESS_AT");
++                                                            return (uint64_t)((v && v[0]) ? std::atoi(v) : 40); }();
++                    if (duel && !s_menuPressed && now - s_pulseStart >= s_pressAt)
++                    {
++                        if (s_menuStopEnv == 1)
++                        {
++                            ps2xNetMenuPress(1 << 14, 3);
++                            g_netJumpPressCross.store(3, std::memory_order_relaxed);
++                        }
++                        s_menuPressed = true; s_menuPressAt = now;
++                    }
++                    if (s_menuPressed && now - s_menuPressAt >= 45u)
++                    {
++                        g_netJumpHold.store(0, std::memory_order_relaxed);
++                        g_netCurtainWant.store(0, std::memory_order_relaxed);
++                        ps2xNetMenuGate(0, 0);
++                        g_netJumpCancel.store(0, std::memory_order_relaxed);
++                        std::fprintf(stderr, "[netjump] settled at the multiplayer menu (state 0x%02x): player 1 chooses the battle type\n", cur);
++                        s_step = 5; g_netJumpState.store(2, std::memory_order_relaxed);   // 5 = done, nothing re-asserted
++                    }
++                    return;
++                }
+                 if (duel && ((now - s_pulseStart) % 8u) == 0u)
+                 {
+                     // The project's own synthetic press, not g_netJumpPressCross: the retired page's
+@@ -6821,7 +7057,7 @@ namespace
          // runs every frame whatever the UI is doing, and it is the only place with the guest RAM in
          // hand -- which the box's `dump` verb needs. The module throttles the actual stat().
          ps2xNotifyPollDropBox(ps2xDropBoxDir(), rdram);
@@ -827,7 +897,7 @@ index 3c3d250..41d7444 100644
          if (g_ps2StepCensus.load(std::memory_order_relaxed)) ps2StepCensusFrame(ctx);   // [stepcensus]
          ps2HalfStepFrame(ctx);        // [halfstep] (no-op unless configured; raises the macro switch on fight frames only)
          {   // [findclock] PS2X_FINDCLOCK=<start value>: when the fight gate opens, remember every 32-bit slot holding a value
-@@ -8348,3 +8541,6 @@ extern "C" int ps2xMenuSePlay(int bank, int idx)
+@@ -8348,3 +8584,6 @@ extern "C" int ps2xMenuSePlay(int bank, int idx)
  }
  
  

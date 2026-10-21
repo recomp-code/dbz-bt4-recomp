@@ -85,3 +85,98 @@ index 97cc0b4..44ce030 100644
  								Console.WriteLn("(PS2Recomp) hitch %.1f ms (host waited for the game %.1f ms, host busy %.1f ms)", ms, wait_ms, ms - wait_ms);
  						}
  					}
+diff --git a/pcsx2/GSDumpReplayer.cpp b/pcsx2/GSDumpReplayer.cpp
+index 44ce030..d8ebfdd 100644
+--- a/pcsx2/GSDumpReplayer.cpp
++++ b/pcsx2/GSDumpReplayer.cpp
+@@ -139,6 +139,11 @@ namespace
+ 		std::chrono::steady_clock::time_point handover_since{}; // [handover] when the old game left
+ 		bool stream_header_done = false;
+ 		std::vector<u8> buffer;
++		// [livestage] the stream is read in blocks of whatever the game has written (up to 256 KB) and the small reads
++		// (tags, headers) are served from here: one readPos publish, fence and space signal per block instead of per read
++		std::vector<u8> stage;
++		size_t stage_pos = 0, stage_len = 0;
++		std::chrono::steady_clock::time_point gone_checked{}; // LiveProducerGone: kill(pid, 0) at most every 50 ms
+ 	};
+ 	LiveSource s_live;
+ 	bool s_live_mode = false;
+@@ -177,6 +182,11 @@ namespace
+ #ifdef _WIN32
+ 		return s_live.producer_process && WaitForSingleObject(s_live.producer_process, 0) == WAIT_OBJECT_0;
+ #else
++		// a syscall: on every empty-ring wait it was ~3% of the host; the game's exit is still seen within 50 ms
++		const auto now = std::chrono::steady_clock::now();
++		if (now - s_live.gone_checked < std::chrono::milliseconds(50))
++			return false;
++		s_live.gone_checked = now;
+ 		return s_live.producer_pid && kill(s_live.producer_pid, 0) != 0 && errno == ESRCH;
+ #endif
+ 	}
+@@ -225,7 +235,66 @@ namespace
+ 		return LiveReadRing(dst, size);
+ 	}
+ 
++	bool LiveReadRingDirect(void* dst, size_t size);
++
++	// [livestage] PS2X_LIVE_STAGE=0: every read straight from the ring, as before.
+ 	bool LiveReadRing(void* dst, size_t size)
++	{
++		static const bool s_stage_on = [] { const char* v = std::getenv("PS2X_LIVE_STAGE"); return !(v && v[0] == '0'); }();
++		if (!s_stage_on)
++			return LiveReadRingDirect(dst, size);
++		constexpr size_t kStage = 256 * 1024;
++		u8* out = static_cast<u8*>(dst);
++		while (size > 0)
++		{
++			if (s_live.stage_pos < s_live.stage_len)
++			{
++				const size_t take = std::min(size, s_live.stage_len - s_live.stage_pos);
++				std::memcpy(out, s_live.stage.data() + s_live.stage_pos, take);
++				s_live.stage_pos += take;
++				out += take;
++				size -= take;
++				continue;
++			}
++			if (size >= kStage / 2)
++				return LiveReadRingDirect(out, size); // big transfers (texture uploads): no double copy
++			if (s_live.stage.size() < kStage)
++				s_live.stage.resize(kStage);
++			// the first byte the old way (it waits, follows a handover and sees the game exit), then whatever else the
++			// game has already written, without waiting, published once
++			if (!LiveReadRingDirect(s_live.stage.data(), 1))
++				return false;
++			size_t got = 1;
++			const s64 r = s_live.header->readPos;
++			const s64 w = s_live.header->writePos;
++			u64 avail = static_cast<u64>(w - r);
++			if (avail > 0)
++			{
++				std::atomic_thread_fence(std::memory_order_acquire);
++				u64 take = std::min<u64>(avail, kStage - got);
++				u64 pos = static_cast<u64>(r);
++				while (take > 0)
++				{
++					const u64 offset = pos % s_live.capacity;
++					const size_t chunk = static_cast<size_t>(std::min<u64>(take, s_live.capacity - offset));
++					std::memcpy(s_live.stage.data() + got, s_live.data + offset, chunk);
++					got += chunk;
++					pos += chunk;
++					take -= chunk;
++				}
++				std::atomic_thread_fence(std::memory_order_release);
++				s_live.header->readPos = static_cast<s64>(pos);
++				std::atomic_thread_fence(std::memory_order_seq_cst); // readPos store before the producerWaiting load
++				if (!s_live.header->producerFlags || s_live.header->producerWaiting)
++					LiveSignalSpace();
++			}
++			s_live.stage_pos = 0;
++			s_live.stage_len = got;
++		}
++		return true;
++	}
++
++	bool LiveReadRingDirect(void* dst, size_t size)
+ 	{
+ 		u8* out = static_cast<u8*>(dst);
+ 		while (size > 0)

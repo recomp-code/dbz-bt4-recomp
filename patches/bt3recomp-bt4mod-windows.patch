@@ -988,7 +988,7 @@ index c086d76..3a39975 100644
          else if (kind == 'j') { g_hs[(pc - kBase) >> 2] = 5; ++ni; }
          else if (kind == 'D') { g_hs[(pc - kBase) >> 2] = 6; ++ni; }   // duration assignment: value * 2 (pairs with a 'd' countdown)   // integer step: store old + (new - old) / 2 (ki drain/charge)
 diff --git a/ps2xRuntime/src/lib/ps2_netplay.cpp b/ps2xRuntime/src/lib/ps2_netplay.cpp
-index 33b15d8..0663a36 100644
+index 33b15d8..ffc8dc4 100644
 --- a/ps2xRuntime/src/lib/ps2_netplay.cpp
 +++ b/ps2xRuntime/src/lib/ps2_netplay.cpp
 @@ -18,7 +18,9 @@
@@ -1208,7 +1208,19 @@ index 33b15d8..0663a36 100644
      if (!g.connected || !g.synced) { sendHello(); pump(); return; }   // handshake / state sync only, no frame numbering yet
      const uint32_t frame = relFrame(frameAbs);
      Ps2xNetInput use = in;
-@@ -815,11 +952,24 @@ bool ps2NetGetInput(uint32_t frameAbs, int player, Ps2xNetInput &out)
+@@ -784,7 +921,10 @@ bool ps2NetGetInput(uint32_t frameAbs, int player, Ps2xNetInput &out)
+     if (!g.active || !g.connected || !g.synced) return false;   // pre-connection / pre-sync: leave the pads alone
+     const uint32_t frame = relFrame(frameAbs);
+     const bool wantLocal = (player == g.localPlayer);
+-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(g.timeoutMs);
++    // The first frames include each machine's own start-up (the GS host's window, shader compilation: a Mac took
++    // over 20 s before its frame 7): up to frame 300 the other side gets 2 minutes, after that PS2X_NET_TIMEOUT.
++    const uint32_t waitMs = frame < 300u ? std::max<uint32_t>(g.timeoutMs, 120000u) : g.timeoutMs;
++    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(waitMs);
+     const auto t0 = std::chrono::steady_clock::now();
+     bool stalled = false;
+     for (;;)
+@@ -815,11 +955,24 @@ bool ps2NetGetInput(uint32_t frameAbs, int player, Ps2xNetInput &out)
              break;
          }
          pump();
@@ -1236,7 +1248,7 @@ index 33b15d8..0663a36 100644
          }
          stalled = true;
          std::this_thread::sleep_for(std::chrono::microseconds(250));
-@@ -851,8 +1001,7 @@ void ps2NetSetChecksum(uint32_t frame, uint64_t hash)
+@@ -851,8 +1004,7 @@ void ps2NetSetChecksum(uint32_t frame, uint64_t hash)
      {
          for (auto i = g.ourHash.begin(); i != g.ourHash.end();) i = (i->first + 600 < frame) ? g.ourHash.erase(i) : ++i;
          for (auto i = g.peerHash.begin(); i != g.peerHash.end();) i = (i->first + 600 < frame) ? g.peerHash.erase(i) : ++i;

@@ -1,0 +1,162 @@
+macOS, on top of bt3recomp-bt4mod-windows.patch (replaces bt3recomp-bt4mod-macos-app.patch + -macos-online.patch):
+- PS2X_GSHOST_ARGS takes "quoted" arguments (the app's ini path has spaces);
+- the runner drops its Dock icon in live mode (the GS host's window is the one icon);
+- [padfocus] the controller counts only while the game's window is the frontmost app (NSWorkspace);
+- the fibers of online's virtual clock: _XOPEN_SOURCE before every header, or ucontext_t has no room for the
+  registers and swapcontext writes past each fiber.
+
+diff --git a/ps2xRuntime/src/lib/ps2_fiber.cpp b/ps2xRuntime/src/lib/ps2_fiber.cpp
+index 51f6cfd..c2e521a 100644
+--- a/ps2xRuntime/src/lib/ps2_fiber.cpp
++++ b/ps2xRuntime/src/lib/ps2_fiber.cpp
+@@ -1,4 +1,11 @@
+ // [fibers] See include/runtime/ps2_fiber.h for why this exists.
++// macOS: _XOPEN_SOURCE has to come before ANY header. <cstdlib> already brings in ucontext_t, and without it the struct
++// has no room for the registers (56 bytes instead of 880 on arm64): getcontext/swapcontext then wrote 816 bytes past
++// every fiber, over the heap (a malloc freelist trap at the first GL shader link with PS2X_FIBERS=1).
++#if defined(__APPLE__) && !defined(_XOPEN_SOURCE)
++#  define _XOPEN_SOURCE 700
++#  define _DARWIN_C_SOURCE 1   // and keep the Darwin extensions (MAP_ANONYMOUS) that _XOPEN_SOURCE alone hides
++#endif
+ #include "runtime/ps2_fiber.h"
+ 
+ #include <cstdio>
+@@ -14,13 +21,13 @@
+ #elif (defined(__APPLE__) || defined(__linux__) || defined(__unix__)) && !defined(__EMSCRIPTEN__)   // [web] no ucontext in wasm
+ // ucontext is deprecated on macOS but still present and functional; silence the deprecation there
+ // rather than carrying a third backend.
+-#  ifdef __APPLE__
+-#    define _XOPEN_SOURCE 700
+-#  endif
+ #  include <ucontext.h>
+ #  include <sys/mman.h>
+ #  include <unistd.h>
+ #  define PS2X_FIBER_UCTX 1
++#  ifdef __APPLE__
++static_assert(sizeof(ucontext_t) > sizeof(mcontext_t), "ucontext_t without its register area: _XOPEN_SOURCE came too late");
++#  endif
+ #else
+ #  define PS2X_FIBER_NONE 1
+ #endif
+diff --git a/ps2xRuntime/src/lib/ps2_gs_live.cpp b/ps2xRuntime/src/lib/ps2_gs_live.cpp
+index e0c22d4..aefd6e4 100644
+--- a/ps2xRuntime/src/lib/ps2_gs_live.cpp
++++ b/ps2xRuntime/src/lib/ps2_gs_live.cpp
+@@ -38,6 +38,12 @@ bool ps2xWebStartGsHost(ps2live::RingHeader *header);
+ #include <cerrno>
+ #include <fcntl.h>
+ #include <signal.h>
++#if defined(__APPLE__)
++#include <objc/message.h>
++#include <objc/runtime.h>
++extern "C" void *objc_autoreleasePoolPush(void);
++extern "C" void objc_autoreleasePoolPop(void *);
++#endif
+ #include <spawn.h>
+ #include <sys/mman.h>
+ #include <sys/stat.h>
+@@ -547,16 +554,26 @@ namespace ps2_gslive
+                 std::vector<std::string> args{exe, "-live", "-window", "-livering", suffix};
+                 const char *extra = std::getenv("PS2X_GSHOST_ARGS");
+                 std::string extraArgs = (extra && extra[0]) ? extra : "-ini dbz.ini"; // quality settings next to the host
+-                size_t pos = 0;
+-                while (pos < extraArgs.size())
++                // Split on spaces; "double quotes" keep a path with spaces in one argument (the Mac app's
++                // -ini lives in ~/Library/Application Support).
++                std::string cur;
++                bool inArg = false, quoted = false;
++                for (const char c : extraArgs)
+                 {
+-                    const size_t start = extraArgs.find_first_not_of(' ', pos);
+-                    if (start == std::string::npos)
+-                        break;
+-                    const size_t end = extraArgs.find(' ', start);
+-                    args.push_back(extraArgs.substr(start, end == std::string::npos ? std::string::npos : end - start));
+-                    pos = end == std::string::npos ? extraArgs.size() : end;
++                    if (c == '"')
++                        quoted = !quoted, inArg = true;
++                    else if (c == ' ' && !quoted)
++                    {
++                        if (inArg)
++                            args.push_back(cur);
++                        cur.clear();
++                        inArg = false;
++                    }
++                    else
++                        cur += c, inArg = true;
+                 }
++                if (inArg)
++                    args.push_back(cur);
+                 std::vector<char *> argv;
+                 for (std::string &arg : args)
+                     argv.push_back(arg.data());
+@@ -936,6 +953,33 @@ namespace ps2_gslive
+         if (HWND fg = GetForegroundWindow())
+             GetWindowThreadProcessId(fg, &pid);
+         return pid == w.live.hostPid || pid == GetCurrentProcessId();
++#elif defined(PS2X_GS_LIVE_RING) && defined(__APPLE__)
++        // macOS: the frontmost application (NSWorkspace, through the Objective-C runtime: this file stays C++). Asked at
++        // most every 100 ms: the pad is polled every frame and the answer only changes when the player switches apps.
++        if (!requested())
++            return true;
++        Writer &w = writer();
++        if (!w.liveActive || w.live.hostPid == 0)
++            return true;
++        using Clock = std::chrono::steady_clock;
++        static Clock::time_point s_at{};
++        static bool s_front = true;
++        const Clock::time_point now = Clock::now();
++        if (now - s_at < std::chrono::milliseconds(100))
++            return s_front;
++        s_at = now;
++        void *pool = objc_autoreleasePoolPush();
++        int pid = -1;
++        if (Class ws = objc_getClass("NSWorkspace"))
++            if (id shared = ((id(*)(Class, SEL))objc_msgSend)(ws, sel_registerName("sharedWorkspace")))
++                if (id app = ((id(*)(id, SEL))objc_msgSend)(shared, sel_registerName("frontmostApplication")))
++                    pid = ((int (*)(id, SEL))objc_msgSend)(app, sel_registerName("processIdentifier"));
++        objc_autoreleasePoolPop(pool);
++        const bool front = pid < 0 || pid == w.live.hostPid || pid == getpid();   // unknown: count the pad
++        if (front != s_front)
++            std::fprintf(stderr, "[padfocus] the game is %s (front app pid %d)\n", front ? "in front" : "behind another window", pid);
++        s_front = front;
++        return front;
+ #else
+         return true;
+ #endif
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 99a13c5..8036e29 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -50,6 +50,21 @@ extern "C" int ps2xSchedTraceOn();               // PS2X_SCHEDTRACE window (defi
+ #include "ps2_stubs.h"
+ #include "ps2_syscalls.h"
+ #include "game_overrides.h"
++#if defined(__APPLE__)
++#include <objc/message.h>
++#include <objc/runtime.h>
++// [gslive] macOS: the window library turns the process into a regular app (Dock icon), but with the PCSX2 GS host
++// drawing the game this process has no visible window: an accessory app keeps everything working without the icon.
++static void ps2xMacHideDockIcon()
++{
++    Class nsApp = objc_getClass("NSApplication");
++    if (!nsApp)
++        return;
++    id app = ((id(*)(Class, SEL))objc_msgSend)(nsApp, sel_registerName("sharedApplication"));
++    if (app)
++        ((void (*)(id, SEL, long))objc_msgSend)(app, sel_registerName("setActivationPolicy:"), 1L); // Accessory
++}
++#endif
+ #include "Kernel/Stubs/Pad.h"        // [hstate]/[fightprobe]: ps2_stubs::getPadDebugSnapshot()
+ #include "Kernel/Stubs/MemoryCard.h" // [hstate]: ps2_stubs::getMemoryCardDebugSnapshot()
+ #include "Kernel/Syscalls/Helpers/Path.h" // [r3000] getConfiguredCdRoot() for the IRX paths
+@@ -1585,6 +1600,9 @@ bool PS2Runtime::initialize(const char *title)
+         {   // [gslive] PCSX2's GS host draws the game in its own window (it also takes the keyboard and the gamepad): this
+             // window only keeps the GL context, audio and pad polling alive, so it stays hidden. Start the host now.
+             bt3SetWindowState(FLAG_WINDOW_HIDDEN);
++#if defined(__APPLE__)
++            ps2xMacHideDockIcon();
++#endif
+             std::fprintf(stderr, "[gslive] runtime window hidden, PCSX2 GS host %s\n", ps2_gslive::liveActive() ? "running" : "NOT available");
+         }
+         {   // [winlog] what we asked for vs what the framework reports vs the REAL client area. The SDL

@@ -34,6 +34,9 @@ Jugar en linea
 Los dos jugadores tienen que tener la misma version del juego (el launcher avisa si no); Mac y Windows pueden
 jugar juntos si la tienen.
 Si la pelea va a tirones porque estais lejos, sube "Retraso de controles" en AJUSTES (manda el de quien invita).
+6. "Estadisticas" (arriba en EN LINEA): tus peleas ganadas y perdidas, el % de victorias, las horas jugadas en
+   linea y tu puesto, y el tablero con los mejores (toca a un jugador para ver los suyos). Solo cuentan las
+   peleas en linea en las que los juegos de los dos dieron el mismo resultado.
 
 Este paquete NO incluye el juego: necesitas tu propia ISO. El mod es de Team BT4:
 https://teambt4.wixsite.com/teambt4projects
@@ -42,7 +45,7 @@ Requisitos
 ----------
 - Mac con Apple Silicon (M1 o mas nuevo) y macOS 14 o mas nuevo.
 - Calidad "Maxima" (6x): M Pro / Max / Ultra.  "Alta" (4x) y "Equilibrada" (3x): el resto.
-  "Apple MetalFX": 3x reescalado a la resolucion de tu pantalla, para cualquier Mac.
+  "Apple MetalFX": 3x reescalado a la resolucion de tu pantalla; pide casi el doble de GPU que 3x.
   Con 60 fps la GPU trabaja el doble: si da tirones, baja la calidad (F1 dentro del juego).
 
 Controles
@@ -53,7 +56,9 @@ Mando (Xbox, PlayStation o MFi conectado al Mac) o teclado:
 F1 (o mantener START 1,5 s) = opciones: resolucion interna, MetalFX, 60 fps, mostrar FPS...
 F11 o Alt+Enter = pantalla completa / ventana.  Cmd+Q en la ventana del juego = salir.
 
-Codigo para desbloquear todo (en el menu principal): manten L1+R1 y pulsa
+Todo desbloqueado: "Contenido desbloqueado" en AJUSTES (activado de serie) abre todos los personajes,
+escenarios y modos al llegar al menu principal; en linea siempre esta activado. Cuando el juego guarda, se queda
+en tu memoria. El codigo del menu principal tambien funciona: manten L1+R1 y pulsa
 Abajo, Derecha, Triangulo, Abajo, Izquierda, Triangulo, Arriba.
 
 Partidas guardadas, opciones y registros: ~/Library/Application Support/DBZ_BT4

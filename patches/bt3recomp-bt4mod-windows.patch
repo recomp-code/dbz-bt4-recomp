@@ -2105,3 +2105,46 @@ index 11f63d2..d9ae13d 100644
  
              for (uint32_t mbx = 0u; mbx < macroblockColumns; ++mbx)
              {
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
+index 2008f33..4acbb3c 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
+@@ -344,6 +344,20 @@ namespace ps2_stubs
+         setReturnU32(ctx, (uint32_t)len);
+     }
+ 
++    // [netplay] strcmp/strncmp as the PS2's newlib does them: the difference of the first differing bytes, as unsigned
++    // char. The host's own are not the same everywhere -- macOS returns that difference, MSVC's CRT -1/0/1 -- and the
++    // game keeps the value: the Mac wrote 46 (= '.' - '\0') at 0x4f8 and the Windows game did not, frame 1905 of
++    // character select -- the online desync between the two.
++    static int ps2Strncmp(const char *a, const char *b, size_t n)
++    {
++        const unsigned char *p = reinterpret_cast<const unsigned char *>(a);
++        const unsigned char *q = reinterpret_cast<const unsigned char *>(b);
++        for (; n != 0; --n, ++p, ++q)
++            if (*p != *q || *p == 0)
++                return static_cast<int>(*p) - static_cast<int>(*q);
++        return 0;
++    }
++
+     void strcmp(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         uint32_t str1Addr = getRegU32(ctx, 4); // $a0
+@@ -355,7 +369,7 @@ namespace ps2_stubs
+ 
+         if (hostStr1 && hostStr2)
+         {
+-            result = ::strcmp(hostStr1, hostStr2);
++            result = ps2Strncmp(hostStr1, hostStr2, SIZE_MAX);
+         }
+         else
+         {
+@@ -383,7 +397,7 @@ namespace ps2_stubs
+ 
+         if (hostStr1 && hostStr2)
+         {
+-            result = ::strncmp(hostStr1, hostStr2, size);
++            result = ps2Strncmp(hostStr1, hostStr2, size);
+         }
+         else
+         {

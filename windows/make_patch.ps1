@@ -27,7 +27,9 @@ $rt = @('ps2xRuntime/src/lib/ps2_gs_live.cpp', 'ps2xRuntime/src/lib/ps2_live_rin
         'ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp',
         # state hash: the dead part of the thread stacks (main stack from SetupThread, workers' [base, sp))
         'ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp', 'ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp',
-        'ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp')
+        'ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp',
+        # strcmp/strncmp like newlib (the host CRTs differ: the Mac-vs-Windows desync)
+        'ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp')
 Write-Diff 'C:/DBZBT4Recomp/tmp_base' 'C:/DBZBT4Recomp/bt3mod' $rt "$R\patches\bt3recomp-bt4mod-windows.patch"
 & $g -C $base apply --check "$R\patches\bt3recomp-bt4mod-windows.patch"
 $ok1 = $LASTEXITCODE -eq 0

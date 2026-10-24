@@ -1,0 +1,516 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index de91b06..e6d56e5 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -1154,7 +1154,7 @@ if (_seamvk)
+         add_subdirectory("${PS2X_GRANITE_DIR}" "${CMAKE_BINARY_DIR}/Granite" EXCLUDE_FROM_ALL)
+         message(STATUS "[seamvk] Granite from ${PS2X_GRANITE_DIR} (no paraLLEl-GS backend)")
+     endif()
+-    target_sources(ps2_runtime PRIVATE src/lib/ps2_seamvk.cpp src/lib/ps2_seamgs.cpp src/lib/ps2_wshud.cpp src/lib/ps2_bcdecode.cpp)   # [seamvk] native Vulkan renderer at the engine seam
++    target_sources(ps2_runtime PRIVATE src/lib/ps2_seamvk.cpp src/lib/ps2_seamvk_gl.cpp src/lib/ps2_seamgs.cpp src/lib/ps2_wshud.cpp src/lib/ps2_bcdecode.cpp)   # [seamvk] native Vulkan renderer at the engine seam ([glshare] _gl: its zero-copy present)
+     target_link_libraries(ps2_runtime PUBLIC granite-vulkan granite-math)
+     target_compile_definitions(ps2_runtime PUBLIC PS2X_HAVE_SEAMVK=1)
+     target_compile_definitions(ps2x_settings PRIVATE PS2X_HAVE_SEAMVK=1)   # [fesettings] same: without it the front end showed (and would save) OpenGL for a saved "native"
+diff --git a/ps2xRuntime/include/runtime/ps2_seamvk.h b/ps2xRuntime/include/runtime/ps2_seamvk.h
+index 80d44bd..edb907e 100644
+--- a/ps2xRuntime/include/runtime/ps2_seamvk.h
++++ b/ps2xRuntime/include/runtime/ps2_seamvk.h
+@@ -65,6 +65,21 @@ namespace seamvk
+     bool takeFrame(std::vector<uint8_t> &rgba, uint32_t &w, uint32_t &h);
+     uint64_t lastFrameGframe();   // [presentlat] the game frame the last taken frame was rendered from
+     void shutdown();              // [earlyframe] join the readback consumer (before the device is destroyed)
++
++    // [glshare] Zero-copy present (ps2_seamvk_gl.cpp). The composed frame is copied on the GPU into one of a few images
++    // whose memory the window's GL context imports (GL_EXT_memory_object + GL_EXT_semaphore, Win32 handles or fds),
++    // instead of being read back to the CPU and uploaded again. Present thread, GL context current: the GL texture
++    // holding the newest frame, or 0 when sharing is unavailable (no extension, another GPU, macOS) -- then takeFrame.
++    // PS2X_SEAMVK_GLSHARE=0 keeps the readback path.
++    uint32_t sharedPresent(void *(*glGetProc)(const char *), uint32_t &w, uint32_t &h);
++    namespace share
++    {   // between the renderer (GS thread) and the GL side
++        struct Frame { int slot = -1; uint32_t w = 0, h = 0, gen = 0; uint64_t memSize = 0; intptr_t mem = -1, sem = -1; };   // mem: only when the slot's image is new; the taker owns mem and sem
++        bool deviceIds(uint8_t luid[8], bool &luidValid, uint8_t deviceUuid[16], uint8_t driverUuid[16]);   // false until the device exists
++        void enable(bool on);    // the GL side can import: render into shared images from the next frame on
++        bool take(Frame &out);   // the newest frame ready for GL
++        void release(int slot);  // GL no longer reads that slot
++    }
+ #else
+     // [standalone] built without Granite (no Vulkan renderer at all): the runtime's hooks fall through
+     inline bool on() { return false; }
+@@ -79,6 +94,7 @@ namespace seamvk
+     inline bool takeFrame(std::vector<uint8_t> &, uint32_t &, uint32_t &) { return false; }
+     inline uint64_t lastFrameGframe() { return 0; }
+     inline void shutdown() {}
++    inline uint32_t sharedPresent(void *(*)(const char *), uint32_t &, uint32_t &) { return 0; }
+ #endif
+ 
+     struct PrivRegs { uint64_t pmode = 0, dispfb1 = 0, display1 = 0, dispfb2 = 0, display2 = 0, bgcolor = 0; };
+diff --git a/ps2xRuntime/src/lib/ps2_seamvk.cpp b/ps2xRuntime/src/lib/ps2_seamvk.cpp
+index 1c963b3..7351f41 100644
+--- a/ps2xRuntime/src/lib/ps2_seamvk.cpp
++++ b/ps2xRuntime/src/lib/ps2_seamvk.cpp
+@@ -23,6 +23,14 @@
+ #include "image.hpp"
+ #include "buffer.hpp"
+ #include "sampler.hpp"
++#if defined(_WIN32)   // [glshare] closing exported handles
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#else
++#include <unistd.h>
++#endif
+ 
+ #include <algorithm>
+ #include <deque>
+@@ -133,7 +141,7 @@ namespace seamvk
+             std::vector<std::pair<Vulkan::ImageHandle, int32_t>> zKeep;   // [zdecdump] depth copies taken at Z read-backs while dumping
+             Vulkan::BufferHandle readback;
+             struct TsMark { uint8_t cat; Vulkan::QueryPoolHandle q; };   // [gputime] GPU timestamps: cat = the category that STARTS at this mark
+-            struct Pending { Vulkan::BufferHandle buf; Vulkan::Fence fence; uint32_t w = 0, h = 0; bool live = false; std::vector<TsMark> ts; uint64_t gframe = 0; };   // [presentlat] gframe: the game frame this output belongs to
++            struct Pending { Vulkan::BufferHandle buf; Vulkan::Fence fence; uint32_t w = 0, h = 0; bool live = false; std::vector<TsMark> ts; uint64_t gframe = 0; bool noReadback = false; };   // [presentlat] gframe: the game frame this output belongs to   // [glshare] noReadback: the frame went to a shared image (the fence still guards the rings)
+             std::unordered_map<uint64_t, Vulkan::ImageHandle> shared;   // [seampack] texture-pack replacement images by name key, for the session
+             std::vector<Vulkan::ImageHandle> hoistFree;   // [hoist] images no draw in flight references any more, by size
+             uint64_t hoistFreeBytes = 0;                    // [poolcap] what hoistFree holds, so the pool is capped by bytes and not by count
+@@ -164,6 +172,23 @@ namespace seamvk
+         bool earlyFrame() { static const bool s = [](){ const char *v = std::getenv("PS2X_SEAMVK_EARLYFRAME"); return !(v && v[0] == '0'); }(); return s; }
+         std::mutex g_rbMtx; std::condition_variable g_rbCv; std::deque<uint32_t> g_rbQueue; bool g_rbQuit = false;
+         std::thread *g_rbThread = nullptr;   // heap-held: never destroyed while joinable at exit (shutdown() joins it when called)
++
++        // [glshare] The shared present images (ps2_seamvk.h). A slot is FREE (only the GS thread touches it), READY (copied,
++        // its semaphore exported, not yet taken: a newer frame supersedes it) or TAKEN (GL samples it until it releases it).
++        // One fresh binary semaphore per frame, as Granite's own GL interop test does: a frame GL skips just closes its handle.
++        struct ShareSlot { Vulkan::ImageHandle img; uint32_t w = 0, h = 0, gen = 0; uint64_t memSize = 0, gframe = 0; intptr_t mem = -1, sem = -1; int st = 0; };   // st: 0 free, 1 ready, 2 taken
++        constexpr int kShareSlots = 4;
++        std::mutex g_shareMtx; ShareSlot g_share[kShareSlots]; std::atomic<bool> g_shareOn{false};
++        void closeExternal(intptr_t &h)
++        {
++            if (h == -1) return;
++#if defined(_WIN32)
++            CloseHandle(reinterpret_cast<HANDLE>(h));
++#else
++            close(int(h));
++#endif
++            h = -1;
++        }
+         void rbWorker()
+         {
+             for (;;)
+@@ -177,13 +202,16 @@ namespace seamvk
+                 }
+                 Gpu::Pending &p = g_gpu.ring[si % 3u];
+                 p.fence->wait();
+-                const uint8_t *src = static_cast<const uint8_t *>(g_gpu.dev->map_host_buffer(*p.buf, Vulkan::MEMORY_ACCESS_READ_BIT));
++                if (!p.noReadback)
+                 {
+-                    std::lock_guard<std::mutex> lk(g_mtx);
+-                    g_frame.assign(src, src + size_t(p.w) * p.h * 4u);
+-                    g_frameW = p.w; g_frameH = p.h; g_frameFresh = true; g_frameGframe = p.gframe;
++                    const uint8_t *src = static_cast<const uint8_t *>(g_gpu.dev->map_host_buffer(*p.buf, Vulkan::MEMORY_ACCESS_READ_BIT));
++                    {
++                        std::lock_guard<std::mutex> lk(g_mtx);
++                        g_frame.assign(src, src + size_t(p.w) * p.h * 4u);
++                        g_frameW = p.w; g_frameH = p.h; g_frameFresh = true; g_frameGframe = p.gframe;
++                    }
++                    g_gpu.dev->unmap_host_buffer(*p.buf, Vulkan::MEMORY_ACCESS_READ_BIT);
+                 }
+-                g_gpu.dev->unmap_host_buffer(*p.buf, Vulkan::MEMORY_ACCESS_READ_BIT);
+                 {
+                     std::lock_guard<std::mutex> lk(g_rbMtx);
+                     p.live = false;
+@@ -2026,19 +2054,73 @@ namespace seamvk
+             std::unique_lock<std::mutex> lk(g_rbMtx);
+             g_rbCv.wait(lk, [&]{ return !slot.live; });
+         }
+-        if (!slot.buf || slot.w != w || slot.h != h)
++        slot.gframe = g_bt3FrameCount.load(std::memory_order_relaxed);   // [presentlat]
++        // [glshare] GL imports the frame: a GPU copy into a free shared image, handed to the external queue family in the
++        // layout GL is told about (GL_LAYOUT_SHADER_READ_ONLY_EXT). No free slot (GL not presenting): this frame is not shown.
++        int shareSlot = -1; bool shareSkip = false;
++        if (g_shareOn.load(std::memory_order_acquire))
+         {
+-            Vulkan::BufferCreateInfo bi = {}; bi.size = VkDeviceSize(w) * h * 4u; bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT; bi.domain = Vulkan::BufferDomain::CachedHost;
+-            slot.buf = dev.create_buffer(bi); slot.w = w; slot.h = h;
++            { std::lock_guard<std::mutex> lk(g_shareMtx); for (int i = 0; i < kShareSlots; ++i) if (g_share[i].st == 0) { shareSlot = i; break; } }
++            shareSkip = shareSlot < 0;
++            if (shareSlot >= 0)
++            {
++                ShareSlot &s = g_share[shareSlot];   // free: no other thread reads it until it is published
++                if (!s.img || s.w != w || s.h != h)
++                {
++                    auto ci = Vulkan::ImageCreateInfo::render_target(w, h, VK_FORMAT_R8G8B8A8_UNORM);
++                    ci.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
++                    ci.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
++                    ci.misc = Vulkan::IMAGE_MISC_EXTERNAL_MEMORY_BIT;
++                    Vulkan::ImageHandle img = dev.create_image(ci);
++                    Vulkan::ExternalHandle eh; if (img) eh = img->export_handle();
++                    const bool ok = img && eh.handle != Vulkan::ExternalHandle().handle;
++                    std::lock_guard<std::mutex> lk(g_shareMtx);
++                    closeExternal(s.mem);
++                    if (ok) { s.img = img; s.mem = intptr_t(eh.handle); s.memSize = img->get_allocation().get_size(); s.w = w; s.h = h; ++s.gen; }
++                    else { std::fprintf(stderr, "[glshare] exportable %ux%u image failed: back to the readback path\n", w, h); g_shareOn.store(false); shareSlot = -1; shareSkip = false; }
++                }
++            }
++            if (shareSlot >= 0)
++            {
++                ShareSlot &s = g_share[shareSlot];
++                cmd->image_barrier(*s.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, 0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
++                cmd->copy_image(*s.img, *g_gpu.out, {}, {}, { w, h, 1 }, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 });
++                VkImageMemoryBarrier2 ib = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };   // release to the external (GL) queue family
++                ib.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT; ib.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
++                ib.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; ib.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
++                ib.srcQueueFamilyIndex = dev.get_queue_info().family_indices[Vulkan::QUEUE_INDEX_GRAPHICS]; ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
++                ib.image = s.img->get_image(); ib.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
++                VkDependencyInfo dep = { VK_STRUCTURE_TYPE_DEPENDENCY_INFO }; dep.imageMemoryBarrierCount = 1; dep.pImageMemoryBarriers = &ib;
++                cmd->barrier(dep);
++            }
++        }
++        slot.noReadback = shareSlot >= 0 || shareSkip;
++        if (!slot.noReadback)
++        {
++            if (!slot.buf || slot.w != w || slot.h != h)
++            {
++                Vulkan::BufferCreateInfo bi = {}; bi.size = VkDeviceSize(w) * h * 4u; bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT; bi.domain = Vulkan::BufferDomain::CachedHost;
++                slot.buf = dev.create_buffer(bi); slot.w = w; slot.h = h;
++            }
++            cmd->copy_image_to_buffer(*slot.buf, *g_gpu.out, 0, {}, { w, h, 1 }, 0, 0, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 });
++            cmd->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
+         }
+-        slot.gframe = g_bt3FrameCount.load(std::memory_order_relaxed);   // [presentlat]
+-        cmd->copy_image_to_buffer(*slot.buf, *g_gpu.out, 0, {}, { w, h, 1 }, 0, 0, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 });
+-        cmd->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
+         const auto tC = std::chrono::steady_clock::now();
+         tsMark(*cmd, 7);
+         if (!g_gpu.tsCur.empty()) { g_gpu.tsPending.emplace_back(); g_gpu.tsPending.back().swap(g_gpu.tsCur); }
+         g_gpu.tsCur.clear();
+         dev.submit(cmd, &slot.fence);
++        if (shareSlot >= 0)
++        {   // [glshare] a fresh semaphore signalled after the copy; GL imports and waits it before sampling
++            Vulkan::Semaphore sem = dev.request_semaphore_external(VK_SEMAPHORE_TYPE_BINARY, Vulkan::ExternalHandle::get_opaque_semaphore_handle_type());
++            dev.submit_empty(Vulkan::CommandBuffer::Type::Generic, nullptr, sem.get());
++            const Vulkan::ExternalHandle sh = sem->export_to_handle();
++            std::lock_guard<std::mutex> lk(g_shareMtx);
++            for (int i = 0; i < kShareSlots; ++i)
++                if (g_share[i].st == 1) { closeExternal(g_share[i].sem); g_share[i].st = 0; }   // superseded before GL took it
++            ShareSlot &s = g_share[shareSlot];
++            s.sem = intptr_t(sh.handle); s.gframe = slot.gframe; s.st = 1;
++        }
+         const auto tD = std::chrono::steady_clock::now();
+         if (earlyFrame())
+         {   // [earlyframe] hand the slot to the consumer thread; it publishes the frame when the GPU signals
+@@ -2068,7 +2150,8 @@ namespace seamvk
+         g_gpu.msSubmit += std::chrono::duration<double, std::milli>(tD - tC).count();
+         g_gpu.msWait += std::chrono::duration<double, std::milli>(tE - tD).count();
+ 
+-        if (havePrev)
++        if (havePrev && prev.noReadback) prev.live = false;
++        else if (havePrev)
+         {
+             const uint8_t *src = static_cast<const uint8_t *>(dev.map_host_buffer(*prev.buf, Vulkan::MEMORY_ACCESS_READ_BIT));
+             {
+@@ -2164,4 +2247,39 @@ namespace seamvk
+             g_gpu.msTake = g_gpu.msRecord = g_gpu.msSubmit = g_gpu.msWait = 0; g_gpu.msUpload = g_gpu.msLoop = 0;
+         }
+     }
++
++    // ---- [glshare] the GL side's handshake (ps2_seamvk.h) -------------------------------------------------------------
++    namespace share
++    {
++        bool deviceIds(uint8_t luid[8], bool &luidValid, uint8_t deviceUuid[16], uint8_t driverUuid[16])
++        {
++            if (!g_own || !g_own->inited) return false;
++            const VkPhysicalDeviceVulkan11Properties &p = g_own->dev.get_device_features().vk11_props;
++            luidValid = p.deviceLUIDValid != VK_FALSE;
++            std::memcpy(luid, p.deviceLUID, 8); std::memcpy(deviceUuid, p.deviceUUID, 16); std::memcpy(driverUuid, p.driverUUID, 16);
++            return true;
++        }
++        void enable(bool on) { g_shareOn.store(on && g_own && g_own->dev.get_device_features().supports_external, std::memory_order_release); }
++        bool take(Frame &out)
++        {
++            std::lock_guard<std::mutex> lk(g_shareMtx);
++            for (int i = 0; i < kShareSlots; ++i)
++            {
++                ShareSlot &s = g_share[i];
++                if (s.st != 1) continue;
++                s.st = 2;
++                out.slot = i; out.w = s.w; out.h = s.h; out.gen = s.gen; out.memSize = s.memSize; out.mem = s.mem; out.sem = s.sem;
++                s.mem = -1; s.sem = -1;
++                { std::lock_guard<std::mutex> lf(g_mtx); g_frameGframe = s.gframe; }   // [presentlat]
++                return true;
++            }
++            return false;
++        }
++        void release(int slot)
++        {
++            if (slot < 0 || slot >= kShareSlots) return;
++            std::lock_guard<std::mutex> lk(g_shareMtx);
++            if (g_share[slot].st == 2) g_share[slot].st = 0;
++        }
++    }
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_seamvk_gl.cpp b/ps2xRuntime/src/lib/ps2_seamvk_gl.cpp
+new file mode 100644
+index 0000000..5a884fb
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_seamvk_gl.cpp
+@@ -0,0 +1,223 @@
++// [glshare] The GL side of the native renderer's zero-copy present (see ps2_seamvk.h): the window's GL context imports
++// the shared images' memory once per image (GL_EXT_memory_object) and, per frame, a semaphore the Vulkan copy signals
++// (GL_EXT_semaphore), so the frame never goes through the CPU. A slot the window stops showing is handed back once a GL
++// fence placed after its last draw has signalled. Kept apart from ps2_runtime.cpp: it needs <windows.h>, which collides
++// with raylib's names there. No GL headers: the few entry points are loaded here.
++#include "runtime/ps2_seamvk.h"
++
++#if defined(PS2X_HAVE_SEAMVK)
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <type_traits>
++#include <vector>
++#if defined(_WIN32)
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++#define PS2X_GLAPI __stdcall
++#else
++#include <dlfcn.h>
++#include <unistd.h>
++#define PS2X_GLAPI
++#endif
++
++namespace seamvk
++{
++    namespace
++    {
++        typedef unsigned GLenum, GLuint, GLbitfield; typedef int GLint, GLsizei; typedef uint64_t GLuint64; typedef unsigned char GLubyte;
++        typedef struct __GLsync *GLsync;
++        enum : GLenum
++        {
++            kTex2D = 0x0DE1, kRGBA8 = 0x8058, kMinFilter = 0x2801, kMagFilter = 0x2800, kLinear = 0x2601, kWrapS = 0x2802, kWrapT = 0x2803,
++            kClampToEdge = 0x812F, kTexBinding2D = 0x8069, kExtensions = 0x1F03, kNumExtensions = 0x821D,
++            kDedicatedMemory = 0x9581, kOpaqueFd = 0x9586, kOpaqueWin32 = 0x9587, kDeviceUuid = 0x9597, kDriverUuid = 0x9598, kDeviceLuid = 0x9599,
++            kLayoutShaderReadOnly = 0x9591, kSyncGpuCommandsComplete = 0x9117, kSyncFlushCommands = 0x1, kAlreadySignaled = 0x911A, kConditionSatisfied = 0x911C,
++        };
++        struct Gl
++        {
++            void (PS2X_GLAPI *GenTextures)(GLsizei, GLuint *);
++            void (PS2X_GLAPI *DeleteTextures)(GLsizei, const GLuint *);
++            void (PS2X_GLAPI *BindTexture)(GLenum, GLuint);
++            void (PS2X_GLAPI *TexParameteri)(GLenum, GLenum, GLint);
++            void (PS2X_GLAPI *GetIntegerv)(GLenum, GLint *);
++            GLenum (PS2X_GLAPI *GetError)(void);
++            const GLubyte *(PS2X_GLAPI *GetStringi)(GLenum, GLuint);
++            void (PS2X_GLAPI *GetUnsignedBytevEXT)(GLenum, GLubyte *);
++            void (PS2X_GLAPI *GetUnsignedBytei_vEXT)(GLenum, GLuint, GLubyte *);
++            void (PS2X_GLAPI *CreateMemoryObjectsEXT)(GLsizei, GLuint *);
++            void (PS2X_GLAPI *DeleteMemoryObjectsEXT)(GLsizei, const GLuint *);
++            void (PS2X_GLAPI *MemoryObjectParameterivEXT)(GLuint, GLenum, const GLint *);
++            void (PS2X_GLAPI *TexStorageMem2DEXT)(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLuint, GLuint64);
++            void (PS2X_GLAPI *GenSemaphoresEXT)(GLsizei, GLuint *);
++            void (PS2X_GLAPI *DeleteSemaphoresEXT)(GLsizei, const GLuint *);
++            void (PS2X_GLAPI *WaitSemaphoreEXT)(GLuint, GLuint, const GLuint *, GLuint, const GLuint *, const GLenum *);
++#if defined(_WIN32)
++            void (PS2X_GLAPI *ImportMemoryWin32HandleEXT)(GLuint, GLuint64, GLenum, void *);
++            void (PS2X_GLAPI *ImportSemaphoreWin32HandleEXT)(GLuint, GLenum, void *);
++#else
++            void (PS2X_GLAPI *ImportMemoryFdEXT)(GLuint, GLuint64, GLenum, GLint);
++            void (PS2X_GLAPI *ImportSemaphoreFdEXT)(GLuint, GLenum, GLint);
++#endif
++            GLsync (PS2X_GLAPI *FenceSync)(GLenum, GLbitfield);
++            GLenum (PS2X_GLAPI *ClientWaitSync)(GLsync, GLbitfield, GLuint64);
++            void (PS2X_GLAPI *DeleteSync)(GLsync);
++        } gl;
++
++        struct GlSlot { GLuint tex = 0, mem = 0; uint32_t gen = 0, w = 0, h = 0; };
++        struct Retire { int slot; GLsync fence; };
++        GlSlot g_slots[8];
++        std::vector<Retire> g_retire;
++        int g_shown = -1;
++        int g_state = 0;   // 0 not tried yet, 1 sharing, -1 unavailable (readback path)
++
++        void closeExternal(intptr_t h)
++        {
++            if (h == -1) return;
++#if defined(_WIN32)
++            CloseHandle(reinterpret_cast<HANDLE>(h));
++#else
++            close(int(h));
++#endif
++        }
++        void *clientProc(const char *name)
++        {   // GL 1.1 is not returned by wglGetProcAddress
++#if defined(_WIN32)
++            static HMODULE lib = GetModuleHandleA("opengl32.dll");
++            return lib ? reinterpret_cast<void *>(GetProcAddress(lib, name)) : nullptr;
++#else
++            return dlsym(RTLD_DEFAULT, name);
++#endif
++        }
++        bool hasExtension(const char *name)
++        {
++            GLint n = 0; gl.GetIntegerv(kNumExtensions, &n);
++            for (GLint i = 0; i < n; ++i) { const GLubyte *e = gl.GetStringi(kExtensions, GLuint(i)); if (e && !std::strcmp(reinterpret_cast<const char *>(e), name)) return true; }
++            return false;
++        }
++        // 1 = ready, 0 = not yet (the Vulkan device does not exist yet), -1 = unavailable for good
++        int init(void *(*getProc)(const char *))
++        {
++            static const bool s_off = [](){ const char *v = std::getenv("PS2X_SEAMVK_GLSHARE"); return v && v[0] == '0'; }();
++            if (s_off || !getProc) return -1;
++            uint8_t luid[8], devUuid[16], drvUuid[16]; bool luidValid = false;
++            if (!share::deviceIds(luid, luidValid, devUuid, drvUuid)) return 0;
++            int missing = 0;
++            auto load = [&](auto &fn, const char *name) { void *p = getProc(name); if (!p) p = clientProc(name); fn = reinterpret_cast<std::remove_reference_t<decltype(fn)>>(p); if (!p) ++missing; };
++            load(gl.GenTextures, "glGenTextures"); load(gl.DeleteTextures, "glDeleteTextures"); load(gl.BindTexture, "glBindTexture");
++            load(gl.TexParameteri, "glTexParameteri"); load(gl.GetIntegerv, "glGetIntegerv"); load(gl.GetError, "glGetError"); load(gl.GetStringi, "glGetStringi");
++            load(gl.GetUnsignedBytevEXT, "glGetUnsignedBytevEXT"); load(gl.GetUnsignedBytei_vEXT, "glGetUnsignedBytei_vEXT");
++            load(gl.CreateMemoryObjectsEXT, "glCreateMemoryObjectsEXT"); load(gl.DeleteMemoryObjectsEXT, "glDeleteMemoryObjectsEXT");
++            load(gl.MemoryObjectParameterivEXT, "glMemoryObjectParameterivEXT"); load(gl.TexStorageMem2DEXT, "glTexStorageMem2DEXT");
++            load(gl.GenSemaphoresEXT, "glGenSemaphoresEXT"); load(gl.DeleteSemaphoresEXT, "glDeleteSemaphoresEXT"); load(gl.WaitSemaphoreEXT, "glWaitSemaphoreEXT");
++#if defined(_WIN32)
++            load(gl.ImportMemoryWin32HandleEXT, "glImportMemoryWin32HandleEXT"); load(gl.ImportSemaphoreWin32HandleEXT, "glImportSemaphoreWin32HandleEXT");
++            const char *memExt = "GL_EXT_memory_object_win32", *semExt = "GL_EXT_semaphore_win32";
++#else
++            load(gl.ImportMemoryFdEXT, "glImportMemoryFdEXT"); load(gl.ImportSemaphoreFdEXT, "glImportSemaphoreFdEXT");
++            const char *memExt = "GL_EXT_memory_object_fd", *semExt = "GL_EXT_semaphore_fd";
++#endif
++            load(gl.FenceSync, "glFenceSync"); load(gl.ClientWaitSync, "glClientWaitSync"); load(gl.DeleteSync, "glDeleteSync");
++            auto fail = [](const char *why) { std::fprintf(stderr, "[glshare] %s: the native frame goes through a CPU readback\n", why); return -1; };
++            if (missing) return fail("GL entry points missing");
++            if (!hasExtension("GL_EXT_memory_object") || !hasExtension("GL_EXT_semaphore") || !hasExtension(memExt) || !hasExtension(semExt)) return fail("no GL_EXT_memory_object / GL_EXT_semaphore");
++            // the window's GL context must run on the GPU the renderer uses (hybrid laptops: the iGPU's GL cannot import the dGPU's memory)
++            bool same = false;
++#if defined(_WIN32)
++            if (luidValid) { GLubyte gl8[8] = {}; gl.GetUnsignedBytevEXT(kDeviceLuid, gl8); same = std::memcmp(gl8, luid, 8) == 0; }
++            else
++#endif
++            { GLubyte d16[16] = {}, r16[16] = {}; gl.GetUnsignedBytei_vEXT(kDeviceUuid, 0, d16); gl.GetUnsignedBytevEXT(kDriverUuid, r16); same = !std::memcmp(d16, devUuid, 16) && !std::memcmp(r16, drvUuid, 16); }
++            while (gl.GetError() != 0) {}
++            if (!same) return fail("the GL context is on another GPU");
++            share::enable(true);
++            std::fprintf(stderr, "[glshare] zero-copy present on: GL imports the native renderer's frames\n");
++            return 1;
++        }
++        void dropSlot(GlSlot &s)
++        {
++            if (s.tex) gl.DeleteTextures(1, &s.tex);
++            if (s.mem) gl.DeleteMemoryObjectsEXT(1, &s.mem);
++            s = GlSlot();
++        }
++        bool importSlot(GlSlot &s, const share::Frame &f)
++        {
++            dropSlot(s);
++            gl.CreateMemoryObjectsEXT(1, &s.mem);
++            const GLint one = 1; gl.MemoryObjectParameterivEXT(s.mem, kDedicatedMemory, &one);   // Granite gives external images a dedicated allocation
++#if defined(_WIN32)
++            gl.ImportMemoryWin32HandleEXT(s.mem, f.memSize, kOpaqueWin32, reinterpret_cast<void *>(f.mem));
++#else
++            gl.ImportMemoryFdEXT(s.mem, f.memSize, kOpaqueFd, GLint(f.mem));   // takes the fd
++#endif
++            GLint prev = 0; gl.GetIntegerv(kTexBinding2D, &prev);
++            gl.GenTextures(1, &s.tex);
++            gl.BindTexture(kTex2D, s.tex);
++            gl.TexStorageMem2DEXT(kTex2D, 1, kRGBA8, GLsizei(f.w), GLsizei(f.h), s.mem, 0);
++            gl.TexParameteri(kTex2D, kMinFilter, GLint(kLinear)); gl.TexParameteri(kTex2D, kMagFilter, GLint(kLinear));
++            gl.TexParameteri(kTex2D, kWrapS, GLint(kClampToEdge)); gl.TexParameteri(kTex2D, kWrapT, GLint(kClampToEdge));
++            gl.BindTexture(kTex2D, GLuint(prev));
++#if defined(_WIN32)
++            closeExternal(f.mem);   // consumed at TexStorage time (Granite's interop test: keeping it open fails on NVIDIA)
++#endif
++            const GLenum err = gl.GetError();
++            if (err != 0) { std::fprintf(stderr, "[glshare] importing a %ux%u image failed (GL error 0x%x)\n", f.w, f.h, err); dropSlot(s); return false; }
++            s.gen = f.gen; s.w = f.w; s.h = f.h;
++            return true;
++        }
++        void giveUp()
++        {
++            share::enable(false);
++            for (Retire &r : g_retire) { gl.DeleteSync(r.fence); share::release(r.slot); }
++            g_retire.clear();
++            if (g_shown >= 0) share::release(g_shown);
++            g_shown = -1;
++            for (GlSlot &s : g_slots) dropSlot(s);
++            g_state = -1;
++            std::fprintf(stderr, "[glshare] off: back to the CPU readback\n");
++        }
++    }
++
++    uint32_t sharedPresent(void *(*glGetProc)(const char *), uint32_t &w, uint32_t &h)
++    {
++        if (g_state == 0) g_state = init(glGetProc);
++        if (g_state != 1) return 0;
++        for (size_t i = 0; i < g_retire.size();)
++        {   // slots the window stopped showing: free once the GPU is past their last draw
++            const GLenum r = gl.ClientWaitSync(g_retire[i].fence, kSyncFlushCommands, 0);
++            if (r == kAlreadySignaled || r == kConditionSatisfied) { gl.DeleteSync(g_retire[i].fence); share::release(g_retire[i].slot); g_retire[i] = g_retire.back(); g_retire.pop_back(); }
++            else ++i;
++        }
++        share::Frame f;
++        if (share::take(f))
++        {
++            if (f.slot < 0 || f.slot >= int(sizeof(g_slots) / sizeof(g_slots[0]))) { closeExternal(f.mem); closeExternal(f.sem); giveUp(); return 0; }
++            GlSlot &s = g_slots[f.slot];
++            if (f.mem != -1 && !importSlot(s, f)) { closeExternal(f.sem); share::release(f.slot); giveUp(); return 0; }
++            if (!s.tex || s.gen != f.gen) { closeExternal(f.sem); share::release(f.slot); giveUp(); return 0; }   // (never: a new image always comes with its memory)
++            if (f.sem != -1)
++            {
++                GLuint sem = 0; gl.GenSemaphoresEXT(1, &sem);
++#if defined(_WIN32)
++                gl.ImportSemaphoreWin32HandleEXT(sem, kOpaqueWin32, reinterpret_cast<void *>(f.sem));
++                closeExternal(f.sem);
++#else
++                gl.ImportSemaphoreFdEXT(sem, kOpaqueFd, GLint(f.sem));   // takes the fd
++#endif
++                const GLenum layout = kLayoutShaderReadOnly;
++                gl.WaitSemaphoreEXT(sem, 0, nullptr, 1, &s.tex, &layout);
++                gl.DeleteSemaphoresEXT(1, &sem);
++            }
++            if (g_shown >= 0 && g_shown != f.slot) g_retire.push_back(Retire{ g_shown, gl.FenceSync(kSyncGpuCommandsComplete, 0) });   // after its last draw
++            g_shown = f.slot;
++        }
++        if (g_shown < 0) return 0;
++        w = g_slots[g_shown].w; h = g_slots[g_shown].h;
++        return g_slots[g_shown].tex;
++    }
++}
++#endif
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index e6e4f2b..fed72bc 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -8542,7 +8542,21 @@ void PS2Runtime::run()
+             static uint32_t s_pw = 0, s_ph = 0;
+             static std::vector<uint8_t> s_pgsBuf;
+             uint32_t pw = 0, ph = 0;
+-            if ((seamvk::on() ? seamvk::takeFrame(s_pgsBuf, pw, ph) : ps2x_pgs::takeFrame(s_pgsBuf, pw, ph)) && pw && ph && s_pgsBuf.size() >= size_t(pw) * ph * 4u)
++            // [glshare] the native frame as a GL texture over the renderer's own Vulkan memory (no readback, no upload);
++            // 0 when the context cannot import it (then the readback below)
++            uint32_t shw = 0, shh = 0, shTex = 0;
++#if defined(_WIN32)
++            if (seamvk::on() && !g_ps2xD3D11Mode) shTex = seamvk::sharedPresent(ps2xGlGetProc, shw, shh);
++#else
++            if (seamvk::on()) shTex = seamvk::sharedPresent(ps2xGlGetProc, shw, shh);
++#endif
++            if (shTex)
++            {
++                static bt3Texture2D s_shareTex{};
++                s_shareTex.id = shTex; s_shareTex.width = (int)shw; s_shareTex.height = (int)shh; s_shareTex.mipmaps = 1; s_shareTex.format = BT3_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
++                presentTex = s_shareTex; flipY = false; presentWidth = shw; presentHeight = shh; pgsTexPtr = &s_shareTex;
++            }
++            else if ((seamvk::on() ? seamvk::takeFrame(s_pgsBuf, pw, ph) : ps2x_pgs::takeFrame(s_pgsBuf, pw, ph)) && pw && ph && s_pgsBuf.size() >= size_t(pw) * ph * 4u)
+             {
+                 {   // [presentlat] PS2X_PRESENTLAT=1: how many game frames old the image handed to the window is (renderer + hand-off pipeline latency)
+                     static const bool s_lat = [](){ const char *v = std::getenv("PS2X_PRESENTLAT"); return v && v[0] && v[0] != '0'; }();
+@@ -8604,7 +8618,7 @@ void PS2Runtime::run()
+                 }
+                 else bt3UpdateTexture(s_pgsTex, s_pgsBuf.data());
+             }
+-            if (s_pgsTex.id) { presentTex = s_pgsTex; flipY = false; presentWidth = s_pw; presentHeight = s_ph; pgsTexPtr = &s_pgsTex; }
++            if (!shTex && s_pgsTex.id) { presentTex = s_pgsTex; flipY = false; presentWidth = s_pw; presentHeight = s_ph; pgsTexPtr = &s_pgsTex; }
+         }
+ 
+         // Refresh the host gamepad layer (SDL2 poll + hotplug, or the evdev reader under raylib).

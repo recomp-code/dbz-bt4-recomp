@@ -1,0 +1,23 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+index 79258a2..3a94039 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+@@ -11,6 +11,7 @@
+ #include "runtime/ps2_gs_psmct16.h"
+ 
+ extern std::atomic<uint64_t> g_fmvLastEmitNs;   // [fmvwindow] defined in ps2_gs_gpu.cpp (global namespace)
++void ps2xHostDataMark(const uint8_t *p, uint32_t bytes);   // [dethash] game_overrides.cpp
+ namespace ps2_stubs
+ {
+     namespace
+@@ -945,6 +946,10 @@ namespace ps2_stubs
+             if (FILE *f = std::fopen(path.c_str(), "wb")) { std::fwrite(dst, 1, totalImageBytes, f); std::fclose(f); }
+         }
+         ps2_gslive::readFifoInto(dst, totalImageBytes);
++        // [dethash] whoever answered (the live host's GPU, or the runtime's own VRAM under the native renderer), these are
++        // pixels for the screen (the fight-start fade), not game state: out of the online state hash in EVERY mode. Marked
++        // only by the live host before, a native player and a PCSX2 player differed from the fight's first frame (3060).
++        ps2xHostDataMark(dst, totalImageBytes);
+         ps2TraceGuestRangeWrite(rdram, dstAddr, totalImageBytes, "storeimg", nullptr);
+         {   // [storeimg] every VRAM->RAM download: the un-hooked guest-RAM writer class (found 2026-09-01)
+             static const bool s_si = [](){ const char *v = std::getenv("PS2X_STOREIMG"); return v && v[0] && v[0] != '0'; }();

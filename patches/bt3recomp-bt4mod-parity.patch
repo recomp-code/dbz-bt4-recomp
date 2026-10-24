@@ -1,0 +1,89 @@
+diff --git a/ps2xRuntime/include/runtime/ps2x_settings.h b/ps2xRuntime/include/runtime/ps2x_settings.h
+index 5431b53..aa7978c 100644
+--- a/ps2xRuntime/include/runtime/ps2x_settings.h
++++ b/ps2xRuntime/include/runtime/ps2x_settings.h
+@@ -48,7 +48,7 @@ namespace ps2x_settings
+         int inkWidth = 100;
+         unsigned inkColor = 0;
+         bool shadows = true;
+-        bool dofBlur = false;
++        bool dofBlur = true;      // [parity] on by default: the far field softened like the game (graded by depth), as the PCSX2 host shows it
+         int dofZFar = 200000;
+         bool fullscreen = false;
+         int windowMode = 0;
+@@ -81,7 +81,7 @@ namespace ps2x_settings
+         // the GPU side costs a timing query per draw call, and nothing should pay that unless someone
+         // is reading the numbers. Not env-guarded -- there is no env for it, it is purely a view.
+         bool showPerf = false;
+-        int hudLayout = 0;
++        int hudLayout = 1;       // [parity] edge-pinned by default, as the PCSX2 host lays it out
+         int hudOffL = 0;
+         int hudOffC = 0;
+         int hudOffR = 0;
+diff --git a/ps2xRuntime/include/ps2_settings_overlay.h b/ps2xRuntime/include/ps2_settings_overlay.h
+index cf71869..6cec602 100644
+--- a/ps2xRuntime/include/ps2_settings_overlay.h
++++ b/ps2xRuntime/include/ps2_settings_overlay.h
+@@ -66,12 +66,12 @@ public:
+         int inkWidth = 100;      // [pgsink] paraLLEl-GS: outline stroke width, % of a PS2 texel (100 = native, 25 = thinnest)
+         unsigned inkColor = 0;   // [pgsink] paraLLEl-GS: outline colour 0xRRGGBB (0 = the game's black)
+         bool shadows = true;
+-        bool dofBlur = false;
++        bool dofBlur = true;      // [parity] on by default: the far field softened like the game (graded by depth), as the PCSX2 host shows it
+         int dofZFar = 200000;
+         int windowW = 0, windowH = 0; // 0 = keep the default host window size
+         bool forceBilinear = true;    // PCSX2-style forced texture filtering (default ON)
+         bool overlayEnabled = true;   // [launcher] master switch: false = in-game overlay never opens
+-        int hudLayout = 0;            // widescreen HUD: 0=centered 4:3, 1=edge-pinned, 2=custom
++        int hudLayout = 1;            // widescreen HUD: 0=centered 4:3, 1=edge-pinned (default: as the PCSX2 host lays it out), 2=custom
+         int hudOffL = 0, hudOffC = 0, hudOffR = 0;  // custom layout x-offsets (512-space px)
+         // Overlay launch / close binding. Each is a SET of inputs that must ALL be held
+         // together (1+ entries). Captured with a 3s hold during binding.
+diff --git a/ps2xRuntime/src/lib/ps2_gs_gpu_renderer.cpp b/ps2xRuntime/src/lib/ps2_gs_gpu_renderer.cpp
+index 535061c..c43c611 100644
+--- a/ps2xRuntime/src/lib/ps2_gs_gpu_renderer.cpp
++++ b/ps2xRuntime/src/lib/ps2_gs_gpu_renderer.cpp
+@@ -356,7 +356,7 @@ namespace { std::atomic<int> g_uiDofBlur{-1}, g_uiDofZFar{-1}; }
+ bool GsGpuRenderer::dofBlurEnabled()
+ {
+     int v = g_uiDofBlur.load(std::memory_order_relaxed);
+-    if (v < 0) { const char *e = std::getenv("PS2X_DOFMASK"); v = (e && std::atoi(e) == 2) ? 1 : 0; g_uiDofBlur.store(v, std::memory_order_relaxed); }
++    if (v < 0) { const char *e = std::getenv("PS2X_DOFMASK"); v = (e && e[0]) ? (std::atoi(e) == 2 ? 1 : 0) : 1; g_uiDofBlur.store(v, std::memory_order_relaxed); }   // [parity] on unless PS2X_DOFMASK says otherwise
+     return v != 0;
+ }
+ void GsGpuRenderer::setDofBlur(bool v)     { g_uiDofBlur.store(v ? 1 : 0); }
+diff --git a/ps2xRuntime/src/lib/ps2_seamgs.cpp b/ps2xRuntime/src/lib/ps2_seamgs.cpp
+index 8bf13e2..86a630d 100644
+--- a/ps2xRuntime/src/lib/ps2_seamgs.cpp
++++ b/ps2xRuntime/src/lib/ps2_seamgs.cpp
+@@ -143,7 +143,7 @@ namespace seamgs
+         {
+             const float half = 0.5f * W, k = W / 512.0f;
+             auto cen = [&](float v) { return half + (v - half) * inv; };
+-            int layout = g_wsHudLayout.load(std::memory_order_relaxed); if (layout < 0) layout = 0;
++            int layout = g_wsHudLayout.load(std::memory_order_relaxed); if (layout < 0) layout = 1;   /* [parity] unset: edge-pinned */
+             if (layout <= 0) return cen(x);
+             const float offL = g_wsHudOffLQ.load(std::memory_order_relaxed) / 16.0f, offC = g_wsHudOffCQ.load(std::memory_order_relaxed) / 16.0f, offR = g_wsHudOffRQ.load(std::memory_order_relaxed) / 16.0f;
+             const float s1 = 124.f * k, s2 = 216.f * k, s3 = 296.f * k, s4 = 388.f * k;
+diff --git a/ps2xRuntime/src/lib/ps2_wshud.cpp b/ps2xRuntime/src/lib/ps2_wshud.cpp
+index 0a3f29f..bbf2869 100644
+--- a/ps2xRuntime/src/lib/ps2_wshud.cpp
++++ b/ps2xRuntime/src/lib/ps2_wshud.cpp
+@@ -60,7 +60,7 @@ static float wsHudMapX(float x, float W, float inv)
+ {
+     const float half = 0.5f * W, k = W / 512.0f;
+     auto cen = [&](float v) { return half + (v - half) * inv; };
+-    int layout = g_wsHudLayout.load(std::memory_order_relaxed); if (layout < 0) layout = 0;
++    int layout = g_wsHudLayout.load(std::memory_order_relaxed); if (layout < 0) layout = 1;   /* [parity] unset: edge-pinned */
+     if (layout <= 0) return cen(x);
+     const float offL = g_wsHudOffLQ.load(std::memory_order_relaxed) / 16.0f, offC = g_wsHudOffCQ.load(std::memory_order_relaxed) / 16.0f, offR = g_wsHudOffRQ.load(std::memory_order_relaxed) / 16.0f;
+     const float s1 = 124.f * k, s2 = 216.f * k, s3 = 296.f * k, s4 = 388.f * k;
+@@ -317,7 +317,7 @@ static void wsHudKickLocked(WsHudState &s, uint8_t *data, float inv)
+     {   // [hudchips] a small element inside a bridge zone (between a pinned group and the centre piece) moves with its group at
+         // the group's scale instead of being stretched with the zone: the buff chips next to the ki gauge (42x22 quads at
+         // x 100..214) came out 1.5x wide under the edge layout. Same rule as the native front end (ps2_seamgs.cpp [hudchips]).
+-        int layout = g_wsHudLayout.load(std::memory_order_relaxed); if (layout < 0) layout = 0;
++        int layout = g_wsHudLayout.load(std::memory_order_relaxed); if (layout < 0) layout = 1;   /* [parity] unset: edge-pinned */
+         if (layout > 0 && w <= 64.f)
+         {
+             const float k = W / 512.0f, s2 = 216.f * k, s3 = 296.f * k, s4 = 388.f * k;

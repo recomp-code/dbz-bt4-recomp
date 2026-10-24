@@ -35,7 +35,7 @@ index e6d56e5..03c7b2c 100644
      message(STATUS "[seamvk] native Vulkan renderer not built (no Granite at ${PS2X_GRANITE_DIR}, or PS2X_DISABLE_SEAMVK)")
  endif()
 diff --git a/ps2xRuntime/src/lib/ps2_seamvk.cpp b/ps2xRuntime/src/lib/ps2_seamvk.cpp
-index 7351f41..7f6aa4f 100644
+index 7351f41..71bdec6 100644
 --- a/ps2xRuntime/src/lib/ps2_seamvk.cpp
 +++ b/ps2xRuntime/src/lib/ps2_seamvk.cpp
 @@ -31,6 +31,10 @@
@@ -66,7 +66,7 @@ index 7351f41..7f6aa4f 100644
          struct RtPC { uint32_t tex[4], clut[4], src[4], texa[4]; };
          struct AliasPC { uint32_t tgt[4], v16[4]; int32_t fA[4], blend[4], texInfo[4]; float col[4]; };   // alias16.frag
  
-@@ -134,6 +148,13 @@ namespace seamvk
+@@ -134,6 +148,17 @@ namespace seamvk
              Vulkan::BufferHandle vram;          // [gpudecode] the GPU copy of GS VRAM (4 MB), pages uploaded in stream order
              Vulkan::BufferHandle cring[3]; uint8_t *cmap[3] = {}; VkDeviceSize coff = 0; uint32_t cslot = 0;   // [batch] host-visible constants ring (one per frame in flight)
              Vulkan::BufferHandle vring[3]; uint8_t *vmap[3] = {}; VkDeviceSize voff = 0;   // [vring] the same for vertex data (slot = cslot)
@@ -77,10 +77,14 @@ index 7351f41..7f6aa4f 100644
 +            std::unordered_map<uint64_t, Consts> mvPrev, mvCur;   // seam chunk -> its constants, last frame / this frame
 +            bool mvValid = false;                                 // this frame's motion pass found the displayed scene's meshes
 +            uint32_t mvFbp = ~0u; Target *mvDepth = nullptr;      // the displayed frame's target and the depth image its meshes used
++            // [jitter] this frame's sub-pixel camera offset for the temporal upscaler: in GS pixels (applied to the shown frame's
++            // meshes through their viewport origin) and in composed-frame pixels (what the upscaler is told); upActive: the
++            // upscaler ran last frame (no jitter without a temporal resolve: it would shimmer)
++            float jitGs[2] = {}, jitOut[2] = {}; uint32_t jitIdx = 0; bool upActive = false;
              Vulkan::ImageHandle out;            // the composed frame
              Vulkan::ImageHandle white;          // 1x1 for untextured draws
              Vulkan::ImageHandle outlineH;       // [outline] pass A output (minC, maxC, minF, maxF), target-sized
-@@ -247,7 +268,7 @@ namespace seamvk
+@@ -247,7 +272,7 @@ namespace seamvk
          }
          // [batch] write n Consts into this frame's ring and bind them as the seam program's storage buffer (binding 0)
          static constexpr VkDeviceSize kCringBytes = 8u << 20;
@@ -89,7 +93,7 @@ index 7351f41..7f6aa4f 100644
          {
              const uint32_t s = g_gpu.cslot;
              if (!g_gpu.cring[s])
-@@ -261,7 +282,7 @@ namespace seamvk
+@@ -261,7 +286,7 @@ namespace seamvk
              if (off + bytes > kCringBytes) { static int s_warn = 0; if (s_warn++ < 3) std::fprintf(stderr, "[seamvk] constants ring full (%zu chunks)\n", n); return false; }
              std::memcpy(g_gpu.cmap[s] + off, arr, bytes);
              g_gpu.coff = off + bytes;
@@ -98,7 +102,7 @@ index 7351f41..7f6aa4f 100644
              return true;
          }
          // [vring] vertex data for binding 0 from this frame's ring, bound at its offset. Granite's vertex pool hands out 4 KB
-@@ -292,10 +313,17 @@ namespace seamvk
+@@ -292,10 +317,17 @@ namespace seamvk
          // [outscale] The composed output image is the CRTC size x min(render scale, PS2X_SEAMVK_OUTSCALE (default 2)), like
          // paraLLEl-GS's 2x scanout: a 3x/4x render is BOX-FILTERED down to it by the circuit blit (supersampling), instead
          // of a 1920x1344 image the host then mip-blurs into a 720p window (scale 3 presented softer than scale 2).
@@ -117,7 +121,7 @@ index 7351f41..7f6aa4f 100644
          }
          uint32_t scale()
          {
-@@ -376,6 +404,17 @@ namespace seamvk
+@@ -376,6 +408,17 @@ namespace seamvk
                      cf.output_mask = 0x1u; cf.push_constant_size = 8;
                      g_gpu.progGlowComp = dev.request_program(kRtVert, sizeof(kRtVert), kGlowCompFrag, sizeof(kGlowCompFrag), &cv, &cf);
                  }
@@ -135,7 +139,7 @@ index 7351f41..7f6aa4f 100644
                  if (!g_gpu.progSeam || !g_gpu.progGs || !g_gpu.progSeamSt || !g_gpu.progGsSt || !g_gpu.progPresent || !g_gpu.progRt || !g_gpu.progAlias || !g_gpu.progOutline || !g_gpu.progOutlineH || !g_gpu.progDepthMask || !g_gpu.progVram || !g_gpu.vram) { g_gpu.failed = true; std::fprintf(stderr, "[seamvk] shader program creation FAILED\n"); return false; }
                  const uint32_t whitePx = 0xFFFFFFFFu;
                  Vulkan::ImageInitialData init = { &whitePx, 0, 0 };
-@@ -384,7 +423,7 @@ namespace seamvk
+@@ -384,7 +427,7 @@ namespace seamvk
              if (!g_gpu.out || g_gpu.w != w || g_gpu.h != h)
              {
                  auto ci = Vulkan::ImageCreateInfo::render_target(w, h, VK_FORMAT_R8G8B8A8_UNORM);
@@ -144,7 +148,15 @@ index 7351f41..7f6aa4f 100644
                  g_gpu.out = dev.create_image(ci);
                  Vulkan::BufferCreateInfo bi = {};
                  bi.size = VkDeviceSize(w) * h * 4u;
-@@ -1270,6 +1309,399 @@ namespace seamvk
+@@ -1194,6 +1237,7 @@ namespace seamvk
+             cmd.set_scissor(sr);
+             PC pc = {};
+             pc.view[0] = t.ofx / 16.0f; pc.view[1] = t.ofy / 16.0f; pc.view[2] = float(targetW(t.fbw)); pc.view[3] = float(kLogicalH);
++            if (d0.kind == 1 && t.fbp == g_gpu.mvFbp) { pc.view[0] -= g_gpu.jitGs[0]; pc.view[1] -= g_gpu.jitGs[1]; }   // [jitter] the 3D scene only: the HUD stays put
+             const bool tex = t.tme && t.tex >= 0 && (size_t)t.tex < g_gpu.tex.size() && g_gpu.tex[t.tex];
+             if (t.tme && !tex) ++g_gpu.texMissing;
+             uint32_t nat = 1u;   // [rtnative] the slot image is a multiple of the GS texture size when decoded from a target at native res
+@@ -1270,6 +1314,406 @@ namespace seamvk
              cmd.set_texture(0, 0, it->second.img->get_view(), Vulkan::StockSampler::LinearClamp);
              cmd.draw(4);
          }
@@ -248,7 +260,7 @@ index 7351f41..7f6aa4f 100644
 +                }
 +                if (!bindConsts(cmd, dev, carr.data(), carr.size(), 0) || !bindConsts(cmd, dev, parr.data(), parr.size(), 1)) break;
 +                MvPC pc = {};
-+                pc.view[0] = d0.st.ofx / 16.0f; pc.view[1] = d0.st.ofy / 16.0f; pc.view[2] = float(targetW(d0.st.fbw)); pc.view[3] = float(kLogicalH);
++                pc.view[0] = d0.st.ofx / 16.0f - g_gpu.jitGs[0]; pc.view[1] = d0.st.ofy / 16.0f - g_gpu.jitGs[1]; pc.view[2] = float(targetW(d0.st.fbw)); pc.view[3] = float(kLogicalH);   // [jitter] as the draw
 +                pc.batch[2] = 1.0f; pc.batch[3] = float(b - a); pc.misc[0] = float(g_gpu.scale);
 +                cmd.push_constants(&pc, 0, sizeof(pc));
 +                cmd.draw(o);
@@ -515,6 +527,13 @@ index 7351f41..7f6aa4f 100644
 +                ev.InRenderSubrectDimensions.Width = inW; ev.InRenderSubrectDimensions.Height = inH;
 +                ev.InReset = reset ? 1 : 0;
 +                ev.InMVScaleX = 1.0f; ev.InMVScaleY = 1.0f;   // pixels of the render resolution, pointing at the previous frame
++                {   // [jitter] the scene was drawn shifted by jitOut composed pixels (right, down), so the sample point moved the other
++                    // way: DLSS takes the sample offset, -jitOut. Measured (40 dumped frames, mean frame-to-frame change of the 3D area):
++                    // "--" 1.91, no jitter 2.62, "++" 2.79 (the visible shake). PS2X_DLSS_JITTER_SIGN=<sx><sy> overrides.
++                    static const float sx = [](){ const char *v = std::getenv("PS2X_DLSS_JITTER_SIGN"); return v && v[0] == '+' ? 1.0f : -1.0f; }();
++                    static const float sy = [](){ const char *v = std::getenv("PS2X_DLSS_JITTER_SIGN"); return v && v[0] && v[1] == '+' ? 1.0f : -1.0f; }();
++                    ev.InJitterOffsetX = sx * g_gpu.jitOut[0]; ev.InJitterOffsetY = sy * g_gpu.jitOut[1];
++                }
 +                const NVSDK_NGX_Result r = NGX_VULKAN_EVALUATE_DLSS_EXT(cb, g_ngx.feature, g_ngx.params, &ev);
 +                if (NVSDK_NGX_FAILED(r)) { static int s_n = 0; if (s_n++ < 4) std::fprintf(stderr, "[dlss] evaluate failed (0x%08x)\n", unsigned(r)); ok = false; }
 +            }
@@ -544,7 +563,7 @@ index 7351f41..7f6aa4f 100644
      }
  
      std::atomic<int> g_seamCfg{-1};   // [nativeopt] -1 = undecided, 0/1 = decided (settings or environment)
-@@ -1384,10 +1816,23 @@ namespace seamvk
+@@ -1384,10 +1828,23 @@ namespace seamvk
              if (!Vulkan::Context::init_loader(nullptr)) return fail("Vulkan loader init failed");
              g_own->ctx.set_num_thread_indices(1);
              g_own->ctx.set_device_factory(&g_own->factory);   // [seamfeat]
@@ -572,18 +591,34 @@ index 7351f41..7f6aa4f 100644
                  return fail("Vulkan instance/device init failed");
              g_own->dev.set_context(g_own->ctx);
              g_own->dev.init_frame_contexts(4);
-@@ -1713,6 +2158,10 @@ namespace seamvk
+@@ -1713,6 +2170,26 @@ namespace seamvk
              tsMark(*cmd, 0);
          }
          const auto tL0 = std::chrono::steady_clock::now();
 +        {   // [mvpass] the frame the CRTC shows (circuit 1, else 2) and, below, the depth image its passes drew with
 +            const uint64_t shown = (priv.pmode & 1u) ? priv.dispfb1 : priv.dispfb2;
 +            g_gpu.mvFbp = upscaleMode() ? (uint32_t)(shown & 0x1FFu) * 32u : ~0u; g_gpu.mvDepth = nullptr;
++            // [jitter] Halton (2, 3), 8 x (output / render)^2 phases (NVIDIA's guidance), in composed-frame pixels; turned into GS
++            // pixels with the shown circuit's magnification (a composed pixel is srcW / outW GS pixels wide). PS2X_UPSCALE_JITTER=0: off.
++            static const bool s_jit = [](){ const char *v = std::getenv("PS2X_UPSCALE_JITTER"); return !(v && v[0] == '0'); }();
++            g_gpu.jitGs[0] = g_gpu.jitGs[1] = g_gpu.jitOut[0] = g_gpu.jitOut[1] = 0.0f;
++            if (s_jit && g_gpu.upActive && g_gpu.w && g_gpu.h)
++            {
++                const uint64_t disp = (priv.pmode & 1u) ? priv.display1 : priv.display2;
++                const uint32_t magh = (uint32_t)((disp >> 23) & 0xFu) + 1u, magv = (uint32_t)((disp >> 27) & 3u) + 1u;
++                const uint32_t srcW = ((uint32_t)((disp >> 32) & 0xFFFu) + 1u) / magh, srcH = ((uint32_t)((disp >> 44) & 0x7FFu) + 1u) / magv;
++                const float ratio = std::max(1.0f, float(g_presentW.load(std::memory_order_relaxed)) / float(g_gpu.w));
++                const uint32_t phases = std::max(8u, uint32_t(8.0f * ratio * ratio + 0.5f));
++                auto halton = [](uint32_t i, uint32_t b) { float f = 1.0f, r = 0.0f; while (i) { f /= float(b); r += f * float(i % b); i /= b; } return r; };
++                const uint32_t i = (g_gpu.jitIdx++ % phases) + 1u;
++                g_gpu.jitOut[0] = halton(i, 2) - 0.5f; g_gpu.jitOut[1] = halton(i, 3) - 0.5f;
++                if (srcW && srcH) { g_gpu.jitGs[0] = g_gpu.jitOut[0] * float(srcW) / float(g_gpu.w); g_gpu.jitGs[1] = g_gpu.jitOut[1] * float(srcH) / float(g_gpu.h); }
++            }
 +        }
          // ---- the ordered draws, into their FRAME / ZBUF targets ----
          uint32_t curFbp = ~0u, curZbp = ~0u; bool inPass = false;
          // Draws that sample pages the game rendered into (the post chain: Z as an index texture, rendered
-@@ -1829,6 +2278,7 @@ namespace seamvk
+@@ -1829,6 +2306,7 @@ namespace seamvk
                  if (!ct.cleared) { rp.clear_attachments = 1u << 0; ct.cleared = true; }
                  else rp.load_attachments = 1u << 0;
                  Target &dt = depth(dev, t.zte ? t.zbp : 0u, pfbw, t.fbp);   // an unused Z buffer still needs an attachment: pair every pass with one
@@ -591,7 +626,7 @@ index 7351f41..7f6aa4f 100644
                  toAttachment(*cmd, dt, true);
                  rp.depth_stencil = &dt.img->get_view();
                  rp.op_flags = Vulkan::RENDER_PASS_OP_STORE_DEPTH_STENCIL_BIT | (dt.cleared ? Vulkan::RENDER_PASS_OP_LOAD_DEPTH_STENCIL_BIT : Vulkan::RENDER_PASS_OP_CLEAR_DEPTH_STENCIL_BIT);
-@@ -1997,6 +2447,7 @@ namespace seamvk
+@@ -1997,6 +2475,7 @@ namespace seamvk
              ++g_gpu.draws; g_gpu.verts += d.count;
          }
          if (inPass) cmd->end_render_pass();
@@ -599,7 +634,7 @@ index 7351f41..7f6aa4f 100644
          g_gpu.msLoop += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tL0).count();
          tsMark(*cmd, 4);
  
-@@ -2041,10 +2492,134 @@ namespace seamvk
+@@ -2041,10 +2520,136 @@ namespace seamvk
              if (en1) composeCircuit(*cmd, priv.dispfb1, priv.display1, (en2 && !sameBuf) ? (mmod ? alp / 255.0f : 0.5f) : 1.0f, en2 && !sameBuf, f, 0);
              cmd->end_render_pass();
          }
@@ -700,6 +735,7 @@ index 7351f41..7f6aa4f 100644
 +                        }
 +                    }
 +#endif
++                    g_gpu.upActive = done;   // [jitter] next frame jitters only behind a working temporal upscaler
 +                    if (done)
 +                    {   // the upscaler writes RGB only; the window blends by alpha, so alpha := 1 (a write-mask-A blit of white)
 +                        cmd->image_barrier(*g_gpu.up, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
@@ -730,6 +766,7 @@ index 7351f41..7f6aa4f 100644
 +                }
 +            }
 +        }
++        if (!presReady) g_gpu.upActive = false;   // [jitter] no upscaler this frame: none next frame either
 +        if (!presReady)
 +            cmd->image_barrier(*g_gpu.out, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 +                               VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
@@ -738,7 +775,7 @@ index 7351f41..7f6aa4f 100644
          // Asynchronous readback: this frame goes into ring slot N; the frame handed to the presenter is the oldest
          // slot whose fence has already signalled (normally the previous frame), so the swap never waits on the GPU.
          Gpu::Pending &slot = g_gpu.ring[g_gpu.ringNext % 3u];
-@@ -2084,7 +2659,7 @@ namespace seamvk
+@@ -2084,7 +2689,7 @@ namespace seamvk
              {
                  ShareSlot &s = g_share[shareSlot];
                  cmd->image_barrier(*s.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, 0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
@@ -747,7 +784,7 @@ index 7351f41..7f6aa4f 100644
                  VkImageMemoryBarrier2 ib = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };   // release to the external (GL) queue family
                  ib.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT; ib.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
                  ib.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; ib.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-@@ -2102,7 +2677,7 @@ namespace seamvk
+@@ -2102,7 +2707,7 @@ namespace seamvk
                  Vulkan::BufferCreateInfo bi = {}; bi.size = VkDeviceSize(w) * h * 4u; bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT; bi.domain = Vulkan::BufferDomain::CachedHost;
                  slot.buf = dev.create_buffer(bi); slot.w = w; slot.h = h;
              }

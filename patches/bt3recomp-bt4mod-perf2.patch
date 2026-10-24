@@ -460,10 +460,42 @@ index 64fd29f..5fd6784 100644
      ln.pending.store(0u, std::memory_order_relaxed);
      if (s_stat)
 diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
-index 59587de..621527d 100644
+index 59587de..c7ea977 100644
 --- a/ps2xRuntime/src/lib/ps2_memory.cpp
 +++ b/ps2xRuntime/src/lib/ps2_memory.cpp
-@@ -2639,7 +2639,9 @@ void PS2Memory::stage2Loop()
+@@ -84,6 +84,12 @@ static inline void ps2xWatchStore(uint32_t address, const void *bytes, uint32_t
+ // Guest write-watch controls (defined in ps2_runtime.cpp; hooked into ps2TraceGuestWrite).
+ // The PS2X_ZEROTAG probe below arms them at DMA time on a zero-matrix packet's address.
+ #include "runtime/ps2_armed_atomic.h"   // [tracearm]
++
++namespace
++{   // [perf2] the kick-job buffer pool, defined before kickWorkerLoop
++    std::vector<uint8_t> kickBufTake(size_t need);
++    void kickBufRecycle(std::vector<uint8_t> &&b);
++}
+ extern Ps2ArmedAtomic<uint32_t> g_ps2WatchLo;
+ extern Ps2ArmedAtomic<uint32_t> g_ps2WatchHi;
+ extern std::atomic<uint32_t> g_ps2WatchAll;
+@@ -1525,16 +1531,13 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     // ~357ms/s for only 32MB/s of data (~50x memcpy). Reserving once collapses
+                     // that to a single right-sized allocation and the raw copies.
+                     static std::atomic<uint32_t> s_chainHint{0};
+-                    std::vector<uint8_t> chainBuf;
++                    // [perf2] a recycled kick buffer (see kickBufTake), already sized to the hint
++                    std::vector<uint8_t> chainBuf = kickBufTake(s_chainHint.load(std::memory_order_relaxed));
+                     // PS2X_BONECHK source map: chainBuf offset -> guest source address, so the
+                     // VIF interpreter can attribute poison floats to the EE/SPR memory they were
+                     // copied from. Sync-kick mode only (async processes the copy later).
+                     if (g_kickSrcMapEnabled())
+                         g_kickSrcMap.clear();
+-                    {
+-                        uint32_t hint = s_chainHint.load(std::memory_order_relaxed);
+-                        if (hint) chainBuf.reserve(hint);
+-                    }
+ 
+                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
+                     {
+@@ -2639,7 +2642,9 @@ void PS2Memory::stage2Loop()
                  ps2x_pgs::setSuppressed(false);
              }
              else for (const auto &pkt : it.batch.pkts) m_gifArbiter->process(pkt);
@@ -474,6 +506,101 @@ index 59587de..621527d 100644
          case 1u:
              ps2GpuRenderer().swapFrame();
              { std::lock_guard<std::mutex> lk(m_kickMtx); if (m_kickFramesQueued > 0u) --m_kickFramesQueued; m_kickDoneCv.notify_all(); }
+@@ -2675,6 +2680,50 @@ void PS2Memory::stage2Loop()
+         }
+     }
+ }
++// [perf2] Kick-job data buffers. Every VIF1/PATH3 kick copied its DMA chain into a fresh vector on the guest thread
++// and the worker freed it after the job: the big ones (above the heap's VirtualAlloc threshold) were a kernel
++// allocation and a kernel free per kick -- ~5% of the worker in a fight. They come back here and are reused.
++namespace
++{
++    std::mutex g_kickBufMtx;
++    std::vector<std::vector<uint8_t>> g_kickBufPool;
++
++    std::vector<uint8_t> kickBufTake(size_t need)
++    {
++        {
++            std::lock_guard<std::mutex> lk(g_kickBufMtx);
++            size_t best = SIZE_MAX;
++            for (size_t i = 0; i < g_kickBufPool.size(); ++i)
++                if (g_kickBufPool[i].capacity() >= need && (best == SIZE_MAX || g_kickBufPool[i].capacity() < g_kickBufPool[best].capacity()))
++                    best = i;
++            if (best == SIZE_MAX && !g_kickBufPool.empty())
++                best = g_kickBufPool.size() - 1;   // none big enough: grow one we already have
++            if (best != SIZE_MAX)
++            {
++                std::vector<uint8_t> b = std::move(g_kickBufPool[best]);
++                g_kickBufPool[best] = std::move(g_kickBufPool.back());
++                g_kickBufPool.pop_back();
++                b.clear();
++                b.reserve(need);
++                return b;
++            }
++        }
++        std::vector<uint8_t> b;
++        b.reserve(need);
++        return b;
++    }
++
++    void kickBufRecycle(std::vector<uint8_t> &&b)
++    {
++        constexpr size_t kMinBytes = 16u << 10, kMaxBytes = 32u << 20, kMaxPooled = 16u;
++        if (b.capacity() < kMinBytes || b.capacity() > kMaxBytes)
++            return;
++        std::lock_guard<std::mutex> lk(g_kickBufMtx);
++        if (g_kickBufPool.size() < kMaxPooled)
++            g_kickBufPool.push_back(std::move(b));
++    }
++}
++
+ void PS2Memory::kickWorkerLoop()
+ {
+     ps2xEeProfAddCurrentThread("KickWorker");   // [eeprof]
+@@ -2716,6 +2765,7 @@ void PS2Memory::kickWorkerLoop()
+         // replicate that here so deferred PATH3 packets don't sit queued across frames.
+         if (job.kind != KickJob::SwapFrame && m_gifArbiter)
+             arbiterDrainOrHandoff();
++        kickBufRecycle(std::move(job.data));   // [perf2] the next kick reuses it
+         {   // [framegate] accumulate this frame's worker cost; publish it at the frame boundary
+             static uint64_t s_accNs = 0;
+             s_accNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+@@ -2823,7 +2873,7 @@ void PS2Memory::processPendingTransfers()
+                         break;
+                     KickJob j;
+                     j.kind = KickJob::GifPath3;
+-                    j.data.assign(base + srcPhys, base + srcPhys + chunk);
++                    j.data = kickBufTake(chunk); j.data.assign(base + srcPhys, base + srcPhys + chunk);   // [perf2] recycled buffer
+                     enqueueKickJob(std::move(j));
+                     bytesLeft -= chunk;
+                     srcPhys += chunk;
+@@ -3022,7 +3072,7 @@ void PS2Memory::processPendingTransfers()
+                         break;
+                     KickJob j;
+                     j.kind = KickJob::Vif1;
+-                    j.data.assign(base + srcPhys, base + srcPhys + chunk);
++                    j.data = kickBufTake(chunk); j.data.assign(base + srcPhys, base + srcPhys + chunk);   // [perf2] recycled buffer
+                     enqueueKickJob(std::move(j));
+                     bytesLeft -= chunk;
+                     srcPhys += chunk;
+@@ -3303,7 +3353,7 @@ void PS2Memory::processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount)
+         {
+             const uint32_t chunk = (src + left > PS2_RAM_SIZE) ? (PS2_RAM_SIZE - src) : left;
+             if (chunk < 16u) break;
+-            KickJob j; j.kind = KickJob::GifPath3; j.data.assign(m_rdram + src, m_rdram + src + chunk);
++            KickJob j; j.kind = KickJob::GifPath3; j.data = kickBufTake(chunk); j.data.assign(m_rdram + src, m_rdram + src + chunk);   // [perf2]
+             enqueueKickJob(std::move(j));
+             left -= chunk; src = 0u;
+         }
+@@ -3411,7 +3461,7 @@ void PS2Memory::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+ {
+     if (m_gifArbiter && asyncKickEnabled() && stage1FenceEnabled() && data && sizeBytes >= 16u)
+     {   // [s1fence] stream order, see above
+-        KickJob j; j.kind = KickJob::GifPath3; j.data.assign(data, data + sizeBytes);
++        KickJob j; j.kind = KickJob::GifPath3; j.data = kickBufTake(sizeBytes); j.data.assign(data, data + sizeBytes);   // [perf2]
+         enqueueKickJob(std::move(j));
+     }
+     else if (m_gifArbiter)
 diff --git a/ps2xRuntime/src/lib/ps2_stepcensus.cpp b/ps2xRuntime/src/lib/ps2_stepcensus.cpp
 index 3091df5..ade97d8 100644
 --- a/ps2xRuntime/src/lib/ps2_stepcensus.cpp
@@ -507,3 +634,85 @@ index 3091df5..ade97d8 100644
          unsigned clip = 0xFFFFFFFFu;
          if (std::sscanf(line, "%x %c %u", &pc, &kind, &clip) < 2 || pc < kBase || pc >= kEnd) continue;
          if (kind == 'h' && clip != 0xFFFFFFFFu) g_hsHClip[pc] = clip;   // [hclip] halve only when the clip slot id matches
+diff --git a/ps2xRuntime/src/lib/ps2_gs_live.cpp b/ps2xRuntime/src/lib/ps2_gs_live.cpp
+index 56f46e5..d53e2e0 100644
+--- a/ps2xRuntime/src/lib/ps2_gs_live.cpp
++++ b/ps2xRuntime/src/lib/ps2_gs_live.cpp
+@@ -213,6 +213,8 @@ namespace ps2_gslive
+             uint64_t waitNs = 0; // time the game blocked on a full ring ([gslive] stats)
+             uint64_t wakes = 0;  // host wake-ups ([gslive] stats)
+             int64_t staged = -1; // [livebatch] end of the bytes copied but not yet published (-1: none)
++            int64_t localWrite = -1; // [perf2] the writePos we last published (-1: not yet: read the header's)
++            int64_t cachedRead = 0;  // [perf2] the host's readPos as last loaded (it only grows: a stale copy errs on the safe side)
+ 
+             bool open()
+             {
+@@ -348,10 +350,17 @@ namespace ps2_gslive
+             {
+                 while (size != 0u)
+                 {
+-                    const int64_t w = staged >= 0 ? staged : header->writePos;
+-                    const int64_t r = header->readPos;
+-                    const uint64_t used = static_cast<uint64_t>(w - r);
+-                    const uint64_t freeBytes = capacity - used;
++                    // [perf2] our own write position and a cached read position: both live on the header's shared cache
++                    // line, which the host writes as it reads, so loading them on every write was a cache miss per call
++                    // (most of Writer::write's own time). readPos is reloaded only when the cached free space is short.
++                    const int64_t w = staged >= 0 ? staged : (localWrite >= 0 ? localWrite : header->writePos);
++                    uint64_t freeBytes = capacity - static_cast<uint64_t>(w - cachedRead);
++                    if (freeBytes < size)
++                    {
++                        cachedRead = header->readPos;
++                        freeBytes = capacity - static_cast<uint64_t>(w - cachedRead);
++                    }
++                    const int64_t r = cachedRead;
+                     if (freeBytes == 0u)
+                     {
+                         if (hostGone())
+@@ -385,6 +394,7 @@ namespace ps2_gslive
+                     return;
+                 MemoryBarrier();
+                 header->writePos = staged;
++                localWrite = staged;   // [perf2]
+                 staged = -1;
+             }
+ 
+@@ -513,6 +523,8 @@ namespace ps2_gslive
+             uint64_t waitNs = 0; // time the game blocked on a full ring ([gslive] stats)
+             uint64_t wakes = 0;  // host wake-ups ([gslive] stats)
+             int64_t staged = -1; // [livebatch] end of the bytes copied but not yet published (-1: none)
++            int64_t localWrite = -1; // [perf2] the writePos we last published (-1: not yet: read the header's)
++            int64_t cachedRead = 0;  // [perf2] the host's readPos as last loaded (it only grows: a stale copy errs on the safe side)
+ 
+             ~LiveRing()
+             {
+@@ -651,10 +663,17 @@ namespace ps2_gslive
+             {
+                 while (size != 0u)
+                 {
+-                    const int64_t w = staged >= 0 ? staged : header->writePos;
+-                    const int64_t r = header->readPos;
+-                    const uint64_t used = static_cast<uint64_t>(w - r);
+-                    const uint64_t freeBytes = capacity - used;
++                    // [perf2] our own write position and a cached read position: both live on the header's shared cache
++                    // line, which the host writes as it reads, so loading them on every write was a cache miss per call
++                    // (most of Writer::write's own time). readPos is reloaded only when the cached free space is short.
++                    const int64_t w = staged >= 0 ? staged : (localWrite >= 0 ? localWrite : header->writePos);
++                    uint64_t freeBytes = capacity - static_cast<uint64_t>(w - cachedRead);
++                    if (freeBytes < size)
++                    {
++                        cachedRead = header->readPos;
++                        freeBytes = capacity - static_cast<uint64_t>(w - cachedRead);
++                    }
++                    const int64_t r = cachedRead;
+                     if (freeBytes == 0u)
+                     {
+                         if (hostGone())
+@@ -688,6 +707,7 @@ namespace ps2_gslive
+                     return;
+                 __atomic_thread_fence(__ATOMIC_RELEASE);
+                 header->writePos = staged;
++                localWrite = staged;   // [perf2]
+                 staged = -1;
+             }
+ 

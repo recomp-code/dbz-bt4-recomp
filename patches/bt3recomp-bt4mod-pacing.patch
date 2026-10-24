@@ -1,0 +1,29 @@
+diff --git a/ps2xRuntime/src/lib/ps2_seamvk.cpp b/ps2xRuntime/src/lib/ps2_seamvk.cpp
+index 1f030bb..a0d7500 100644
+--- a/ps2xRuntime/src/lib/ps2_seamvk.cpp
++++ b/ps2xRuntime/src/lib/ps2_seamvk.cpp
+@@ -1977,6 +1977,24 @@ namespace seamvk
+         if (!on()) return;
+         if (!ensureOwnDevice()) return;
+         const PrivRegs pr = composePriv();
++        {   // [pacing] frames that came more than 25 ms after the previous one (the PCSX2 host's "hitches>25ms"), per second
++            static std::chrono::steady_clock::time_point s_last{}, s_win{};
++            static uint32_t s_hitch = 0, s_frames = 0; static double s_worst = 0.0;
++            const auto now = std::chrono::steady_clock::now();
++            if (s_last.time_since_epoch().count())
++            {
++                const double ms = std::chrono::duration<double, std::milli>(now - s_last).count();
++                if (ms > 25.0) ++s_hitch;
++                s_worst = std::max(s_worst, ms);
++            }
++            s_last = now; ++s_frames;
++            if (!s_win.time_since_epoch().count()) s_win = now;
++            if (now - s_win >= std::chrono::seconds(1))
++            {
++                std::fprintf(stderr, "[pacing] %u frames, hitches>25ms %u, worst %.1f ms\n", s_frames, s_hitch, s_worst);
++                s_win = now; s_hitch = 0; s_frames = 0; s_worst = 0.0;
++            }
++        }
+         ps2x_wshud::noteSwap(g_gpu.h ? g_gpu.h / g_gpu.oscale : 448u);   // [wshud] the walker's per-frame reset (scanout height in the 1x domain: the output image is CRTC size x OUTPUT scale, not render scale -- dividing by the render scale gave 298 at scale 3 and switched the HUD squeeze off)
+         renderFrame(g_own->dev, pr);
+         g_own->dev.next_frame_context();   // fences and command buffers recycle per context

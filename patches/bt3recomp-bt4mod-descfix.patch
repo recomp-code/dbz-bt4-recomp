@@ -1,0 +1,39 @@
+diff --git a/ps2xRuntime/src/lib/ps2_seamvk.cpp b/ps2xRuntime/src/lib/ps2_seamvk.cpp
+index 08ec20a..1f030bb 100644
+--- a/ps2xRuntime/src/lib/ps2_seamvk.cpp
++++ b/ps2xRuntime/src/lib/ps2_seamvk.cpp
+@@ -381,7 +381,7 @@ namespace seamvk
+                 Vulkan::ResourceLayout vl = {}, fl = {};
+                 vl.sets[0].storage_buffer_mask = 1u << 0; vl.sets[0].meta[0].array_size = 1;   // [batch] per-chunk constants array (SSBO ring)
+                 vl.input_mask = 0xFu; vl.output_mask = 0x1Fu; vl.push_constant_size = sizeof(PC);   // [spriterect] varying 4
+-                fl.sets[0].sampled_image_mask = (1u << 1) | (1u << 2); fl.sets[0].meta[1].array_size = 1; fl.sets[0].meta[2].array_size = 1;
++                fl.sets[0].sampled_image_mask = 1u << 1; fl.sets[0].input_attachment_mask = 1u << 2; fl.sets[0].meta[1].array_size = 1; fl.sets[0].meta[2].array_size = 1;
+                 fl.input_mask = 0x1Fu; fl.output_mask = 0x1u; fl.push_constant_size = sizeof(PC);
+                 g_gpu.progSeam = dev.request_program(kSeamVert, sizeof(kSeamVert), kGsFrag, sizeof(kGsFrag), &vl, &fl);
+                 Vulkan::ResourceLayout gl = {};
+@@ -411,7 +411,7 @@ namespace seamvk
+                 Vulkan::ResourceLayout av = {}, af = {};   // alias16: fullscreen triangle, target as input attachment (binding 2), texture (1), rects (0)
+                 av.output_mask = 0x0u; av.push_constant_size = sizeof(AliasPC);
+                 af.sets[0].uniform_buffer_mask = 1u << 0; af.sets[0].meta[0].array_size = 1;
+-                af.sets[0].sampled_image_mask = (1u << 1) | (1u << 2); af.sets[0].meta[1].array_size = 1; af.sets[0].meta[2].array_size = 1;
++                af.sets[0].sampled_image_mask = 1u << 1; af.sets[0].input_attachment_mask = 1u << 2; af.sets[0].meta[1].array_size = 1; af.sets[0].meta[2].array_size = 1;
+                 af.output_mask = 0x1u; af.push_constant_size = sizeof(AliasPC);
+                 g_gpu.progAlias = dev.request_program(kRtVert, sizeof(kRtVert), kAliasFrag, sizeof(kAliasFrag), &av, &af);
+                 Vulkan::ResourceLayout ov = {}, of = {};   // outline: fullscreen triangle, Ztop texture (1), CLUT (0)
+@@ -431,14 +431,14 @@ namespace seamvk
+                     Vulkan::ResourceLayout av = {}, af = {};
+                     av.output_mask = 0x0u; av.push_constant_size = 16;
+                     af.sets[0].uniform_buffer_mask = 1u << 0; af.sets[0].meta[0].array_size = 1;
+-                    af.sets[0].sampled_image_mask = (1u << 1) | (1u << 2); af.sets[0].meta[1].array_size = 1; af.sets[0].meta[2].array_size = 1;
++                    af.sets[0].sampled_image_mask = 1u << 1; af.sets[0].input_attachment_mask = 1u << 2; af.sets[0].meta[1].array_size = 1; af.sets[0].meta[2].array_size = 1;
+                     af.output_mask = 0x1u; af.push_constant_size = 16;
+                     g_gpu.progClutPass = dev.request_program(kRtVert, sizeof(kRtVert), kClutPassFrag, sizeof(kClutPassFrag), &av, &af);
+                 }
+                 {   // [postnative] step 4b: the 0x2a00 texture (1) + the destination as input attachment (2), as gs.frag's DATE read
+                     Vulkan::ResourceLayout cv = {}, cf = {};
+                     cv.output_mask = 0x0u; cv.push_constant_size = 8;
+-                    cf.sets[0].sampled_image_mask = (1u << 1) | (1u << 2) | (1u << 3); cf.sets[0].meta[1].array_size = 1; cf.sets[0].meta[2].array_size = 1; cf.sets[0].meta[3].array_size = 1;   // [dofgraded] 3 = the depth image
++                    cf.sets[0].sampled_image_mask = (1u << 1) | (1u << 3); cf.sets[0].input_attachment_mask = 1u << 2; cf.sets[0].meta[1].array_size = 1; cf.sets[0].meta[2].array_size = 1; cf.sets[0].meta[3].array_size = 1;   // [dofgraded] 3 = the depth image
+                     cf.output_mask = 0x1u; cf.push_constant_size = 8;
+                     g_gpu.progGlowComp = dev.request_program(kRtVert, sizeof(kRtVert), kGlowCompFrag, sizeof(kGlowCompFrag), &cv, &cf);
+                 }

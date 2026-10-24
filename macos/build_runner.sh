@@ -4,7 +4,7 @@
 # The bt3mod tree is BT3-Recomp e22a34b + patches/bt3recomp-bt4mod-full.patch + bt3recomp-bt4mod-windows.patch +
 # bt3recomp-bt4mod-macos.patch + bt3recomp-bt4mod-perf.patch + bt3recomp-bt4mod-unlock.patch
 # + bt3recomp-bt4mod-netstats.patch + bt3recomp-bt4mod-movieend.patch + bt3recomp-bt4mod-livebatch.patch
-# + bt3recomp-bt4mod-perf2.patch + bt3recomp-bt4mod-seamperf.patch + bt3recomp-bt4mod-glshare.patch + bt3recomp-bt4mod-upscale.patch + bt3recomp-bt4mod-fsr2.patch + bt3recomp-bt4mod-netnative.patch, with the game code generated as in the README's
+# + bt3recomp-bt4mod-perf2.patch + bt3recomp-bt4mod-seamperf.patch + bt3recomp-bt4mod-glshare.patch + bt3recomp-bt4mod-upscale.patch + bt3recomp-bt4mod-fsr2.patch + bt3recomp-bt4mod-netnative.patch + bt3recomp-bt4mod-descfix.patch, with the game code generated as in the README's
 # "Native macOS" section.
 # (The Mac GS host takes pcsx2-gsrunner-perf2.patch too: its Vulkan budget fix and PS2X_HWDOWNLOAD_MODE are shared code.)
 set -e

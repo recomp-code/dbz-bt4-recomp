@@ -3,11 +3,14 @@
 # no ISO, ELF or disc data: the app copies the ELF out of the player's ISO the first time.
 #   Contents/MacOS/      DBZ_BT4 (launcher), pcsx2-gsrunner (PCSX2's GS on Metal)
 #   Contents/Helpers/    Game.app: ps2EntryRunner (the recompiled game), a UI element (no Dock icon)
-#   Contents/Frameworks/ the GS host's dylibs (SDL3, freetype, png, webp...), rewritten to load from here
+#   Contents/Frameworks/ the GS host's dylibs (SDL3, freetype, png, webp...), rewritten to load from here, and
+#                        libMoltenVK.dylib (the native renderer's Vulkan; the launcher hands its path to the runner)
 #   Contents/Resources/  PCSX2's resources (shaders, fonts, GameIndex.yaml), runtime/ (assets, fps60_sites.txt,
 #                        settings.toml), presets/ (one ini per launcher quality), AppIcon.icns
 # Inputs (see the README's "Native macOS" section):
-#   RUNNER  the runner built for macOS 14 (bt3mod/build-mac-dist: CMAKE_OSX_DEPLOYMENT_TARGET=14.0, static minimal FFmpeg)
+#   RUNNER  the runner built for macOS 14 (macos/build_runner.sh: bt3mod-native/build-native, CMAKE_OSX_DEPLOYMENT_TARGET=14.0,
+#           static minimal FFmpeg): the PCSX2 host qualities and the native renderer (seamvk + MetalFX) in one binary
+#   MVK     MoltenVK's dylib (default Homebrew's molten-vk; it links only system frameworks)
 #   GSHOST  pcsx2-gsrunner (pcsx2/build-mac), RES its resources folder
 # Usage: macos/make_dist.sh [version]
 set -euo pipefail
@@ -15,7 +18,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(dirname "$HERE")"
 R=~/NBAStreetRecomp
 VERSION="${1:-1.0}"
-RUNNER="${RUNNER:-$R/bt3mod/build-mac-dist/ps2xRuntime}"
+RUNNER="${RUNNER:-$R/bt3mod-native/build-native/ps2xRuntime}"
+MVK="${MVK:-/opt/homebrew/lib/libMoltenVK.dylib}"
 GSHOST="${GSHOST:-$R/pcsx2/build-mac/pcsx2-gsrunner/pcsx2-gsrunner}"
 RES="${RES:-$R/gshost-dbz/resources}"
 OUT="${OUT:-$R/dbz/macdist}"
@@ -48,6 +52,10 @@ PLIST
 cp "$RUNNER/ps2EntryRunner" "$G/"
 cp "$GSHOST" "$C/MacOS/"
 strip -x "$G/ps2EntryRunner" "$C/MacOS/pcsx2-gsrunner"
+# [native] the native renderer's Vulkan driver: MoltenVK, opened by path (the launcher sets GRANITE_VULKAN_LIBRARY)
+cp -L "$MVK" "$C/Frameworks/libMoltenVK.dylib"
+chmod u+w "$C/Frameworks/libMoltenVK.dylib"
+install_name_tool -id "@executable_path/../Frameworks/libMoltenVK.dylib" "$C/Frameworks/libMoltenVK.dylib"
 
 # dylibs: everything outside the system, recursively, loaded from Contents/Frameworks
 fix_refs() {   # fix_refs <binary>: point its non-system dylib references at Frameworks/

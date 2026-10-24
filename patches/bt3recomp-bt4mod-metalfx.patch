@@ -1,0 +1,256 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -494,6 +494,26 @@
+         libswscale
+     )
+ 
++    # [metalfx] pkg-config hands a static FFmpeg's "-framework X" as two separate link options, and CMake de-duplicates
++    # options token by token: with any other framework on the link line the second "-framework" went and CoreVideo /
++    # CoreMedia were left bare ("no such file or directory"). Keep each pair whole.
++    get_target_property(_ffopts PkgConfig::FFMPEG INTERFACE_LINK_OPTIONS)
++    if(_ffopts)
++        set(_ffkeep "")
++        set(_ffnext "")
++        foreach(_o IN LISTS _ffopts)
++            if(_ffnext)
++                list(APPEND _ffkeep "SHELL:-framework ${_o}")
++                set(_ffnext "")
++            elseif(_o STREQUAL "-framework")
++                set(_ffnext 1)
++            else()
++                list(APPEND _ffkeep "${_o}")
++            endif()
++        endforeach()
++        set_target_properties(PkgConfig::FFMPEG PROPERTIES INTERFACE_LINK_OPTIONS "${_ffkeep}")
++    endif()
++
+     add_library(ffmpeg INTERFACE)
+     target_link_libraries(ffmpeg INTERFACE PkgConfig::FFMPEG)
+ endif()
+@@ -1162,13 +1182,24 @@
+     # [fsr2] AMD FidelityFX FSR2 for the native renderer (any GPU): the CPU side from Granite's FSR2 fork (third_party/fsr2),
+     # our Granite backend copy with the passes pre-baked as SPIR-V (src/lib/seamvk/fsr2_baked.inc, tools/bake_fsr2.ps1)
+     set(_ps2x_fsr2 "${PS2X_GRANITE_DIR}/third_party/fsr2/src/ffx-fsr2-api")
+-    if(EXISTS "${_ps2x_fsr2}/ffx_fsr2.cpp")
++    if(EXISTS "${_ps2x_fsr2}/ffx_fsr2.cpp" AND NOT APPLE)   # [metalfx] macOS upscales with Apple's MetalFX, not FSR2
+         target_sources(ps2_runtime PRIVATE "${_ps2x_fsr2}/ffx_fsr2.cpp" "${_ps2x_fsr2}/ffx_assert.cpp" src/lib/seamvk/ffx_fsr2_granite_baked.cpp)
+         target_include_directories(ps2_runtime PRIVATE "${_ps2x_fsr2}" "${_ps2x_fsr2}/granite" src/lib/seamvk)
+         target_compile_definitions(ps2_runtime PRIVATE PS2X_SEAMVK_FSR2=1)
+         message(STATUS "[fsr2] native renderer FSR2 from ${_ps2x_fsr2}")
+     else()
+         message(STATUS "[fsr2] no FSR2 sources (Granite third_party/fsr2 submodule): no temporal upscaler outside NVIDIA")
++    endif()
++    # [metalfx] macOS: Apple MetalFX temporal on the renderer's own Metal queue (MoltenVK's VK_EXT_metal_objects)
++    if(APPLE)
++        target_sources(ps2_runtime PRIVATE src/lib/ps2_seamvk_metalfx.mm)
++        # compiled as C++ with clang's Objective-C++ front end (OBJCXX cannot be enabled this late in a subdirectory)
++        set_source_files_properties(src/lib/ps2_seamvk_metalfx.mm PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "-xobjective-c++;-fobjc-arc")
++        target_compile_definitions(ps2_runtime PRIVATE PS2X_SEAMVK_METALFX=1)
++        # as linker options: one more "-framework X" among the link libraries makes CMake deduplicate a "-framework" token
++        # away and leave FFmpeg's CoreVideo / CoreMedia bare
++        target_link_options(ps2_runtime PUBLIC "LINKER:-framework,Metal" "LINKER:-framework,MetalFX")
++        message(STATUS "[metalfx] native renderer upscaler: Apple MetalFX (no FSR2 on macOS)")
+     endif()
+     # [dlss] NVIDIA DLSS for the native renderer through the NGX SDK (github.com/NVIDIA/DLSS), when it is there. The runtime
+     # (nvngx_dlss.dll / libnvidia-ngx-dlss.so) goes next to the executable; without it DLSS reports itself unavailable.
+diff --git a/ps2xRuntime/src/lib/ps2_seamvk.cpp b/ps2xRuntime/src/lib/ps2_seamvk.cpp
+--- a/ps2xRuntime/src/lib/ps2_seamvk.cpp
++++ b/ps2xRuntime/src/lib/ps2_seamvk.cpp
+@@ -35,6 +35,14 @@
+ #include "ffx_fsr2.h"
+ #include "ffx_fsr2_granite.h"
+ #endif
++#if defined(PS2X_SEAMVK_METALFX)   // [metalfx] Apple MetalFX temporal (ps2_seamvk_metalfx.mm), macOS's upscaler
++namespace ps2_seamvk_metalfx
++{
++    float maxScale(VkDevice dev, PFN_vkGetDeviceProcAddr gdpa);
++    bool run(VkDevice dev, VkQueue queue, PFN_vkGetDeviceProcAddr gdpa, VkImage color, VkImage depth, VkImage motion, VkImage out,
++             uint32_t inW, uint32_t inH, uint32_t outW, uint32_t outH, float jx, float jy, bool reset);
++}
++#endif
+ #if defined(PS2X_SEAMVK_DLSS)   // [dlss] NVIDIA's NGX SDK (github.com/NVIDIA/DLSS), when the build found it
+ #include "nvsdk_ngx_vk.h"
+ #include "nvsdk_ngx_helpers_vk.h"
+@@ -351,11 +359,13 @@
+         // [outscale] The composed output image is the CRTC size x min(render scale, PS2X_SEAMVK_OUTSCALE (default 2)), like
+         // paraLLEl-GS's 2x scanout: a 3x/4x render is BOX-FILTERED down to it by the circuit blit (supersampling), instead
+         // of a 1920x1344 image the host then mip-blurs into a 720p window (scale 3 presented softer than scale 2).
+-        // [upscale] PS2X_SEAMVK_UPSCALE=dlss|fsr|off: 1 = DLSS (FSR where DLSS cannot run), 2 = FSR, 0 = off (the box resolve below)
++        // [upscale] PS2X_SEAMVK_UPSCALE=dlss|fsr|metalfx|off: 1 = DLSS (FSR where DLSS cannot run), 2 = FSR, 0 = off (the box
++        // resolve below). [metalfx] On macOS every one of them means MetalFX (no FSR2 or DLSS is built there).
+         int upscaleMode()
+         {
+             static const int m = [](){ const char *v = std::getenv("PS2X_SEAMVK_UPSCALE");
+-                if (!v || !v[0] || !std::strcmp(v, "off")) return 0; if (!std::strcmp(v, "dlss")) return 1; if (!std::strcmp(v, "fsr")) return 2; return std::atoi(v) & 3; }();
++                if (!v || !v[0] || !std::strcmp(v, "off")) return 0; if (!std::strcmp(v, "dlss")) return 1; if (!std::strcmp(v, "fsr")) return 2;
++                if (!std::strcmp(v, "metalfx")) return 3; return std::atoi(v) & 3; }();
+             return m;
+         }
+         uint32_t outScale(uint32_t sc)
+@@ -1929,7 +1939,17 @@
+             Vulkan::ContextCreationFlags descFlags = Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_HEAP_BIT | Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_BUFFER_BIT;
+             if (const char *v = std::getenv("PS2X_SEAMVK_DESCMODEL"))   // diagnostics: legacy | buffer | heap (default: heap, else buffer)
+                 descFlags = !std::strcmp(v, "legacy") ? 0 : !std::strcmp(v, "buffer") ? Vulkan::ContextCreationFlags(Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_BUFFER_BIT) : descFlags;
+-            if (!g_own->ctx.init_instance_and_device(instExts.empty() ? nullptr : instExts.data(), uint32_t(instExts.size()), nullptr, 0,
++#if defined(PS2X_SEAMVK_METALFX)
++            // [metalfx] the Metal objects under the Vulkan images and queue, and each vkQueueSubmit committed before it returns
++            // (MoltenVK's default, pinned: the MetalFX command buffer must land on the queue after the frame's work)
++            setenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS", "1", 0);
++            static const char *const devExts[] = { "VK_EXT_metal_objects" };
++            const uint32_t numDevExts = 1;
++#else
++            static const char *const *devExts = nullptr;
++            const uint32_t numDevExts = 0;
++#endif
++            if (!g_own->ctx.init_instance_and_device(instExts.empty() ? nullptr : instExts.data(), uint32_t(instExts.size()), devExts, numDevExts,
+                                                      Vulkan::CONTEXT_CREATION_ENABLE_PUSH_DESCRIPTOR_BIT | descFlags))
+                 return fail("Vulkan instance/device init failed");
+             g_own->dev.set_context(g_own->ctx);
+@@ -2720,6 +2740,22 @@
+ #if defined(PS2X_SEAMVK_FSR2)
+                     // [fsr2] FSR2 when asked for, or where DLSS could not run (other vendors, no NGX runtime): same inputs, same command buffer
+                     if (!done && upscaleMode() != 0) done = fsr2Run(*cmd, dev, *g_gpu.out, *g_gpu.upDepth, *g_gpu.upMv, *g_gpu.up, reset);
++#endif
++#if defined(PS2X_SEAMVK_METALFX)
++                    if (!done && upscaleMode() != 0)
++                    {   // [metalfx] the frame so far goes to the queue now (Granite holds fence-less submissions until a flush; MoltenVK
++                        // commits it inside vkQueueSubmit), MetalFX is encoded on the same Metal queue behind it, and the rest of the
++                        // frame continues in a new command buffer behind that. The sample offset is DLSS's: -jitOut.
++                        static const float sx = [](){ const char *v = std::getenv("PS2X_METALFX_JITTER_SIGN"); return v && v[0] == '+' ? 1.0f : -1.0f; }();
++                        static const float sy = [](){ const char *v = std::getenv("PS2X_METALFX_JITTER_SIGN"); return v && v[0] && v[1] == '+' ? 1.0f : -1.0f; }();
++                        dev.submit(cmd);
++                        dev.flush_frame();
++                        done = ps2_seamvk_metalfx::run(dev.get_device(), dev.get_queue_info().queues[Vulkan::QUEUE_INDEX_GRAPHICS], vkGetDeviceProcAddr,
++                                                       g_gpu.out->get_image(), g_gpu.upDepth->get_image(), g_gpu.upMv->get_image(), g_gpu.up->get_image(),
++                                                       g_gpu.w, g_gpu.h, g_gpu.up->get_width(), g_gpu.up->get_height(),
++                                                       sx * g_gpu.jitOut[0], sy * g_gpu.jitOut[1], reset);
++                        cmd = dev.request_command_buffer();
++                    }
+ #endif
+                     g_gpu.upActive = done;   // [jitter] next frame jitters only behind a working temporal upscaler
+                     if (done)
+diff --git a/ps2xRuntime/third_party/bt3gl/src/platforms/rcore_desktop_sdl.c b/ps2xRuntime/third_party/bt3gl/src/platforms/rcore_desktop_sdl.c
+--- a/ps2xRuntime/third_party/bt3gl/src/platforms/rcore_desktop_sdl.c
++++ b/ps2xRuntime/third_party/bt3gl/src/platforms/rcore_desktop_sdl.c
+@@ -466,7 +466,14 @@
+         }
+         else
+         {
++#if defined(__APPLE__)
++            // [macfs] macOS: fullscreen in its own Space at the display's own resolution. SDL_WINDOW_FULLSCREEN switched the
++            // display mode to the window's size (1280x800 on a MacBook Pro), and the native renderer's MetalFX then had
++            // nothing larger to upscale to.
++            SDL_SetWindowFullscreen(platform.window, SDL_WINDOW_FULLSCREEN_DESKTOP);
++#else
+             SDL_SetWindowFullscreen(platform.window, SDL_WINDOW_FULLSCREEN);
++#endif
+             CORE.Window.flags |= FLAG_FULLSCREEN_MODE;
+             CORE.Window.fullscreen = true;
+         }
+diff --git a/ps2xRuntime/src/lib/ps2_seamvk_metalfx.mm b/ps2xRuntime/src/lib/ps2_seamvk_metalfx.mm
+new file mode 100644
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_seamvk_metalfx.mm
+@@ -0,0 +1,101 @@
++// [metalfx] Apple MetalFX temporal upscaling for the native renderer on macOS (FSR2 / DLSS elsewhere). The renderer runs on
++// MoltenVK, so its Vulkan images and queue are Metal objects underneath: VK_EXT_metal_objects hands them over, and the
++// scaler is encoded on the SAME MTLCommandQueue right after the frame's Vulkan work was submitted (MoltenVK commits
++// a Vulkan submission's MTLCommandBuffer inside vkQueueSubmit), so Metal runs it after that work and before the rest
++// of the frame, with no copy, no semaphore and no CPU wait. Same inputs as DLSS / FSR2: the composed colour, the
++// game's real depth (inverted) and motion (render pixels, towards the previous frame), and the sub-pixel jitter.
++#define VK_USE_PLATFORM_METAL_EXT
++#import <Metal/Metal.h>
++#import <MetalFX/MetalFX.h>
++#include <vulkan/vulkan.h>
++
++#include <cstdio>
++#include <cstdlib>
++
++namespace ps2_seamvk_metalfx
++{
++    struct State
++    {
++        int state = 0;   // 0 unknown, 1 working, -1 unavailable
++        id<MTLFXTemporalScaler> scaler = nil;
++        uint32_t inW = 0, inH = 0, outW = 0, outH = 0;
++        id<MTLCommandQueue> queue = nil;
++        PFN_vkExportMetalObjectsEXT exportObjects = nullptr;
++    };
++    static State g;
++
++    static id<MTLTexture> texture(VkDevice dev, VkImage img)
++    {
++        VkExportMetalTextureInfoEXT t = { VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT };
++        t.image = img;
++        t.plane = VK_IMAGE_ASPECT_PLANE_0_BIT;
++        VkExportMetalObjectsInfoEXT o = { VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT };
++        o.pNext = &t;
++        g.exportObjects(dev, &o);
++        return t.mtlTexture;
++    }
++
++    // maxScale: the largest output / input ratio per axis MetalFX takes on this Mac (3 on an M2 Pro), 0 = no MetalFX.
++    float maxScale(VkDevice dev, PFN_vkGetDeviceProcAddr gdpa)
++    {
++        static float s = -1.0f;
++        if (s >= 0.0f) return s;
++        s = 0.0f;
++        id<MTLDevice> md = MTLCreateSystemDefaultDevice();
++        if (!md || ![MTLFXTemporalScalerDescriptor supportsDevice:md]) return s;
++        if (!gdpa || !(g.exportObjects = (PFN_vkExportMetalObjectsEXT)gdpa(dev, "vkExportMetalObjectsEXT"))) return s;
++        if (@available(macOS 14.0, *)) s = [MTLFXTemporalScalerDescriptor supportedInputContentMaxScaleForDevice:md];
++        else s = 2.0f;
++        return s;
++    }
++
++    // run: colour (RGBA8), depth (R32F, inverted), motion (RG16F) at inW x inH into out (RGBA8, storage + sampled +
++    // colour attachment) at outW x outH. jx, jy: the sample offset in input pixels. false = not run (the caller keeps
++    // the plain composed frame).
++    bool run(VkDevice dev, VkQueue queue, PFN_vkGetDeviceProcAddr gdpa, VkImage color, VkImage depth, VkImage motion, VkImage out,
++             uint32_t inW, uint32_t inH, uint32_t outW, uint32_t outH, float jx, float jy, bool reset)
++    {
++        if (g.state < 0 || maxScale(dev, gdpa) <= 0.0f) { g.state = -1; return false; }
++        if (!g.queue)
++        {
++            VkExportMetalCommandQueueInfoEXT q = { VK_STRUCTURE_TYPE_EXPORT_METAL_COMMAND_QUEUE_INFO_EXT };
++            q.queue = queue;
++            VkExportMetalObjectsInfoEXT o = { VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT };
++            o.pNext = &q;
++            g.exportObjects(dev, &o);
++            g.queue = q.mtlCommandQueue;
++            if (!g.queue) { g.state = -1; std::fprintf(stderr, "[metalfx] no Metal command queue from MoltenVK\n"); return false; }
++        }
++        if (!g.scaler || inW != g.inW || inH != g.inH || outW != g.outW || outH != g.outH)
++        {
++            MTLFXTemporalScalerDescriptor *d = [MTLFXTemporalScalerDescriptor new];
++            d.colorTextureFormat = MTLPixelFormatRGBA8Unorm;
++            d.depthTextureFormat = MTLPixelFormatR32Float;
++            d.motionTextureFormat = MTLPixelFormatRG16Float;
++            d.outputTextureFormat = MTLPixelFormatRGBA8Unorm;
++            d.inputWidth = inW; d.inputHeight = inH; d.outputWidth = outW; d.outputHeight = outH;
++            d.autoExposureEnabled = NO;   // LDR colour, as the game draws it
++            g.scaler = [d newTemporalScalerWithDevice:g.queue.device];
++            g.inW = inW; g.inH = inH; g.outW = outW; g.outH = outH;
++            if (!g.scaler) { std::fprintf(stderr, "[metalfx] scaler %ux%u -> %ux%u not available\n", inW, inH, outW, outH); return false; }
++            std::fprintf(stderr, "[metalfx] temporal scaler %ux%u -> %ux%u\n", inW, inH, outW, outH);
++            reset = true;
++        }
++        id<MTLTexture> c = texture(dev, color), z = texture(dev, depth), m = texture(dev, motion), o = texture(dev, out);
++        if (!c || !z || !m || !o) { static int s_n = 0; if (s_n++ < 4) std::fprintf(stderr, "[metalfx] a texture did not export\n"); return false; }
++        id<MTLFXTemporalScaler> s = g.scaler;
++        s.colorTexture = c; s.depthTexture = z; s.motionTexture = m; s.outputTexture = o;
++        s.inputContentWidth = inW; s.inputContentHeight = inH;
++        s.jitterOffsetX = jx; s.jitterOffsetY = jy;
++        static const float mvs = [](){ const char *v = std::getenv("PS2X_METALFX_MV_SIGN"); return v && v[0] == '-' ? -1.0f : 1.0f; }();   // diagnostics
++        s.motionVectorScaleX = mvs; s.motionVectorScaleY = mvs;   // render pixels, pointing at the previous frame
++        s.depthReversed = YES;
++        s.reset = reset;
++        id<MTLCommandBuffer> cb = [g.queue commandBuffer];
++        cb.label = @"MetalFX temporal";
++        [s encodeToCommandBuffer:cb];
++        [cb commit];
++        g.state = 1;
++        return true;
++    }
++}

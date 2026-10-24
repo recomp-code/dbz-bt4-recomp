@@ -1,0 +1,35 @@
+diff --git a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
+index 32501c6..98e2686 100644
+--- a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
++++ b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
+@@ -1520,7 +1520,11 @@ void GSDeviceVK::ActivateCommandBuffer(u32 index)
+ 	m_current_command_buffer = resources.command_buffers[1];
+ 
+ 	// using the lower 32 bits of the fence index should be sufficient here, I hope...
+-	vmaSetCurrentFrameIndex(m_allocator, static_cast<u32>(m_next_fence_counter));
++	// [perf2] With VK_EXT_memory_budget, every call refetches the budget from the OS (a kernel query): DBZ BT4 moves
++	// to a new command buffer at every GS readback, many times a frame, and that refetch was 14% of the GS thread.
++	// The budget is only a heuristic for VMA's heap choices; refreshing it every 8 command buffers is plenty.
++	if ((m_next_fence_counter & 7u) == 0u)
++		vmaSetCurrentFrameIndex(m_allocator, static_cast<u32>(m_next_fence_counter));
+ }
+ 
+ void GSDeviceVK::ExecuteCommandBuffer(WaitType wait_for_completion)
+diff --git a/pcsx2-gsrunner/Main.cpp b/pcsx2-gsrunner/Main.cpp
+index 47cf55d..847adfc 100644
+--- a/pcsx2-gsrunner/Main.cpp
++++ b/pcsx2-gsrunner/Main.cpp
+@@ -216,6 +216,13 @@ void Host::CommitBaseSettingChanges()
+ 
+ void Host::LoadSettings(SettingsInterface& si, std::unique_lock<std::mutex>& lock)
+ {
++	// [perf2] PS2X_HWDOWNLOAD_MODE=0..4 overrides the preset's HWDownloadMode (GSHardwareDownloadMode: 0 accurate ...
++	// 2 no readbacks). The launcher sets 2 for offline play: DBZ BT4's glow builds its palette from a render target every
++	// frame, and the synchronous download stalled the GS thread on the GPU -- frame 9.5 -> 7.5 ms, pixel-identical on the
++	// frames compared. Online keeps the preset's accurate mode: what a download returns can reach the game, and both
++	// machines must see the same data.
++	if (const char* v = std::getenv("PS2X_HWDOWNLOAD_MODE"); v && v[0] >= '0' && v[0] <= '4' && !v[1])
++		EmuConfig.GS.HWDownloadMode = static_cast<GSHardwareDownloadMode>(v[0] - '0');
+ }
+ 
+ void Host::CheckForSettingsChanges(const Pcsx2Config& old_config)

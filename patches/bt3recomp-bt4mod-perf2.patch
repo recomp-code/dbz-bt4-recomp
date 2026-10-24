@@ -1,0 +1,509 @@
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 1569cc1..a79facc 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -842,7 +842,32 @@ namespace
+     thread_local bool g_schedTickDue = false;
+     static const uint64_t g_tickBranches = [](){ const char *v = std::getenv("PS2X_TICKBRANCHES"); const uint64_t n = (v && v[0]) ? std::strtoull(v, nullptr, 10) : 500000ull; return n < 4096ull ? 4096ull : n; }();
+     thread_local uint32_t g_cadBackEdge = 0u, g_cadAdxCtr = 0u, g_cadDp = 0u;
+-    thread_local std::unordered_map<PS2Runtime *, uint32_t> g_guestExecutionDepths;
++    // [perf2] This thread's guest-execution lock depth, per runtime. It was an unordered_map: the entry was erased at
++    // every scheduler yield and re-inserted after it (a heap node each time), and the whole map was COPIED twice per
++    // fiber switch. There is one runtime per process (two slots for tests), so a fixed table does the same with no
++    // allocation, and copies as two words.
++    struct GuestDepths
++    {
++        PS2Runtime *rt[2] = {nullptr, nullptr};
++        uint32_t depth[2] = {0u, 0u};
++        uint32_t *find(const PS2Runtime *r)
++        {
++            for (int i = 0; i < 2; ++i) if (rt[i] == r && depth[i] != 0u) return &depth[i];
++            return nullptr;
++        }
++        uint32_t &operator[](PS2Runtime *r)
++        {
++            for (int i = 0; i < 2; ++i) if (rt[i] == r) return depth[i];
++            for (int i = 0; i < 2; ++i) if (rt[i] == nullptr || depth[i] == 0u) { rt[i] = r; depth[i] = 0u; return depth[i]; }
++            std::abort();   // a third live runtime on one thread: never happens
++        }
++        void erase(const PS2Runtime *r)
++        {
++            for (int i = 0; i < 2; ++i) if (rt[i] == r) { rt[i] = nullptr; depth[i] = 0u; }
++        }
++    };
++    thread_local GuestDepths g_guestExecutionDepths;
++    std::atomic<uint32_t> g_guestExecutionHandoffWaiters{0u};   // [perf2] threads in yieldGuestExecutionAfterWake's handoff wait
+     // Per-host-thread guest tid for the deterministic scheduler (main = 1).
+     thread_local int g_schedTid = 1;
+     // Only true on real guest dispatch threads (main + StartThread workers). Host
+@@ -2296,14 +2321,65 @@ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
+ 
+ // [disptls] What dispatchGuestBranch touches on EVERY guest call/return, in one per-thread block: on macOS each distinct
+ // thread_local is its own _tlv_get_addr call (~4% of the game thread in a fight with five of them); one block = one.
++// [perf2] 4096 entries (was 512): with 512, lookupGeneratedFunction still took ~2% of the game thread in a fight.
++constexpr uint32_t kHotCallEntries = 4096u;
+ struct DispatchTls
+ {
+     R5900Context *bjCtx = nullptr; uint8_t *bjRdram = nullptr;   // [thunkwatch] for the [badjump] slot dump
+     bool pumping = false;                                         // the tick/ADX pumps' reentrancy guard
+-    uint32_t hcPc[512] = {};                                      // hot-call cache: targetPc -> recompiled fn
+-    PS2Runtime::RecompiledFunction hcFn[512] = {};
++    uint32_t gsBusyCtr = 0u;                                      // [perf2] the title-screen GS-busy clear's cadence (main thread)
++    uint32_t hcPc[kHotCallEntries] = {};                          // hot-call cache: targetPc -> recompiled fn
++    PS2Runtime::RecompiledFunction hcFn[kHotCallEntries] = {};
+ };
+ static thread_local DispatchTls t_disp;
++
++// [perf2] Every environment switch dispatchGuestBranch consults, read once at startup. As function-local statics they
++// each cost a thread-safe-initialisation check on every guest call and return (MSVC/clang-cl read the TLS init epoch
++// for each), about 25 of them per branch: with the 64-bit modulo below, most of the ~11% of the game thread a fight
++// spent in the dispatcher.
++namespace
++{
++    bool dispEnvOn(const char *name)
++    {
++        const char *v = std::getenv(name);
++        return v && v[0] && v[0] != '0';
++    }
++
++    struct DispatchEnv
++    {
++        bool superTrace, sndAck, profile, fa0, sndTrace, trace, dumpOverlay;
++        uint32_t slotProbe;
++        bool sndBlocks;          // PS2X_SNDGATE / ADXLOG / SNDLOG / SNDWAKE / SNDDISP / SNDAUDIT / SNDKICK (main thread)
++        bool tickPump, adxVsync, gsBusyClr;
++        uint64_t tickInterval;
++        uint64_t tickMask;       // tickInterval - 1 when it is a power of two (the default), else 0: modulo
++    };
++
++    DispatchEnv readDispatchEnv()
++    {
++        DispatchEnv e{};
++        e.superTrace = dispEnvOn("PS2X_SUPERTRACE");
++        e.sndAck = dispEnvOn("PS2X_BT3_SNDACK");
++        e.profile = dispEnvOn("PS2X_PROFILE");
++        e.fa0 = dispEnvOn("PS2X_FA0PROBE");
++        e.sndTrace = dispEnvOn("PS2X_SNDTRACE");
++        e.trace = dispEnvOn("PS2X_TRACE");
++        e.dumpOverlay = std::getenv("PS2X_DUMP_OVERLAY") != nullptr;
++        const char *sp = std::getenv("PS2X_SLOTPROBE");
++        e.slotProbe = sp && sp[0] ? (uint32_t)std::strtoul(sp, nullptr, 16) : 0u;
++        e.sndBlocks = dispEnvOn("PS2X_SNDGATE") || dispEnvOn("PS2X_ADXLOG") || dispEnvOn("PS2X_SNDLOG") ||
++                      dispEnvOn("PS2X_SNDWAKE") || dispEnvOn("PS2X_SNDDISP") || dispEnvOn("PS2X_SNDAUDIT") ||
++                      dispEnvOn("PS2X_SNDKICK");
++        { const char *v = std::getenv("PS2X_TICKPUMP"); e.tickPump = !(v && v[0] == '0'); }
++        { const char *v = std::getenv("PS2X_ADXVSYNC"); e.adxVsync = !(v && v[0] == '0'); }
++        { const char *v = std::getenv("PS2X_GSBUSYCLR"); e.gsBusyClr = !(v && v[0] == '0'); }
++        { const char *v = std::getenv("PS2X_TICKINTERVAL"); const uint64_t n = (v && v[0]) ? std::strtoull(v, nullptr, 10) : 131072ull; e.tickInterval = n < 256ull ? 256ull : n; }
++        e.tickMask = (e.tickInterval & (e.tickInterval - 1u)) == 0u ? e.tickInterval - 1u : 0u;
++        return e;
++    }
++
++    const DispatchEnv g_dispEnv = readDispatchEnv();
++}
+ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
+ {
+     pushDispatchPc(address);
+@@ -3939,18 +4015,17 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+     }
+     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
+ 
++    const DispatchEnv &E = g_dispEnv;   // [perf2]
++
+     // SUPER-TRACE tap (PS2X_SUPERTRACE + F10): see the rig above dispatchGuestBranch.
+-    {
+-        static const bool s_stOn = []() { const char *v = std::getenv("PS2X_SUPERTRACE"); return v && v[0] && v[0] != '0'; }();
+-        if (s_stOn && kind != GuestBranchKind::Return)
+-            straceRecord(targetPc, sourcePc);
+-    }
++    if (E.superTrace && kind != GuestBranchKind::Return)
++        straceRecord(targetPc, sourcePc);
+ 
+     // Hot-call cache: recent (targetPc -> recompiled fn), per thread. The game's tight
+     // service/critical-section loops call a handful of static functions millions of times
+     // each; caching the resolved fn skips lookupFunction()'s dispatch-history push + table
+     // lookup + hasFunction() on those. Only static-table fns are cached (never unloaded).
+-    const uint32_t hcI = (targetPc >> 2) & 0x1FFu;
++    const uint32_t hcI = (targetPc >> 2) & (kHotCallEntries - 1u);
+ 
+     // BT3 sound-service ack (env PS2X_BT3_SNDACK): the sound service thread
+     // FUN_0026d070 is asleep (no IOP wakes it), so it never clears the cross-thread
+@@ -3962,8 +4037,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+     // framebuffer the way running the op body from the pump did (SNDDISP -> pink).
+     // Runs on all guest threads (throttled) since the spinning thread may not be main.
+     {
+-        static const bool s_sndAck = [](){ const char *v = std::getenv("PS2X_BT3_SNDACK"); return v && v[0] && v[0] != '0'; }();
+-        if (s_sndAck)
++        if (E.sndAck)
+         {
+             static thread_local uint32_t s_ackCtr = 0u;
+             if ((++s_ackCtr & 0x3Fu) == 0u)
+@@ -3978,8 +4052,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+     // guest threads (the main thread mostly blocks; the real work is elsewhere).
+     // Prints every ~4M branches with total branches/sec and the two hottest pcs.
+     {
+-        static const bool s_prof = [](){ const char *v = std::getenv("PS2X_PROFILE"); return v && v[0] && v[0] != '0'; }();
+-        if (s_prof)
++        if (E.profile)
+         {
+             static std::atomic<uint64_t> s_gpc{0};
+             static std::atomic<uint32_t> s_ghist[0x4000];
+@@ -4012,11 +4085,10 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+     // pending-op handler 0x26cd20 -> func_26CC38) is never dispatched, that's the
+     // exact missing link that stops the sound-init countdown from decrementing.
+     {
+-        static const bool s_fa0 = [](){ const char *v = std::getenv("PS2X_FA0PROBE"); return v && v[0] && v[0] != '0'; }();
+         // Completion/decrement/registration functions: 26d9f0/26e628/26e848=decrement,
+         // 26e388=decrement thunk, 26e740=0x31ec90 registrar, 26e7c8=state setter,
+         // 26cc38=op body, 26cd20=slot-6 handler.
+-        if (s_fa0 && (targetPc == 0x0026d9f0u || targetPc == 0x0026e628u || targetPc == 0x0026e848u
++        if (E.fa0 && (targetPc == 0x0026d9f0u || targetPc == 0x0026e628u || targetPc == 0x0026e848u
+                       || targetPc == 0x0026e388u || targetPc == 0x0026e740u || targetPc == 0x0026e7c8u
+                       || targetPc == 0x0026cc38u || targetPc == 0x0026cd20u))
+         {
+@@ -4033,9 +4105,9 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+         // value (default: the sound callback slot 0x321828 = 0x0026cbc8, which the 2026-09-15 second-
+         // demo crash found with bit 31 set). A guest store shows up as the previous function on this
+         // tid; a host-side write shows up as a change between two unrelated branches.
+-        static const uint32_t s_spAddr = [](){ const char *v = std::getenv("PS2X_SLOTPROBE"); return v && v[0] ? (uint32_t)std::strtoul(v, nullptr, 16) : 0u; }();
+-        if (s_spAddr)
++        if (E.slotProbe)
+         {
++            const uint32_t s_spAddr = E.slotProbe;
+             static const uint32_t s_spWant = [](){ const char *v = std::getenv("PS2X_SLOTPROBE"); const char *c = v ? std::strchr(v, ':') : nullptr; return c ? (uint32_t)std::strtoul(c + 1, nullptr, 16) : 0x0026cbc8u; }();
+             static std::atomic<int> s_spState{0};   // 0 = waiting for the expected value, 1 = armed, 2 = reported
+             uint32_t cur = 0; std::memcpy(&cur, rdram + (s_spAddr & 0x01FFFFFFu), 4);
+@@ -4056,13 +4128,15 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+     // nested waits observe read/stream completion. Main thread + reentrancy gated.
+     if (ctx == &m_cpuContext)
+     {
+-        static const bool s_tickPumpEnabled = []() { const char *v = std::getenv("PS2X_TICKPUMP"); return !(v && v[0] == '0'); }();
++        const bool s_tickPumpEnabled = E.tickPump;
+         uint64_t &s_tickCounter = g_cadTickCounter;   // [rollback] cadence counter (file scope)
+         // Pump interval: running the (expensive) tick FUN_0028a3b0 every 2048 branches
+         // is huge redundant overhead (the game calls it too). Default 1048576 (1M);
+         // tunable via PS2X_TICKINTERVAL. Higher = faster main thread.
+-        static const uint64_t kTickPumpInterval = [](){ const char *v = std::getenv("PS2X_TICKINTERVAL"); uint64_t n = (v && v[0]) ? std::strtoull(v,nullptr,10) : 131072ull; return n < 256ull ? 256ull : n; }();
+-        if (s_tickPumpEnabled && !T.pumping && (++s_tickCounter % kTickPumpInterval) == 0u && hasFunction(0x0028a3b0u))
++        // [perf2] a mask instead of a 64-bit division on every main-thread branch when the interval is a power of two
++        // (counted only when the pump may run, as before: it is a rollback cadence counter)
++        auto tickDue = [&]() { const uint64_t n = ++s_tickCounter; return E.tickMask ? (n & E.tickMask) == 0u : (n % E.tickInterval) == 0u; };
++        if (s_tickPumpEnabled && !T.pumping && tickDue() && hasFunction(0x0028a3b0u))
+         {
+             T.pumping = true;
+             static const uint32_t kTickPcs[] = {0x0028a3b0u, 0x0028a530u};
+@@ -4110,7 +4184,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+         // movie phase (game doesn't tick it) gets the 1/frame it needs. Env PS2X_ADXVSYNC=0
+         // disables. tctx is copied from the main-thread ctx so gp/sp are correct.
+         {
+-            static const bool s_adxVsyncPump = []() { const char *v = std::getenv("PS2X_ADXVSYNC"); return !(v && v[0] == '0'); }();
++            const bool s_adxVsyncPump = E.adxVsync;
+             static thread_local uint64_t s_lastAdxPumpVsync = ~0ull;
+             // Only test the vsync change every 512 branches -- checking (even the lock-free
+             // GetCurrentVSyncTick + hasFunction) on EVERY guest branch is millions of calls
+@@ -4222,9 +4296,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+         // can advance. Main-thread only.
+         if (ctx == &m_cpuContext)
+         {
+-            static const bool s_gsBusyClr = []() { const char *v = std::getenv("PS2X_GSBUSYCLR"); return !(v && v[0] == '0'); }();
+-            static thread_local uint32_t s_gsCtr = 0u;
+-            if (s_gsBusyClr && ((++s_gsCtr & 0x3Fu) == 0u)) // every 64 branches is plenty
++            if (E.gsBusyClr && ((++T.gsBusyCtr & 0x3Fu) == 0u)) // every 64 branches is plenty
+             {
+                 const uint32_t base = *reinterpret_cast<const uint32_t *>(rdram + (0x2ff10cu & 0x01FFFFFFu));
+                 if (base != 0u)
+@@ -4235,6 +4307,9 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+             }
+         }
+ 
++        // [perf2] The sound-init experiments below (SNDGATE ... SNDKICK) only run with one of their switches set.
++        if (E.sndBlocks)
++        {
+         // EMPIRICAL (env PS2X_SNDGATE): the game spins in FUN_0026cd88 on
+         // `while (*(u64*)0x2c9fc8 == 0)` -- the sound-ready flag normally set by
+         // FUN_0026d9a0 once IOP sound-init completes. That handshake is stubbed, so
+@@ -4456,6 +4531,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+                 T.pumping = false;
+             }
+         }
++        } // [perf2] E.sndBlocks
+     }
+     else
+     {
+@@ -4463,8 +4539,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+         // on the sound worker threads, so it catches the func_26CC38<->tid6 handshake
+         // flag 0x2c9f54 transients the coarse main-thread pump misses. Logs the
+         // countdown 0x2c9f14, handshake flag 0x2c9f54, and state 0x2d184c on change.
+-        static const bool s_sndTrace = [](){ const char *v = std::getenv("PS2X_SNDTRACE"); return v && v[0] && v[0] != '0'; }();
+-        if (s_sndTrace)
++        if (E.sndTrace)
+         {
+             uint32_t cnt = *reinterpret_cast<uint32_t *>(rdram + (0x2c9f14u & 0x01FFFFFFu));
+             uint32_t hs  = *reinterpret_cast<uint32_t *>(rdram + (0x2c9f54u & 0x01FFFFFFu));
+@@ -4537,6 +4612,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+     // FUN_00100280(0x100628); jal 0x336a90(0x100630); FUN_0012bd10(0x100638).
+     // Determine which call the main thread reaches and whether the 0x336a90
+     // overlay ever has loaded code / is ever invoked.
++    // [perf2] only with PS2X_TRACE / PS2X_DUMP_OVERLAY: an atomic add on every call into the overlay range otherwise
++    if (E.trace || E.dumpOverlay)
+     {
+         if (sourcePc == 0x100628u || sourcePc == 0x100630u || sourcePc == 0x100638u ||
+             targetPc == 0x336a90u || (targetPc >= 0x334c00u && targetPc < 0x360000u))
+@@ -4673,7 +4750,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+         0x121da8u, 0x100670u, 0x263098u, 0x122940u, 0x116ba8u, 0x239ff0u, 0x23d0e0u, 0x252be8u,
+         0x268188u, 0x100280u, 0x12bd10u};
+     bool traceThis = false;
+-    if (ps2xTraceEnabled())
++    if (E.trace)
+         for (uint32_t a : s_mainCalls) if (a == targetPc) { traceThis = true; break; }
+     if (traceThis)
+         std::cerr << "[m>] 0x" << std::hex << targetPc << std::dec << std::endl;
+@@ -5530,36 +5607,36 @@ void PS2Runtime::enterGuestExecution()
+ 
+ void PS2Runtime::leaveGuestExecution()
+ {
+-    auto it = g_guestExecutionDepths.find(this);
+-    if (it == g_guestExecutionDepths.end() || it->second == 0u)
++    uint32_t *it = g_guestExecutionDepths.find(this);
++    if (!it)
+     {
+         return;
+     }
+ 
+-    --it->second;
+-    if (it->second == 0u) g_guestMutexHolderTid.store(-1);   // [fibers] stale holder made "[mutex] curHolder=me" look like a self-wait
++    --*it;
++    if (*it == 0u) g_guestMutexHolderTid.store(-1);   // [fibers] stale holder made "[mutex] curHolder=me" look like a self-wait
+     m_guestExecutionMutex.unlock();
+-    if (it->second == 0u)
++    if (*it == 0u)
+     {
+-        g_guestExecutionDepths.erase(it);
++        g_guestExecutionDepths.erase(this);
+     }
+ }
+ 
+ uint32_t PS2Runtime::releaseGuestExecution()
+ {
+-    auto it = g_guestExecutionDepths.find(this);
+-    if (it == g_guestExecutionDepths.end() || it->second == 0u)
++    uint32_t *it = g_guestExecutionDepths.find(this);
++    if (!it)
+     {
+         return 0u;
+     }
+ 
+-    const uint32_t depth = it->second;
++    const uint32_t depth = *it;
+     g_guestMutexHolderTid.store(-1);
+     for (uint32_t i = 0; i < depth; ++i)
+     {
+         m_guestExecutionMutex.unlock();
+     }
+-    g_guestExecutionDepths.erase(it);
++    g_guestExecutionDepths.erase(this);
+     return depth;
+ }
+ 
+@@ -5583,9 +5660,16 @@ void PS2Runtime::reacquireGuestExecution(uint32_t depth)
+ 
+ void PS2Runtime::markGuestExecutionAcquired()
+ {
++    // [perf2] Every acquisition (each guest entry and each scheduler yield) took the handoff mutex and notified the
++    // condition variable, though a waiter is rare (yieldGuestExecutionAfterWake, outside fibers). The epoch still
++    // moves every time; the lock and the wake only when someone waits. No lost wakeup: a waiter counts itself before
++    // it locks and checks the epoch (seq_cst on both sides), so either it sees the new epoch or we see it and wake it
++    // under the mutex, which it holds until it sleeps.
++    m_guestExecutionHandoffEpoch.fetch_add(1u, std::memory_order_seq_cst);
++    if (g_guestExecutionHandoffWaiters.load(std::memory_order_seq_cst) == 0u)
++        return;
+     {
+         std::lock_guard<std::mutex> lock(m_guestExecutionHandoffMutex);
+-        m_guestExecutionHandoffEpoch.fetch_add(1u, std::memory_order_acq_rel);
+     }
+     m_guestExecutionHandoffCv.notify_all();
+ }
+@@ -5717,7 +5801,7 @@ namespace
+ {
+     struct GuestTls
+     {
+-        std::unordered_map<PS2Runtime *, uint32_t> depths;
++        GuestDepths depths;
+         int  schedTid = 1;
+         bool isGuest = false;
+         uint32_t lastPc = 0, lastRa = 0;
+@@ -6248,8 +6332,7 @@ void PS2Runtime::yieldGuestExecutionAfterWake()
+         schedYield(g_schedTid);
+         return;
+     }
+-    auto it = g_guestExecutionDepths.find(this);
+-    if (it == g_guestExecutionDepths.end() || it->second == 0u)
++    if (!g_guestExecutionDepths.find(this))
+     {
+         std::this_thread::yield();
+         return;
+@@ -6258,10 +6341,12 @@ void PS2Runtime::yieldGuestExecutionAfterWake()
+     const uint64_t handoffEpoch = m_guestExecutionHandoffEpoch.load(std::memory_order_acquire);
+     {
+         GuestExecutionReleaseScope releaseGuestExecution(this);
++        g_guestExecutionHandoffWaiters.fetch_add(1u, std::memory_order_seq_cst);   // [perf2] see markGuestExecutionAcquired
+         std::unique_lock<std::mutex> lock(m_guestExecutionHandoffMutex);
+         Ps2xWaitScope whand(WP_HANDOFF);
+         m_guestExecutionHandoffCv.wait_for(lock, std::chrono::milliseconds(2), [&]()
+-                                           { return m_guestExecutionHandoffEpoch.load(std::memory_order_acquire) != handoffEpoch; });
++                                           { return m_guestExecutionHandoffEpoch.load(std::memory_order_seq_cst) != handoffEpoch; });
++        g_guestExecutionHandoffWaiters.fetch_sub(1u, std::memory_order_seq_cst);
+     }
+ }
+ 
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Interrupt.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Interrupt.cpp
+index 35fa965..9dc8160 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Interrupt.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Interrupt.cpp
+@@ -30,6 +30,17 @@ namespace ps2_syscalls
+         // with the guest busy ~20 ms/frame, a 25000 us period gives 40 fps if the game waits for the NEXT vblank
+         // (1 tick) and 20 fps if it always waits two ticks.
+         static const auto kVblankPeriod = [](){ const char *v = std::getenv("PS2X_VBLANK_US"); const long us = (v && v[0]) ? std::atol(v) : 0L; return std::chrono::microseconds(us > 1000 ? us : 16667L); }();
++        // [perf2] Benchmark: PS2X_BENCH_UNCAP_AT=<s> switches the vblank period to PS2X_BENCH_VBLANK_US (default 2000)
++        // that many seconds after start, so a scripted run reaches its fight at normal speed and then runs as fast as
++        // the host allows: the frame rate it reaches is the throughput a change is measured by.
++        std::chrono::microseconds vblankPeriodNow()
++        {
++            static const long s_at = [](){ const char *v = std::getenv("PS2X_BENCH_UNCAP_AT"); return (v && v[0]) ? std::atol(v) : 0L; }();
++            if (s_at <= 0) return kVblankPeriod;
++            static const long s_us = [](){ const char *v = std::getenv("PS2X_BENCH_VBLANK_US"); const long us = (v && v[0]) ? std::atol(v) : 0L; return us >= 500 ? us : 2000L; }();
++            static const auto s_t0 = std::chrono::steady_clock::now();
++            return std::chrono::steady_clock::now() - s_t0 >= std::chrono::seconds(s_at) ? std::chrono::microseconds(s_us) : kVblankPeriod;
++        }
+         constexpr int kMaxCatchupTicks = 4;
+ 
+         std::mutex g_irq_handler_mutex;
+@@ -535,7 +546,8 @@ namespace ps2_syscalls
+         g_currentThreadId = -1;
+ 
+         using clock = std::chrono::steady_clock;
+-        auto nextTick = clock::now() + kVblankPeriod;
++        (void)vblankPeriodNow();   // [perf2] starts the benchmark clock with the worker
++        auto nextTick = clock::now() + vblankPeriodNow();
+ #if defined(__APPLE__)
+         // [vblankpace] macOS coalesces the timers of ordinary threads: this worker woke 5 ms late on average (up to 8) after
+         // each deadline, so the vblanks -- and the frames sent to the GS host -- came 16-24 ms apart, and the 60 Hz display
+@@ -574,10 +586,11 @@ namespace ps2_syscalls
+ 
+             const auto now = clock::now();
+             int ticksToProcess = 0;
++            const auto period = vblankPeriodNow();
+             while (now >= nextTick && ticksToProcess < kMaxCatchupTicks)
+             {
+                 ++ticksToProcess;
+-                nextTick += kVblankPeriod;
++                nextTick += period;
+             }
+             if (ticksToProcess == 0)
+             {
+diff --git a/ps2xRuntime/include/runtime/ps2_gif_arbiter.h b/ps2xRuntime/include/runtime/ps2_gif_arbiter.h
+index cbba098..665023a 100644
+--- a/ps2xRuntime/include/runtime/ps2_gif_arbiter.h
++++ b/ps2xRuntime/include/runtime/ps2_gif_arbiter.h
+@@ -54,6 +54,8 @@ public:
+     void takeQueue(GifArbiterBatch &out);     // [vu1pipe] hand the queued packets (ordered as drain would) to another thread
+     void process(const GifArbiterPacket &pkt);   // [vu1pipe] run the process function on one packet (the thread that owns the GS)
+     uint32_t pending() const;                    // packets this thread's lane holds since its last takeQueue/drain
++    // [perf2] hand a processed batch's buffers back: takeQueue gives them to the lane again, capacity and all
++    void recycle(GifArbiterBatch &batch);
+ 
+     // [giflane] The kick worker and the guest thread are two independent producers whose packets were
+     // never meant to interleave: with [vu1pipe] the worker's go to stage 2 in order and the guest's are
+@@ -82,6 +84,12 @@ private:
+     std::atomic<uint64_t> m_lockWaitNs{0};   // total wait, nanoseconds
+     Lane m_lanes[2];                         // 0 = guest / any thread, 1 = the kick worker
+     Lane &lane();
++    // [perf2] takeQueue hands the lane's arena and queue over and the lane started again from empty vectors: every
++    // run regrew them by doubling (allocate, copy everything, free), ~20% of the kick worker in a fight. The buffers
++    // stage 2 is done with come back here and are reused instead.
++    std::mutex m_poolMtx;
++    std::vector<std::vector<uint8_t>> m_arenaPool;
++    std::vector<std::vector<GifArbiterPacket>> m_pktPool;
+ 
+     static bool isImagePacket(const uint8_t *data, uint32_t sizeBytes);
+     static uint8_t pathPriority(GifPathId id);
+diff --git a/ps2xRuntime/src/lib/ps2_gif_arbiter.cpp b/ps2xRuntime/src/lib/ps2_gif_arbiter.cpp
+index 64fd29f..5fd6784 100644
+--- a/ps2xRuntime/src/lib/ps2_gif_arbiter.cpp
++++ b/ps2xRuntime/src/lib/ps2_gif_arbiter.cpp
+@@ -163,6 +163,17 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
+     ln.pending.store(static_cast<uint32_t>(ln.queue.size()), std::memory_order_relaxed);
+ }
+ 
++void GifArbiter::recycle(GifArbiterBatch &batch)
++{   // [perf2] a few spare buffers are enough: the two lanes take at most one of each per takeQueue
++    constexpr size_t kMaxPooled = 8u, kMaxArenaBytes = 64u << 20;
++    std::lock_guard<std::mutex> pl(m_poolMtx);
++    for (std::vector<uint8_t> &a : batch.arenas)
++        if (m_arenaPool.size() < kMaxPooled && a.capacity() <= kMaxArenaBytes) { a.clear(); m_arenaPool.push_back(std::move(a)); }
++    if (m_pktPool.size() < kMaxPooled && batch.pkts.capacity() > 0u) { batch.pkts.clear(); m_pktPool.push_back(std::move(batch.pkts)); }
++    batch.arenas.clear();
++    batch.pkts.clear();
++}
++
+ static thread_local bool t_gifWorkerLane = false;   // [giflane]
+ void GifArbiter::markWorkerThread() { t_gifWorkerLane = true; }
+ GifArbiter::Lane &GifArbiter::lane() { return m_lanes[t_gifWorkerLane ? 1 : 0]; }
+@@ -196,6 +207,9 @@ void GifArbiter::takeQueue(GifArbiterBatch &out)
+         arena.swap(ln.arena);
+         for (GifArbiterPacket &p : out.pkts) p.data = arena.data() + p.offset;
+         out.arenas.push_back(std::move(arena));
++        std::lock_guard<std::mutex> pl(m_poolMtx);   // [perf2] the lane goes on with recycled capacity
++        if (!m_arenaPool.empty()) { ln.arena.swap(m_arenaPool.back()); m_arenaPool.pop_back(); }
++        if (!m_pktPool.empty() && q.capacity() < m_pktPool.back().capacity()) { q.swap(m_pktPool.back()); m_pktPool.pop_back(); }
+     }
+     ln.pending.store(0u, std::memory_order_relaxed);
+     if (s_stat)
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 59587de..621527d 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -2639,7 +2639,9 @@ void PS2Memory::stage2Loop()
+                 ps2x_pgs::setSuppressed(false);
+             }
+             else for (const auto &pkt : it.batch.pkts) m_gifArbiter->process(pkt);
+-            nPkts += it.batch.pkts.size(); break;
++            nPkts += it.batch.pkts.size();
++            m_gifArbiter->recycle(it.batch);   // [perf2] the buffers go back to the arbiter's lanes
++            break;
+         case 1u:
+             ps2GpuRenderer().swapFrame();
+             { std::lock_guard<std::mutex> lk(m_kickMtx); if (m_kickFramesQueued > 0u) --m_kickFramesQueued; m_kickDoneCv.notify_all(); }
+diff --git a/ps2xRuntime/src/lib/ps2_stepcensus.cpp b/ps2xRuntime/src/lib/ps2_stepcensus.cpp
+index 3091df5..ade97d8 100644
+--- a/ps2xRuntime/src/lib/ps2_stepcensus.cpp
++++ b/ps2xRuntime/src/lib/ps2_stepcensus.cpp
+@@ -386,6 +386,10 @@ namespace
+ {
+     uint8_t *g_hs = nullptr;                      // 0 none, 1 float-halve, 2 int-every-other-frame
+     std::unordered_set<uint64_t> g_hsVec;         // vector sites: (pc << 32) | ra
++    // [perf2] the pcs that have any vector site, one bit each: every 128-bit store of the logic thread probed the hash
++    // set above, ~2% of the game thread at 60 fps for a handful of sites
++    uint8_t g_hsVecPc[(kEnd - kBase) >> 5] = {};
++    inline bool hsVecPcListed(uint32_t pc) { const uint32_t i = (pc - kBase) >> 2; return (g_hsVecPc[i >> 3] >> (i & 7u)) & 1u; }
+     // one-shot guard keyed per (site, address): a hash table over all addresses (fd11: a smoke-particle lifetime
+     // site touches 29 slots, >10 per frame -- an 8-entry per-site ring thrashed and re-doubled live particles)
+     struct HsEntry { uint32_t addr, frame, pc; uint32_t halfRate; uint32_t val; };   // halfRate: this (site, address) stores only every other frame ([uparity]); val: what this site last stored there ([dcont])
+@@ -633,7 +637,7 @@ void ps2HalfStepWrite128(uint8_t *rdram, uint32_t guestAddr, uint64_t &lo, uint6
+ {
+     if (!g_hs || !ctx || ctx != g_hsCtx.load(std::memory_order_relaxed)) return;
+     const uint32_t pc = ctx->pc;
+-    if (pc < kBase || pc >= kEnd) return;
++    if (pc < kBase || pc >= kEnd || !hsVecPcListed(pc)) return;
+     if (g_hsVec.find(((uint64_t)pc << 32) | (uint32_t)ctx->r[31][0]) == g_hsVec.end()) return;   // keyed by (site, caller)
+     const uint32_t a = guestAddr & 0x1FFFFFFFu;
+     if (a + 16u > 32u * 1024u * 1024u) return;
+@@ -737,7 +741,7 @@ void ps2HalfStepEnable(const char *sitesPath)
+             }
+             kind = 0;
+         }
+-        if (std::sscanf(line, "%x:%x %c", &pc, &ra, &kind) == 3) { if (pc >= kBase && pc < kEnd && kind == 'f') { g_hsVec.insert(((uint64_t)pc << 32) | ra); ++nv; } continue; }
++        if (std::sscanf(line, "%x:%x %c", &pc, &ra, &kind) == 3) { if (pc >= kBase && pc < kEnd && kind == 'f') { g_hsVec.insert(((uint64_t)pc << 32) | ra); const uint32_t i = (pc - kBase) >> 2; g_hsVecPc[i >> 3] |= (uint8_t)(1u << (i & 7u)); ++nv; } continue; }
+         unsigned clip = 0xFFFFFFFFu;
+         if (std::sscanf(line, "%x %c %u", &pc, &kind, &clip) < 2 || pc < kBase || pc >= kEnd) continue;
+         if (kind == 'h' && clip != 0xFFFFFFFFu) g_hsHClip[pc] = clip;   // [hclip] halve only when the clip slot id matches

@@ -1,6 +1,7 @@
 # Regenera los parches propios de Windows:
 #  patches\bt3recomp-bt4mod-windows.patch  sobre BT3-Recomp e22a34b + dbz-bt4-recomp\patches\bt3recomp-bt4mod-full.patch
-#    (bt3mod tiene encima macos + perf + unlock + netstats + movieend + livebatch: se quitan de una copia antes de sacar el diff)
+#    (bt3mod tiene encima macos + perf + unlock + netstats + movieend + livebatch + perf2: se quitan de una copia antes de sacar el diff;
+#     el host tiene encima pcsx2-gsrunner-perf2.patch, que se quita igual)
 #  patches\pcsx2-gsrunner-dbz-windows.patch sobre el arbol PCSX2 de NBA + dbz-bt4-recomp\patches\pcsx2-gsrunner-live-dbz.patch
 $g = "C:\NBAStreetRecomp\tools\mingit\cmd\git.exe"
 $R = "C:\DBZBT4Recomp"
@@ -31,14 +32,14 @@ $rt = @('ps2xRuntime/src/lib/ps2_gs_live.cpp', 'ps2xRuntime/src/lib/ps2_live_rin
         'ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp',
         # strcmp/strncmp like newlib (the host CRTs differ: the Mac-vs-Windows desync)
         'ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp')
-# The tree also has the patches that go on top of this one (macos, perf, unlock, netstats, movieend, livebatch): take them back out of a
+# The tree also has the patches that go on top of this one (macos, perf, unlock, netstats, movieend, livebatch, perf2): take them back out of a
 # copy of the Windows files, so the Windows patch stays only the Windows work and the layers keep applying in order.
 $top = "$R\tmp_top"
 Remove-Item -Recurse -Force $top -ErrorAction SilentlyContinue
 foreach ($rel in $rt) { $d = Join-Path $top $rel; New-Item -ItemType Directory -Force (Split-Path $d) | Out-Null; Copy-Item "$R\bt3mod\$rel" $d }
 & $g -C $top init -q
 $inc = $rt | ForEach-Object { "--include=$_" }
-foreach ($layer in 'livebatch', 'movieend', 'netstats', 'unlock', 'perf', 'macos') {
+foreach ($layer in 'perf2', 'livebatch', 'movieend', 'netstats', 'unlock', 'perf', 'macos') {
     & $g -C $top apply -R --whitespace=nowarn @inc "$R\dbz-bt4-recomp\patches\bt3recomp-bt4mod-$layer.patch"
     if ($LASTEXITCODE -ne 0) { throw "bt3recomp-bt4mod-$layer.patch no se puede quitar del arbol (no esta aplicado?)" }
 }
@@ -56,7 +57,15 @@ foreach ($rel in $hf) { $d = Join-Path $hb $rel; New-Item -ItemType Directory -F
 & $g -C $hb init -q
 & $g -C $hb apply --include=pcsx2/GSDumpReplayer.cpp --include=pcsx2/Ps2LiveRing.h --include=pcsx2-gsrunner/Main.cpp "$R\dbz-bt4-recomp\patches\pcsx2-gsrunner-live-dbz.patch"
 if ($LASTEXITCODE -ne 0) { throw "no aplica pcsx2-gsrunner-live-dbz.patch sobre la NBA" }
-Write-Diff 'C:/DBZBT4Recomp/tmp_host' 'C:/DBZBT4Recomp/pcsx2' $hf "$R\patches\pcsx2-gsrunner-dbz-windows.patch"
+# the host's own layer on top (pcsx2-gsrunner-perf2.patch) comes back out of a copy, as the runtime's do above
+$htop = "$R\tmp_host_top"
+Remove-Item -Recurse -Force $htop -ErrorAction SilentlyContinue
+foreach ($rel in $hf) { $d = Join-Path $htop $rel; New-Item -ItemType Directory -Force (Split-Path $d) | Out-Null; Copy-Item "$R\pcsx2\$rel" $d }
+& $g -C $htop init -q
+& $g -C $htop apply -R --whitespace=nowarn ($hf | ForEach-Object { "--include=$_" }) "$R\dbz-bt4-recomp\patches\pcsx2-gsrunner-perf2.patch"
+if ($LASTEXITCODE -ne 0) { throw "pcsx2-gsrunner-perf2.patch no se puede quitar del host (no esta aplicado?)" }
+Write-Diff 'C:/DBZBT4Recomp/tmp_host' 'C:/DBZBT4Recomp/tmp_host_top' $hf "$R\patches\pcsx2-gsrunner-dbz-windows.patch"
+Remove-Item -Recurse -Force $htop
 & $g -C $hb apply --check "$R\patches\pcsx2-gsrunner-dbz-windows.patch"
 $ok2 = $LASTEXITCODE -eq 0
 Remove-Item -Recurse -Force $hb

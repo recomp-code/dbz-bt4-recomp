@@ -1,0 +1,215 @@
+diff --git a/ps2xRuntime/src/lib/ps2_seamvk.cpp b/ps2xRuntime/src/lib/ps2_seamvk.cpp
+index 31ac5d3..1c963b3 100644
+--- a/ps2xRuntime/src/lib/ps2_seamvk.cpp
++++ b/ps2xRuntime/src/lib/ps2_seamvk.cpp
+@@ -125,6 +125,7 @@ namespace seamvk
+             Vulkan::Program *progSeam = nullptr, *progGs = nullptr, *progSeamSt = nullptr, *progGsSt = nullptr, *progPresent = nullptr, *progRt = nullptr, *progAlias = nullptr, *progOutlineH = nullptr, *progOutline = nullptr, *progDepthMask = nullptr, *progZtop = nullptr, *progVram = nullptr, *progClutPass = nullptr, *progGlowDown = nullptr, *progGlowComp = nullptr;
+             Vulkan::BufferHandle vram;          // [gpudecode] the GPU copy of GS VRAM (4 MB), pages uploaded in stream order
+             Vulkan::BufferHandle cring[3]; uint8_t *cmap[3] = {}; VkDeviceSize coff = 0; uint32_t cslot = 0;   // [batch] host-visible constants ring (one per frame in flight)
++            Vulkan::BufferHandle vring[3]; uint8_t *vmap[3] = {}; VkDeviceSize voff = 0;   // [vring] the same for vertex data (slot = cslot)
+             Vulkan::ImageHandle out;            // the composed frame
+             Vulkan::ImageHandle white;          // 1x1 for untextured draws
+             Vulkan::ImageHandle outlineH;       // [outline] pass A output (minC, maxC, minF, maxF), target-sized
+@@ -235,6 +236,25 @@ namespace seamvk
+             cmd.set_storage_buffer(0, 0, *g_gpu.cring[s], off, bytes);
+             return true;
+         }
++        // [vring] vertex data for binding 0 from this frame's ring, bound at its offset. Granite's vertex pool hands out 4 KB
++        // blocks and gives anything larger (most GS draws, every seam batch: ~2.8 MB a fight frame) a dedicated buffer that
++        // it destroys a frame later -- that create/destroy churn was ~12% of the GS thread. A full ring falls back to Granite.
++        static constexpr VkDeviceSize kVringBytes = 16u << 20;
++        void *vertexData(Vulkan::CommandBuffer &cmd, Vulkan::Device &dev, VkDeviceSize bytes, VkDeviceSize stride)
++        {
++            const uint32_t s = g_gpu.cslot;
++            if (!g_gpu.vring[s])
++            {
++                Vulkan::BufferCreateInfo bi = {}; bi.size = kVringBytes; bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT; bi.domain = Vulkan::BufferDomain::Host;
++                g_gpu.vring[s] = dev.create_buffer(bi);
++                g_gpu.vmap[s] = static_cast<uint8_t *>(dev.map_host_buffer(*g_gpu.vring[s], Vulkan::MEMORY_ACCESS_WRITE_BIT));
++            }
++            const VkDeviceSize off = (g_gpu.voff + 63u) & ~VkDeviceSize(63u);
++            if (off + bytes > kVringBytes) return cmd.allocate_vertex_data(0, bytes, stride);
++            g_gpu.voff = off + bytes;
++            cmd.set_vertex_binding(0, *g_gpu.vring[s], off, stride);
++            return g_gpu.vmap[s] + off;
++        }
+         bool stencilDate()
+         {
+             static const bool s = [](){ const char *v = std::getenv("PS2X_SEAMVK_STENCILDATE"); return v && v[0] == '1'; }();   // =1 (experimental, wrong on the terrain's DATE draws and no faster): stencil mirrors the stored alpha bit; default: the in-pass barrier + destination read per DATE draw
+@@ -436,6 +456,23 @@ namespace seamvk
+             t.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+         }
+ 
++        uint64_t poolImageBytes(const Vulkan::ImageHandle &h)
++        {
++            const auto &ci = h->get_create_info(); const uint64_t b = uint64_t(ci.width) * ci.height * 4u; return ci.levels != 1u ? b + b / 3u : b;
++        }
++        // [poolreuse] a free decode image of this size (and mip-ness), or none
++        Vulkan::ImageHandle poolTake(uint32_t w, uint32_t h, bool mips)
++        {
++            for (size_t i = 0; i < g_gpu.hoistFree.size(); ++i)
++            {
++                Vulkan::ImageHandle &c = g_gpu.hoistFree[i];
++                if (c->get_width() != w || c->get_height() != h || (c->get_create_info().levels != 1u) != mips) continue;
++                Vulkan::ImageHandle img = c; g_gpu.hoistFreeBytes -= poolImageBytes(img);
++                c = g_gpu.hoistFree.back(); g_gpu.hoistFree.pop_back();
++                return img;
++            }
++            return Vulkan::ImageHandle();
++        }
+         void freeTextures(const seamgs::FrameList &f)
+         {   // after the frame's draws: retired slots may still be referenced by them
+             static const bool s_noFree = [](){ const char *v = std::getenv("PS2X_SEAMVK_NOFREE"); return v && v[0] == '1'; }();   // diagnostic: leak slot images (lifetime bisect)
+@@ -522,6 +559,12 @@ namespace seamvk
+             Vulkan::ImageHandle &img = into ? *into : g_gpu.tex[r.slot];
+             if (g_gpu.dumpRt) img.reset();   // dumping: every decode keeps its own image (a slot decoded twice in the frame would show only the last)
+             if (!img || img->get_width() != iw || img->get_height() != ih)
++            {   // [poolreuse] a decode image from the free pool first (only the hoisted path took from it: a target decode into a
++                // new slot created an image every time while the retired ones aged out of the pool and were destroyed)
++                if (img && !into && !g_gpu.hoistRetire.empty()) g_gpu.hoistRetire.back().push_back(img);   // earlier draws of this frame still read it
++                img = g_gpu.dumpRt ? Vulkan::ImageHandle() : poolTake(iw, ih, mipsOn() && !srcp);
++            }
++            if (!img)
+             {
+                 auto ci = Vulkan::ImageCreateInfo::render_target(iw, ih, VK_FORMAT_R8G8B8A8_UNORM);
+                 ci.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+@@ -1371,7 +1414,11 @@ namespace seamvk
+     void renderFrame(Vulkan::Device &dev, const PrivRegs &priv)
+     {
+         const auto tA = std::chrono::steady_clock::now();
+-        seamgs::FrameList f;
++        // [framereuse] one list for the process: takeFrame swaps it with the front end's, which clears it and refills the
++        // same vectors. A fresh local here handed the front end empty vectors every frame (~550 draws, ~2.8 MB of verts
++        // regrown from zero and freed again: ~25% of the GS thread in the uncapped fight).
++        static seamgs::FrameList s_frameList;
++        seamgs::FrameList &f = s_frameList;
+         { const uint64_t db[2] = { priv.dispfb1, priv.dispfb2 }; seamgs::takeFrame(f, db, (uint32_t)(priv.pmode & 3u)); }   // [dispvram]
+         if (!ensureGpu(dev)) return;
+         const auto tB = std::chrono::steady_clock::now();
+@@ -1579,7 +1626,14 @@ namespace seamvk
+         g_gpu.rtDumps.clear();
+         auto cmd = dev.request_command_buffer();
+         g_gpu.tsCur.clear(); tsMark(*cmd, 0);
+-        g_gpu.cslot = g_gpu.ringNext % 3u; g_gpu.coff = 0;   // [batch] the constants ring slot of this frame (its fence is waited two frames later)
++        g_gpu.cslot = g_gpu.ringNext % 3u; g_gpu.coff = 0; g_gpu.voff = 0;   // [batch] the constants ring slot of this frame (its fence is waited two frames later)
++        if (earlyFrame())
++        {   // [vring] the frame three back used this slot's rings: the consumer clears .live once the GPU signalled it. Waited
++            // here, before recording writes into them (the wait below the record came after the writes; it never blocks in practice)
++            Gpu::Pending &sl = g_gpu.ring[g_gpu.ringNext % 3u];
++            std::unique_lock<std::mutex> lk(g_rbMtx);
++            g_rbCv.wait(lk, [&]{ return !sl.live; });
++        }
+         // [hoist] decodes from the VRAM copy read only the copy (updated in stream order among themselves) and never a pass target, so
+         // their GPU work runs before the first draw pass instead of breaking it (each break: end pass, barriers, decode pass, begin
+         // pass with LOAD; 40 a frame). Each hoisted decode gets its own image from a pool; the slot is pointed at it when the
+@@ -1594,12 +1648,17 @@ namespace seamvk
+         // that needs more than the budget just creates and drops images that frame, which is what happened before the
+         // pool existed.
+         static const uint64_t s_poolBytes = [](){ const char *v = std::getenv("PS2X_SEAMVK_POOL_MB"); const long mb = v && v[0] ? std::strtol(v, nullptr, 10) : 384; return uint64_t(mb < 0 ? 0 : mb) << 20; }();
+-        auto imageBytes = [](const Vulkan::ImageHandle &h) -> uint64_t {
+-            const auto &ci = h->get_create_info(); uint64_t b = uint64_t(ci.width) * ci.height * 4u; return ci.levels > 1u ? b + b / 3u : b; };
++        auto imageBytes = [](const Vulkan::ImageHandle &h) { return poolImageBytes(h); };
+         while (g_gpu.hoistRetire.size() > 3u)
+         {
++            // [poolevict] a full pool drops its OLDEST image, not the one coming back: refusing the newcomer kept the pool
++            // full of sizes the scene stopped using while the sizes it does use were destroyed and recreated every frame
++            // (Granite's deferred frees: ~11% of the GS thread in the uncapped fight)
+             for (Vulkan::ImageHandle &h : g_gpu.hoistRetire.front())
+-                if (g_gpu.hoistFree.size() < 96u) { g_gpu.hoistFreeBytes += imageBytes(h); g_gpu.hoistFree.push_back(h); }
++            {
++                if (g_gpu.hoistFree.size() >= 256u) { g_gpu.hoistFreeBytes -= imageBytes(g_gpu.hoistFree.front()); g_gpu.hoistFree.erase(g_gpu.hoistFree.begin()); }
++                g_gpu.hoistFreeBytes += imageBytes(h); g_gpu.hoistFree.push_back(h);
++            }
+             g_gpu.hoistRetire.pop_front();
+             while (g_gpu.hoistFreeBytes > s_poolBytes && !g_gpu.hoistFree.empty())
+             {   // oldest first: the front is what retired longest ago
+@@ -1618,9 +1677,7 @@ namespace seamvk
+                     // overwritten by the next frame's hoist -- the opponent's HUD portrait vanished that way): recycled
+                     // through a 3-frame retire ring once the slot moves on
+                     const seamgs::RtDecode &r = f.rtDecodes[d.rt];
+-                    Vulkan::ImageHandle img;
+-                    for (size_t i = 0; i < g_gpu.hoistFree.size(); ++i)
+-                        if (g_gpu.hoistFree[i]->get_width() == r.w * rtNativeFactor(r) && g_gpu.hoistFree[i]->get_height() == r.h * rtNativeFactor(r)) { img = g_gpu.hoistFree[i]; g_gpu.hoistFreeBytes -= imageBytes(img); g_gpu.hoistFree[i] = g_gpu.hoistFree.back(); g_gpu.hoistFree.pop_back(); break; }
++                    Vulkan::ImageHandle img;   // (runRtDecode takes it from the free pool)
+                     runRtDecode(*cmd, dev, f, r, &img);
+                     g_gpu.decTexels += uint64_t(r.w) * r.h;
+                     hoistImg[d.rt] = img; ++k; ++g_gpu.decHoisted;
+@@ -1808,7 +1865,7 @@ namespace seamvk
+                     cmd->set_vertex_attrib(3, 0, VK_FORMAT_R32_SFLOAT, 36);
+                     cmd->set_vertex_attrib(4, 0, VK_FORMAT_R32G32_UINT, 40);   // [spriterect]
+                     const size_t bytes = size_t(d.count) * sizeof(seamgs::Vtx);
+-                    void *vb = cmd->allocate_vertex_data(0, bytes, sizeof(seamgs::Vtx));
++                    void *vb = vertexData(*cmd, dev, bytes, sizeof(seamgs::Vtx));
+                     std::memcpy(vb, f.verts.data() + d.vertOff, bytes);
+                     cmd->draw(d.count);
+                 }
+@@ -1826,7 +1883,7 @@ namespace seamvk
+                     if (s_flat) c1.misc[3] = 1.0f;   // PS2X_SEAMVK_FLAT=1: the seam's meshes in a flat colour per program (coverage diagnostics)
+                     bindConsts(*cmd, dev, &c1, 1);
+                     const float zero = 0.0f; cmd->push_constants(&zero, offsetof(PC, texInfo) + 8u, 4u);
+-                    void *vb = cmd->allocate_vertex_data(0, VkDeviceSize(64) * d.count, 64);
++                    void *vb = vertexData(*cmd, dev, VkDeviceSize(64) * d.count, 64);
+                     uint8_t *dst = static_cast<uint8_t *>(vb);
+                     const uint8_t *src = f.verts.data() + d.vertOff;
+                     for (uint32_t v = 0; v < d.count; ++v) { std::memcpy(dst + v * 64u, src + size_t(v) * d.stride, d.stride); if (d.stride < 64u) std::memset(dst + v * 64u + d.stride, 0, 64u - d.stride); }
+@@ -1841,7 +1898,9 @@ namespace seamvk
+                 // the visible surface, as in the interleaved order). Another program, a DATE / destination-alpha / feedback
+                 // state, or 128 chunks end the run. Each vertex carries its chunk index in inA3.w; the constants come from an array.
+                 struct Grp { std::vector<uint32_t> idx; uint64_t key; };
+-                static std::vector<Grp> grpA, grpB; grpA.clear(); grpB.clear();
++                // [grpreuse] the groups (and their idx capacity) live across runs; only the counts reset (clear() freed every
++                // idx vector ~400 times a frame and regrew it)
++                static std::vector<Grp> grpA, grpB; size_t nA = 0, nB = 0;
+                 // [batch] a bind-state hash keyed lookup instead of a linear sameBindState scan over the groups (4101 chunks x ~20 groups x 40 fields a frame)
+                 auto bindKey = [](const seamgs::State &a) {
+                     uint64_t h = 1469598103934665603ull;
+@@ -1859,11 +1918,11 @@ namespace seamvk
+                     if (e.kind != 1 || e.stride != 48u || e.prog != d.prog) break;
+                     if (j != di0 && ((e.st.date && !sameBindState(e.st, t)) || (e.st.abe && e.st.aC == 1u) || blendInShader(e.st) || e.st.texFromDrawn)) break;   // DATE chunks: only with the run's own state (one barrier per batch; tiles rarely overlap)
+                     if (nrun >= 1024u) break;
+-                    std::vector<Grp> &gs = e.hostPass == 0u ? grpA : grpB;
++                    std::vector<Grp> &gs = e.hostPass == 0u ? grpA : grpB; size_t &ng = e.hostPass == 0u ? nA : nB;
+                     Grp *g = nullptr;
+                     const uint64_t key = bindKey(e.st);
+-                    for (Grp &c : gs) if (c.key == key && sameBindState(f.draws[c.idx[0]].st, e.st)) { g = &c; break; }
+-                    if (!g) { gs.push_back(Grp()); g = &gs.back(); g->key = key; }
++                    for (size_t c = 0; c < ng; ++c) if (gs[c].key == key && sameBindState(f.draws[gs[c].idx[0]].st, e.st)) { g = &gs[c]; break; }
++                    if (!g) { if (ng == gs.size()) gs.emplace_back(); g = &gs[ng++]; g->key = key; g->idx.clear(); }
+                     g->idx.push_back((uint32_t)j); ++nrun;
+                 }
+                 di0 = j - 1;
+@@ -1881,7 +1940,7 @@ namespace seamvk
+                     uint32_t total = 0; for (uint32_t k : b) total += f.draws[k].count + 2u;
+                     // vertices stay at their 48-byte source stride, one block copy per chunk; the chunk index is found by
+                     // vertex range in the shader (Consts.range.x), so nothing is written per vertex
+-                    uint8_t *vb = static_cast<uint8_t *>(cmd->allocate_vertex_data(0, VkDeviceSize(48) * total, 48));
++                    uint8_t *vb = static_cast<uint8_t *>(vertexData(*cmd, dev, VkDeviceSize(48) * total, 48));
+                     static const bool s_flat = [](){ const char *v = std::getenv("PS2X_SEAMVK_FLAT"); return v && v[0] && v[0] != '0'; }();
+                     uint32_t o = 0;
+                     for (size_t k = 0; k < b.size(); ++k)
+@@ -1900,8 +1959,8 @@ namespace seamvk
+                     cmd->draw(o);
+                     ++g_gpu.draws; ++g_gpu.batches;
+                 };
+-                for (const Grp &g : grpA) issueBatch(g.idx);
+-                for (const Grp &g : grpB) issueBatch(g.idx);
++                for (size_t c = 0; c < nA; ++c) issueBatch(grpA[c].idx);
++                for (size_t c = 0; c < nB; ++c) issueBatch(grpB[c].idx);
+                 g_gpu.chunksBatched += nrun;
+                 continue;
+             }
+diff --git a/ps2xRuntime/src/lib/ps2_seamgs.cpp b/ps2xRuntime/src/lib/ps2_seamgs.cpp
+index a47cbe6..8bf13e2 100644
+--- a/ps2xRuntime/src/lib/ps2_seamgs.cpp
++++ b/ps2xRuntime/src/lib/ps2_seamgs.cpp
+@@ -616,8 +616,8 @@ namespace seamgs
+                     g_pageHash[p] = h;
+                 }
+                 g_list.vramPages.push_back((uint16_t)p);
+-                const size_t off = g_list.vramBytes.size(); g_list.vramBytes.resize(off + 8192u);
+-                std::memcpy(g_list.vramBytes.data() + off, g_vram + size_t(p) * 8192u, 8192u);
++                const uint8_t *src = g_vram + size_t(p) * 8192u;
++                g_list.vramBytes.insert(g_list.vramBytes.end(), src, src + 8192u);   // (resize + memcpy zero-filled the page first)
+             }
+             r.upCount = (uint32_t)g_list.vramPages.size() - r.upFirst;
+             Draw d; d.kind = 2; d.rt = (int32_t)g_list.rtDecodes.size(); d.st.tex = slot;

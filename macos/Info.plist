@@ -14,5 +14,6 @@
 	<key>LSApplicationCategoryType</key><string>public.app-category.action-games</string>
 	<key>NSHighResolutionCapable</key><true/>
 	<key>NSPrincipalClass</key><string>NSApplication</string>
+	<key>NSMicrophoneUsageDescription</key><string>Para el chat de voz con los jugadores de tu sala.</string>
 </dict>
 </plist>

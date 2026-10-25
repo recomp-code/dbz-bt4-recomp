@@ -1,0 +1,453 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index dfe609a..72c9dd8 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -1198,7 +1198,7 @@ if (_seamvk)
+         target_compile_definitions(ps2_runtime PRIVATE PS2X_SEAMVK_METALFX=1)
+         # as linker options: one more "-framework X" among the link libraries makes CMake deduplicate a "-framework" token
+         # away and leave FFmpeg's CoreVideo / CoreMedia bare
+-        target_link_options(ps2_runtime PUBLIC "LINKER:-framework,Metal" "LINKER:-framework,MetalFX")
++        target_link_options(ps2_runtime PUBLIC "LINKER:-framework,Metal" "LINKER:-framework,MetalFX" "LINKER:-framework,IOSurface" "LINKER:-framework,OpenGL")   # [macshare] IOSurface + CGL
+         message(STATUS "[metalfx] native renderer upscaler: Apple MetalFX (no FSR2 on macOS)")
+     endif()
+     # [dlss] NVIDIA DLSS for the native renderer through the NGX SDK (github.com/NVIDIA/DLSS), when it is there. The runtime
+diff --git a/ps2xRuntime/src/gfx/gs_resources.cpp b/ps2xRuntime/src/gfx/gs_resources.cpp
+index 8d2dd6c..040a1e9 100644
+--- a/ps2xRuntime/src/gfx/gs_resources.cpp
++++ b/ps2xRuntime/src/gfx/gs_resources.cpp
+@@ -72,7 +72,11 @@ namespace ps2x::gfx
+     {
+         bt3rlDrawRenderBatchActive();
+         bt3rlEnableFramebuffer(0);
++#if defined(__APPLE__)
++        bt3rlViewport(0, 0, bt3GetRenderWidth(), bt3GetRenderHeight());   // [retina] the window's framebuffer in pixels
++#else
+         bt3rlViewport(0, 0, bt3GetScreenWidth(), bt3GetScreenHeight());
++#endif
+     }
+ 
+     void GsRenderTarget::Unload()
+diff --git a/ps2xRuntime/src/gfx/gs_rt.cpp b/ps2xRuntime/src/gfx/gs_rt.cpp
+index abd4eee..a7b6c9e 100644
+--- a/ps2xRuntime/src/gfx/gs_rt.cpp
++++ b/ps2xRuntime/src/gfx/gs_rt.cpp
+@@ -159,10 +159,19 @@ namespace ps2x::gfx
+         bt3rlDisableFramebuffer();
+         const int rw = bt3GetRenderWidth() > 0 ? bt3GetRenderWidth() : 1;
+         const int rh = bt3GetRenderHeight() > 0 ? bt3GetRenderHeight() : 1;
++#if defined(__APPLE__)
++        // [retina] as SetupViewport on macOS: the viewport in framebuffer pixels (GetRenderWidth is points x the DPI
++        // scale there), the projection in points (what raylib draws in). Both in pixels put the picture in the
++        // top-left quarter of a Retina window.
++        const int ow = bt3GetScreenWidth() > 0 ? bt3GetScreenWidth() : 1;
++        const int oh = bt3GetScreenHeight() > 0 ? bt3GetScreenHeight() : 1;
++#else
++        const int ow = rw, oh = rh;
++#endif
+         bt3rlViewport(0, 0, rw, rh);
+         bt3rlMatrixMode(BT3RL_PROJECTION);
+         bt3rlLoadIdentity();
+-        bt3rlOrtho(0, rw, rh, 0, 0.0f, 1.0f);      // restore the WINDOW projection (was missing)
++        bt3rlOrtho(0, ow, oh, 0, 0.0f, 1.0f);      // restore the WINDOW projection (was missing)
+         bt3rlMatrixMode(BT3RL_MODELVIEW);
+         bt3rlLoadIdentity();
+     }
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index fed72bc..8bc614a 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1617,6 +1617,13 @@ bool PS2Runtime::initialize(const char *title)
+             std::fprintf(stderr, "[winmode] mode=%d monitor=%d size=%dx%d\n",
+                          winMode, winMonitor, hostWinW, hostWinH);
+         }
++#if defined(__APPLE__)
++        // [retina] the window's framebuffer in the display's real pixels (2x on a Retina screen; raylib keeps drawing in
++        // points and scales its viewport by GetWindowScaleDPI). Before, macOS stretched a points-sized frame to the screen.
++        // PS2X_RETINA=0: the points-sized framebuffer as before (less GPU per frame on a big display).
++        static const bool s_retina = [](){ const char *v = std::getenv("PS2X_RETINA"); return !(v && v[0] == '0'); }();
++        if (!ps2_gslive::requested() && s_retina) bt3SetConfigFlags(FLAG_WINDOW_HIGHDPI);
++#endif
+         ps2xHostPrepareWindow();   // [window] DPI hints must precede the window (SDL init happens inside)
+         _mark("sdl hints");
+         bt3InitWindow(hostWinW, hostWinH, title);
+@@ -9103,11 +9110,20 @@ void PS2Runtime::run()
+             // (glGenerateMipmap per present, ~0.1 ms on a desktop GPU). Upscales keep the point sampling the GL path has.
+             // PS2X_PGS_PRESENTMIP=0 disables the mip path (bilinear only).
+             static const bool s_mip = [](){ const char *v = std::getenv("PS2X_PGS_PRESENTMIP"); return !(v && v[0] == '0'); }();
+-            const float ratio = std::max(srcWidth / std::max(1.0f, dstWidth), srcHeight / std::max(1.0f, dstHeight));
+-            ps2x_pgs::setPresentSize(uint32_t(dstWidth + 0.5f), uint32_t(dstHeight + 0.5f));
+-            seamvk::setPresentSize(uint32_t(dstWidth + 0.5f), uint32_t(dstHeight + 0.5f));   // [standalone]
++#if defined(__APPLE__)
++            // [retina] dst is in points; the framebuffer has GetRenderWidth / GetScreenWidth pixels per point (2 on Retina)
++            const float dpk = float(bt3GetRenderWidth()) / float(std::max(1, bt3GetScreenWidth()));
++#else
++            const float dpk = 1.0f;
++#endif
++            const float ratio = std::max(srcWidth / std::max(1.0f, dstWidth * dpk), srcHeight / std::max(1.0f, dstHeight * dpk));
++            ps2x_pgs::setPresentSize(uint32_t(dstWidth * dpk + 0.5f), uint32_t(dstHeight * dpk + 0.5f));
++            seamvk::setPresentSize(uint32_t(dstWidth * dpk + 0.5f), uint32_t(dstHeight * dpk + 0.5f));   // [standalone] the upscaler's target, in pixels
+             if (s_mip && ratio > 1.5f) { bt3GenTextureMipmaps(pgsTexPtr); bt3SetTextureFilter(*pgsTexPtr, TEXTURE_FILTER_TRILINEAR); }
+             else if (ratio > 1.001f) bt3SetTextureFilter(*pgsTexPtr, TEXTURE_FILTER_BILINEAR);
++#if defined(__APPLE__)
++            else if (ratio < 0.999f && seamvk::on()) bt3SetTextureFilter(*pgsTexPtr, TEXTURE_FILTER_BILINEAR);   // [retina] a MetalFX frame below the window's pixels (PS2X_METALFX_OUT)
++#endif
+             else bt3SetTextureFilter(*pgsTexPtr, TEXTURE_FILTER_POINT);
+         }
+         else if (GsGpuRenderer::renderScale() > 1)
+diff --git a/ps2xRuntime/src/lib/ps2_seamvk.cpp b/ps2xRuntime/src/lib/ps2_seamvk.cpp
+index 506d224..92048a6 100644
+--- a/ps2xRuntime/src/lib/ps2_seamvk.cpp
++++ b/ps2xRuntime/src/lib/ps2_seamvk.cpp
+@@ -41,6 +41,9 @@ namespace ps2_seamvk_metalfx
+     float maxScale(VkDevice dev, PFN_vkGetDeviceProcAddr gdpa);
+     bool run(VkDevice dev, VkQueue queue, PFN_vkGetDeviceProcAddr gdpa, VkImage color, VkImage depth, VkImage motion, VkImage out,
+              uint32_t inW, uint32_t inH, uint32_t outW, uint32_t outH, float jx, float jy, bool reset);
++    bool glReady();
++    bool glUsable();
++    bool publish(VkDevice dev, VkQueue queue, PFN_vkGetDeviceProcAddr gdpa, VkImage image, uint32_t w, uint32_t h);   // [macshare]
+ }
+ #endif
+ #if defined(PS2X_SEAMVK_DLSS)   // [dlss] NVIDIA's NGX SDK (github.com/NVIDIA/DLSS), when the build found it
+@@ -56,6 +59,7 @@ namespace ps2_seamvk_metalfx
+ #include <unordered_map>
+ #include <atomic>
+ extern std::atomic<uint64_t> g_bt3FrameCount;   // game_overrides.cpp: the game's frame counter
++extern std::atomic<int> g_ps2VStepMode;          // ps2_stepcensus.cpp: [fps60] 1 = the 60 fps mode is on
+ #include <chrono>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -2941,7 +2945,20 @@ namespace seamvk
+         bool presReady = false;   // pres already in TRANSFER_SRC_OPTIMAL
+         if (upscaleMode())
+         {
+-            const uint32_t pw = g_presentW.load(std::memory_order_relaxed), ph = g_presentH.load(std::memory_order_relaxed);
++            uint32_t pw = g_presentW.load(std::memory_order_relaxed), ph = g_presentH.load(std::memory_order_relaxed);
++#if defined(PS2X_SEAMVK_METALFX)
++            {   // [retina] MetalFX fills at most a pixel budget of the window and the window's bilinear present the rest: a Retina
++                // fullscreen is 7.7 Mpx and MetalFX's cost follows its output. Unlimited at 30 fps; 3.8 Mpx in the 60 fps mode,
++                // measured on an M2 Pro fullscreen (3456x2234, 60 fps mode): 7.7 Mpx = 55.7 fps (MetalFX 4.2 ms), 5.6 Mpx = 57.5,
++                // 4.3 Mpx = 58..60, 1.9 Mpx = 59.9. A non-Retina window stays under it. Follows the mode live (the F1 switch).
++                // PS2X_METALFX_OUT=<0.5..1> fixes the per-axis fraction instead.
++                static const float s_out = [](){ const char *v = std::getenv("PS2X_METALFX_OUT"); const float f = v && v[0] ? float(std::atof(v)) : 0.0f; return f <= 0.0f ? 0.0f : f < 0.5f ? 0.5f : f > 1.0f ? 1.0f : f; }();
++                const double px = double(pw) * double(ph), budget = 3.8e6;
++                const float out = s_out > 0.0f ? s_out
++                                : g_ps2VStepMode.load(std::memory_order_relaxed) != 0 && px > budget ? float(std::sqrt(budget / px)) : 1.0f;
++                if (out < 1.0f) { pw = std::max(g_gpu.w, uint32_t(float(pw) * out + 0.5f)); ph = std::max(g_gpu.h, uint32_t(float(ph) * out + 0.5f)); }
++            }
++#endif
+             if (pw >= g_gpu.w && ph >= g_gpu.h && pw <= g_gpu.w * 3u && ph <= g_gpu.h * 3u)
+             {
+                 if (!g_gpu.up || g_gpu.up->get_width() != pw || g_gpu.up->get_height() != ph)
+@@ -3159,6 +3176,15 @@ namespace seamvk
+                     }
+ #endif
+                     g_gpu.upActive = done;   // [jitter] next frame jitters only behind a working temporal upscaler
++#if defined(PS2X_SEAMVK_METALFX)
++                    if (done && ps2_seamvk_metalfx::glReady())
++                    {   // [macshare] the window's texture reads alpha as 1 itself (swizzle): no full-size alpha pass over the output
++                        cmd->image_barrier(*g_gpu.up, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
++                                           VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
++                        pres = g_gpu.up.get();
++                    }
++                    else
++#endif
+                     if (done)
+                     {   // the upscaler writes RGB only; the window blends by alpha, so alpha := 1 (a write-mask-A blit of white)
+                         cmd->image_barrier(*g_gpu.up, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+@@ -3246,6 +3272,11 @@ namespace seamvk
+             }
+         }
+         slot.noReadback = shareSlot >= 0 || shareSkip;
++#if defined(PS2X_SEAMVK_METALFX)
++        // [macshare] the window takes the frame from an IOSurface (ps2_seamvk_metalfx.mm): no CPU readback once that works
++        const bool macShare = ps2_seamvk_metalfx::glUsable();
++        if (ps2_seamvk_metalfx::glReady()) slot.noReadback = true;
++#endif
+         if (!slot.noReadback)
+         {
+             if (!slot.buf || slot.w != w || slot.h != h)
+@@ -3261,6 +3292,13 @@ namespace seamvk
+         if (!g_gpu.tsCur.empty()) { g_gpu.tsPending.emplace_back(); g_gpu.tsPending.back().swap(g_gpu.tsCur); }
+         g_gpu.tsCur.clear();
+         dev.submit(cmd, &slot.fence);
++#if defined(PS2X_SEAMVK_METALFX)
++        if (macShare)
++        {   // [macshare] the frame on the queue now (MoltenVK commits it inside vkQueueSubmit), the IOSurface copy behind it
++            dev.flush_frame();
++            ps2_seamvk_metalfx::publish(dev.get_device(), dev.get_queue_info().queues[Vulkan::QUEUE_INDEX_GRAPHICS], vkGetDeviceProcAddr, pres->get_image(), w, h);
++        }
++#endif
+         if (shareSlot >= 0)
+         {   // [glshare] a fresh semaphore signalled after the copy; GL imports and waits it before sampling
+             Vulkan::Semaphore sem = dev.request_semaphore_external(VK_SEMAPHORE_TYPE_BINARY, Vulkan::ExternalHandle::get_opaque_semaphore_handle_type());
+diff --git a/ps2xRuntime/src/lib/ps2_seamvk_gl.cpp b/ps2xRuntime/src/lib/ps2_seamvk_gl.cpp
+index 5a884fb..452dba0 100644
+--- a/ps2xRuntime/src/lib/ps2_seamvk_gl.cpp
++++ b/ps2xRuntime/src/lib/ps2_seamvk_gl.cpp
+@@ -25,6 +25,9 @@
+ #define PS2X_GLAPI
+ #endif
+ 
++#if defined(PS2X_SEAMVK_METALFX)
++namespace ps2_seamvk_metalfx { uint32_t glPresent(uint32_t &w, uint32_t &h); }   // [macshare] ps2_seamvk_metalfx.mm
++#endif
+ namespace seamvk
+ {
+     namespace
+@@ -184,6 +187,9 @@ namespace seamvk
+ 
+     uint32_t sharedPresent(void *(*glGetProc)(const char *), uint32_t &w, uint32_t &h)
+     {
++#if defined(PS2X_SEAMVK_METALFX)
++        return ::ps2_seamvk_metalfx::glPresent(w, h);   // [macshare] macOS: IOSurfaces instead of GL_EXT_memory_object
++#endif
+         if (g_state == 0) g_state = init(glGetProc);
+         if (g_state != 1) return 0;
+         for (size_t i = 0; i < g_retire.size();)
+diff --git a/ps2xRuntime/src/lib/ps2_seamvk_metalfx.mm b/ps2xRuntime/src/lib/ps2_seamvk_metalfx.mm
+index 8a85e32..2caf942 100644
+--- a/ps2xRuntime/src/lib/ps2_seamvk_metalfx.mm
++++ b/ps2xRuntime/src/lib/ps2_seamvk_metalfx.mm
+@@ -5,12 +5,19 @@
+ // of the frame, with no copy, no semaphore and no CPU wait. Same inputs as DLSS / FSR2: the composed colour, the
+ // game's real depth (inverted) and motion (render pixels, towards the previous frame), and the sub-pixel jitter.
+ #define VK_USE_PLATFORM_METAL_EXT
++#define GL_SILENCE_DEPRECATION
+ #import <Metal/Metal.h>
+ #import <MetalFX/MetalFX.h>
++#import <IOSurface/IOSurface.h>
++#import <OpenGL/OpenGL.h>
++#import <OpenGL/gl3.h>
++#import <OpenGL/CGLIOSurface.h>
+ #include <vulkan/vulkan.h>
+ 
++#include <atomic>
+ #include <cstdio>
+ #include <cstdlib>
++#include <mutex>
+ 
+ namespace ps2_seamvk_metalfx
+ {
+@@ -94,8 +101,199 @@ namespace ps2_seamvk_metalfx
+         id<MTLCommandBuffer> cb = [g.queue commandBuffer];
+         cb.label = @"MetalFX temporal";
+         [s encodeToCommandBuffer:cb];
++        static const bool s_timing = [](){ const char *v = std::getenv("PS2X_METALFX_TIMING"); return v && v[0] == '1'; }();   // diagnostics
++        if (s_timing)
++            [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
++                static double s_sum = 0; static int s_n = 0;
++                s_sum += (c.GPUEndTime - c.GPUStartTime) * 1000.0;
++                if (++s_n == 120) { std::fprintf(stderr, "[metalfx] GPU %.2f ms per frame (%ux%u -> %ux%u)\n", s_sum / s_n, g.inW, g.inH, g.outW, g.outH); s_sum = 0; s_n = 0; }
++            }];
+         [cb commit];
+         g.state = 1;
+         return true;
+     }
+ }
++
++// [macshare] The native renderer's zero-copy present on macOS: the Mac counterpart of [glshare] (no GL_EXT_memory_object
++// there). Each frame the presented Vulkan image is copied by a Metal blit, on the renderer's own queue behind the frame,
++// into one of a few IOSurfaces; the window's GL context binds the newest finished one (CGLTexImageIOSurface2D) and copies
++// it, still on the GPU, into the 2D texture the present samples. Before, the frame went GPU -> CPU -> GL every frame: 31 MB
++// at a Retina fullscreen, which held a 60 fps fight to ~50.
++namespace ps2_seamvk_metalfx
++{
++    namespace
++    {
++        constexpr int kSlots = 3;
++        struct Slot
++        {
++            IOSurfaceRef surf = nullptr;
++            id<MTLTexture> tex = nil;          // RGBA8 over the surface (the Vulkan image's bytes)
++            uint32_t w = 0, h = 0, gen = 0;
++            int st = 0;                        // 0 free, 1 being written, 2 ready, 3 taken by GL
++            uint64_t seq = 0;
++        };
++        std::mutex g_mtx;
++        Slot g_slots[kSlots];
++        uint64_t g_seq = 0;
++        std::atomic<int> g_glState{0};         // 0 untried, 1 GL side working, -1 unavailable
++        id<MTLCommandQueue> g_queue = nil;
++
++        IOSurfaceRef makeSurface(uint32_t w, uint32_t h)
++        {
++            NSDictionary *d = @{ (id)kIOSurfaceWidth: @(w), (id)kIOSurfaceHeight: @(h), (id)kIOSurfaceBytesPerElement: @4,
++                                 (id)kIOSurfacePixelFormat: @((uint32_t)'BGRA') };   // CGL binds BGRA surfaces only
++            return IOSurfaceCreate((__bridge CFDictionaryRef)d);
++        }
++    }
++
++    // glReady: the GL side has bound a surface at least once (only then does the frame skip the CPU readback).
++    bool glReady() { return g_glState.load(std::memory_order_acquire) == 1; }
++    // glUsable: worth publishing (the GL side has not given up); the readback stays until glReady.
++    bool glUsable() { return g_glState.load(std::memory_order_acquire) >= 0; }
++
++    // publish: after the frame's submission (MoltenVK commits it inside vkQueueSubmit), copy the presented image into a
++    // free surface on the same Metal queue; it becomes ready when the GPU is done. false: nothing free (the GL side
++    // still holds them all): this frame is not shown, as with [glshare].
++    bool publish(VkDevice dev, VkQueue queue, PFN_vkGetDeviceProcAddr gdpa, VkImage image, uint32_t w, uint32_t h)
++    {
++        if (!g.exportObjects && gdpa) g.exportObjects = (PFN_vkExportMetalObjectsEXT)gdpa(dev, "vkExportMetalObjectsEXT");
++        if (!g.exportObjects) return false;
++        if (!g_queue)
++        {
++            VkExportMetalCommandQueueInfoEXT q = { VK_STRUCTURE_TYPE_EXPORT_METAL_COMMAND_QUEUE_INFO_EXT };
++            q.queue = queue;
++            VkExportMetalObjectsInfoEXT o = { VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT };
++            o.pNext = &q;
++            g.exportObjects(dev, &o);
++            g_queue = q.mtlCommandQueue;
++            if (!g_queue) return false;
++        }
++        id<MTLTexture> src = texture(dev, image);
++        if (!src) return false;
++        int si = -1;
++        {
++            std::lock_guard<std::mutex> lk(g_mtx);
++            for (int i = 0; i < kSlots; ++i) if (g_slots[i].st == 0) { si = i; break; }
++            if (si < 0) return false;
++            g_slots[si].st = 1;
++        }
++        Slot &s = g_slots[si];   // being written: only this thread touches it until the completion handler
++        if (!s.surf || s.w != w || s.h != h)
++        {
++            if (s.surf) CFRelease(s.surf);
++            s.surf = makeSurface(w, h);
++            MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:w height:h mipmapped:NO];
++            td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
++            td.storageMode = MTLStorageModeShared;
++            s.tex = s.surf ? [g_queue.device newTextureWithDescriptor:td iosurface:s.surf plane:0] : nil;
++            s.w = w; s.h = h; ++s.gen;
++            if (!s.tex) { std::lock_guard<std::mutex> lk(g_mtx); s.st = 0; return false; }
++        }
++        id<MTLCommandBuffer> cb = [g_queue commandBuffer];
++        cb.label = @"present to IOSurface";
++        id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
++        [bl copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
++                  toTexture:s.tex destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
++        [bl endEncoding];
++        const int slot = si;
++        [cb addCompletedHandler:^(id<MTLCommandBuffer>) {
++            std::lock_guard<std::mutex> lk(g_mtx);
++            for (int i = 0; i < kSlots; ++i) if (i != slot && g_slots[i].st == 2) g_slots[i].st = 0;   // superseded before GL took it
++            g_slots[slot].st = 2; g_slots[slot].seq = ++g_seq;
++        }];
++        [cb commit];
++        return true;
++    }
++
++    namespace
++    {
++        struct GlSlot { GLuint rect = 0; uint32_t gen = 0, w = 0, h = 0; };
++        GlSlot g_gl[kSlots];
++        GLuint g_tex2d = 0, g_fbRead = 0, g_fbDraw = 0; uint32_t g_w2d = 0, g_h2d = 0;
++        int g_shown = -1;
++        struct Retire { int slot; GLsync fence; };
++        Retire g_retire[kSlots * 2]; int g_nRetire = 0;
++    }
++
++    // glPresent: called by seamvk::sharedPresent from the window's GL thread each present. The newest ready surface is
++    // copied into a 2D texture (R and B swizzled back: the surface holds RGBA bytes that CGL reads as BGRA) and its id is
++    // returned; 0 = nothing yet (the caller keeps the readback path).
++    uint32_t glPresent(uint32_t &w, uint32_t &h)
++    {
++        if (g_glState.load() < 0) return 0;
++        CGLContextObj ctx = CGLGetCurrentContext();
++        if (!ctx) { g_glState = -1; return 0; }
++        for (int i = 0; i < g_nRetire;)
++        {   // a surface the window stopped showing: back to Metal once GL is past its last read
++            const GLenum r = glClientWaitSync(g_retire[i].fence, 0, 0);
++            if (r == GL_ALREADY_SIGNALED || r == GL_CONDITION_SATISFIED)
++            {
++                glDeleteSync(g_retire[i].fence);
++                { std::lock_guard<std::mutex> lk(g_mtx); g_slots[g_retire[i].slot].st = 0; }
++                g_retire[i] = g_retire[--g_nRetire];
++            }
++            else ++i;
++        }
++        int take = -1; uint32_t sw = 0, sh = 0, sgen = 0; IOSurfaceRef surf = nullptr;
++        {
++            std::lock_guard<std::mutex> lk(g_mtx);
++            uint64_t best = 0;
++            for (int i = 0; i < kSlots; ++i) if (g_slots[i].st == 2 && g_slots[i].seq > best) { best = g_slots[i].seq; take = i; }
++            if (take >= 0) { g_slots[take].st = 3; sw = g_slots[take].w; sh = g_slots[take].h; sgen = g_slots[take].gen; surf = g_slots[take].surf; }
++        }
++        if (take >= 0)
++        {
++            GLint prevRead = 0, prevDraw = 0, prevTex = 0, prevRect = 0;
++            glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevRead); glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevDraw);
++            glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex); glGetIntegerv(GL_TEXTURE_BINDING_RECTANGLE, &prevRect);
++            const GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
++            GlSlot &gs = g_gl[take];
++            bool ok = true;
++            if (!gs.rect || gs.gen != sgen || gs.w != sw || gs.h != sh)
++            {
++                if (!gs.rect) glGenTextures(1, &gs.rect);
++                glBindTexture(GL_TEXTURE_RECTANGLE, gs.rect);
++                ok = CGLTexImageIOSurface2D(ctx, GL_TEXTURE_RECTANGLE, GL_RGBA8, GLsizei(sw), GLsizei(sh), GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, surf, 0) == kCGLNoError;
++                gs.gen = sgen; gs.w = sw; gs.h = sh;
++            }
++            if (ok && (!g_tex2d || g_w2d != sw || g_h2d != sh))
++            {
++                if (!g_tex2d) { glGenTextures(1, &g_tex2d); glGenFramebuffers(1, &g_fbRead); glGenFramebuffers(1, &g_fbDraw); }
++                glBindTexture(GL_TEXTURE_2D, g_tex2d);
++                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, GLsizei(sw), GLsizei(sh), 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
++                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_BLUE); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_RED);
++                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, GL_ONE);   // opaque: the renderer skips its alpha := 1 pass (ps2_seamvk.cpp)
++                g_w2d = sw; g_h2d = sh;
++            }
++            if (ok)
++            {   // GPU copy, surface -> 2D (component for component: the swizzle on the 2D texture puts R and B back)
++                glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbRead);
++                glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_RECTANGLE, gs.rect, 0);
++                glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_fbDraw);
++                glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_tex2d, 0);
++                if (scissor) glDisable(GL_SCISSOR_TEST);
++                glBlitFramebuffer(0, 0, GLint(sw), GLint(sh), 0, 0, GLint(sw), GLint(sh), GL_COLOR_BUFFER_BIT, GL_NEAREST);
++                if (scissor) glEnable(GL_SCISSOR_TEST);
++                ok = glGetError() == GL_NO_ERROR;
++            }
++            glBindFramebuffer(GL_READ_FRAMEBUFFER, GLuint(prevRead)); glBindFramebuffer(GL_DRAW_FRAMEBUFFER, GLuint(prevDraw));
++            glBindTexture(GL_TEXTURE_2D, GLuint(prevTex)); glBindTexture(GL_TEXTURE_RECTANGLE, GLuint(prevRect));
++            // the surface is free for Metal once this copy is done on the GPU
++            if (g_nRetire < kSlots * 2) g_retire[g_nRetire++] = Retire{ take, glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0) };
++            else { std::lock_guard<std::mutex> lk(g_mtx); g_slots[take].st = 0; }
++            if (!ok)
++            {
++                if (g_glState.load() == 0) std::fprintf(stderr, "[macshare] the GL context cannot take an IOSurface: CPU readback\n");
++                g_glState = -1;
++                return 0;
++            }
++            if (g_glState.exchange(1) != 1) std::fprintf(stderr, "[macshare] zero-copy present: IOSurface %ux%u\n", sw, sh);
++            g_shown = take;
++        }
++        if (!g_tex2d || g_shown < 0) return 0;
++        w = g_w2d; h = g_h2d;
++        return g_tex2d;
++    }
++}
+diff --git a/ps2xRuntime/third_party/bt3gl/src/platforms/rcore_desktop_sdl.c b/ps2xRuntime/third_party/bt3gl/src/platforms/rcore_desktop_sdl.c
+index 3d4e7fe..280e162 100644
+--- a/ps2xRuntime/third_party/bt3gl/src/platforms/rcore_desktop_sdl.c
++++ b/ps2xRuntime/third_party/bt3gl/src/platforms/rcore_desktop_sdl.c
+@@ -1075,8 +1075,16 @@ Vector2 GetWindowScaleDPI(void)
+ #ifndef PLATFORM_DESKTOP_SDL3
+     // NOTE: SDL_GetWindowDisplayScale was only added on SDL3
+     //       see https://wiki.libsdl.org/SDL3/SDL_GetWindowDisplayScale
+-    // TODO: Implement the window scale factor calculation manually.
+-    TRACELOG(LOG_WARNING, "GetWindowScaleDPI() not implemented on target platform");
++    // [retina] SDL2: the GL drawable over the window's size. On a Mac window created with SDL_WINDOW_ALLOW_HIGHDPI
++    // (FLAG_WINDOW_HIGHDPI) that is 2 on a Retina display, and rcore's viewport, scissor and screen reads (all
++    // __APPLE__-scaled by this) then cover the real pixels while drawing stays in points. 1 everywhere else.
++    if (platform.window != NULL)
++    {
++        int ww = 0, wh = 0, dw = 0, dh = 0;
++        SDL_GetWindowSize(platform.window, &ww, &wh);
++        SDL_GL_GetDrawableSize(platform.window, &dw, &dh);
++        if ((ww > 0) && (wh > 0) && (dw > 0) && (dh > 0)) { scale.x = (float)dw/(float)ww; scale.y = (float)dh/(float)wh; }
++    }
+ #else
+     scale.x = SDL_GetWindowDisplayScale(platform.window);
+     scale.y = scale.x;

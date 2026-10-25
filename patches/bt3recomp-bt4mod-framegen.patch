@@ -1,0 +1,523 @@
+diff --git a/ps2xRuntime/src/lib/ps2_seamvk.cpp b/ps2xRuntime/src/lib/ps2_seamvk.cpp
+index 9e095f3..f76539c 100644
+--- a/ps2xRuntime/src/lib/ps2_seamvk.cpp
++++ b/ps2xRuntime/src/lib/ps2_seamvk.cpp
+@@ -139,6 +139,9 @@ namespace seamvk
+         };
+         const uint32_t kUpAuxFrag[] = {    // [upscale] depth + motion in the composed frame's space
+ #include "seamvk/upaux.frag.inc"
++        };
++        const uint32_t kFgMidFrag[] = {    // [framegen] the frame halfway between two presented frames
++#include "seamvk/fgmid.frag.inc"
+         };
+         struct MvPC { float view[4], batch[4], misc[4]; };   // seam_mv.vert / .frag
+         struct RtPC { uint32_t tex[4], clut[4], src[4], texa[4]; };
+@@ -167,7 +170,9 @@ namespace seamvk
+             Vulkan::BufferHandle vring[3]; uint8_t *vmap[3] = {}; VkDeviceSize voff = 0;   // [vring] the same for vertex data (slot = cslot)
+             // [upscale] the upscaler's inputs: motion vectors in target space (mv pass), then depth and motion in the composed
+             // frame's space (upaux), and the upscaled output at the window's size
+-            Vulkan::Program *progMv = nullptr, *progUpAux = nullptr;
++            Vulkan::Program *progMv = nullptr, *progUpAux = nullptr, *progFgMid = nullptr;
++            Vulkan::ImageHandle fgPrev, fgMid;   // [framegen] the last presented frame, and the generated one
++            std::chrono::steady_clock::time_point fgLast{}; double fgMs = 16.7;   // [framegen] the game's frame interval (EMA)
+             Vulkan::ImageHandle mv, mvZ, upDepth, upMv, up;   // mvZ: the motion pass's own depth
+             Vulkan::ImageHandle prevOut; bool prevOutValid = false; uint32_t prevShown = 0;   // [mvcheck] the previous composed frame (diagnostics only)
+             uint32_t prevDb[2] = {}; bool prevDbValid = false;   // [mvofs] last frame's display start (DBX, DBY) in composeAux
+@@ -329,8 +334,15 @@ namespace seamvk
+         // [glshare] The shared present images (ps2_seamvk.h). A slot is FREE (only the GS thread touches it), READY (copied,
+         // its semaphore exported, not yet taken: a newer frame supersedes it) or TAKEN (GL samples it until it releases it).
+         // One fresh binary semaphore per frame, as Granite's own GL interop test does: a frame GL skips just closes its handle.
+-        struct ShareSlot { Vulkan::ImageHandle img; uint32_t w = 0, h = 0, gen = 0; uint64_t memSize = 0, gframe = 0; intptr_t mem = -1, sem = -1; int st = 0; };   // st: 0 free, 1 ready, 2 taken
+-        constexpr int kShareSlots = 4;
++        // [framegen] seq: publication order; due: not shown before (steady_clock ns; 0 = at once). GL takes the newest due frame
++        // and drops the older ready ones, so a generated frame and the real one behind it wait in order.
++        struct ShareSlot { Vulkan::ImageHandle img; uint32_t w = 0, h = 0, gen = 0; uint64_t memSize = 0, gframe = 0, seq = 0; int64_t due = 0; intptr_t mem = -1, sem = -1; int st = 0; };   // st: 0 free, 1 ready, 2 taken
++        constexpr int kShareSlots = 6;
++        uint64_t g_shareSeq = 0;
++        // [framegen] PS2X_SEAMVK_FRAMEGEN=1: a generated frame between every two (glshare only), the window loop at
++        // PS2X_FRAMEGEN_HZ (default 120)
++        std::atomic<bool> g_fgAllowed{true};   // [framegen] off on a display under 90 Hz (setFrameGenAllowed)
++        bool frameGen() { static const bool s = [](){ const char *v = std::getenv("PS2X_SEAMVK_FRAMEGEN"); return v && v[0] == '1'; }(); return s && g_fgAllowed.load(std::memory_order_relaxed); }
+         std::mutex g_shareMtx; ShareSlot g_share[kShareSlots]; std::atomic<bool> g_shareOn{false};
+         void closeExternal(intptr_t &h)
+         {
+@@ -563,6 +575,10 @@ namespace seamvk
+                     uf.sets[0].sampled_image_mask = (1u << 0) | (1u << 1); uf.sets[0].meta[0].array_size = 1; uf.sets[0].meta[1].array_size = 1;
+                     uf.input_mask = 0x1u; uf.output_mask = 0x3u; uf.push_constant_size = sizeof(PresentPC);
+                     g_gpu.progUpAux = dev.request_program(kPresentVert, sizeof(kPresentVert), kUpAuxFrag, sizeof(kUpAuxFrag), &pv, &uf);
++                    Vulkan::ResourceLayout gf = {};   // [framegen] current (0), previous (1), motion (2) -> one output
++                    gf.sets[0].sampled_image_mask = 7u; gf.sets[0].meta[0].array_size = gf.sets[0].meta[1].array_size = gf.sets[0].meta[2].array_size = 1;
++                    gf.input_mask = 0x1u; gf.output_mask = 0x1u; gf.push_constant_size = sizeof(PresentPC);
++                    g_gpu.progFgMid = dev.request_program(kPresentVert, sizeof(kPresentVert), kFgMidFrag, sizeof(kFgMidFrag), &pv, &gf);
+                 }
+                 if (!g_gpu.progSeam || !g_gpu.progGs || !g_gpu.progSeamSt || !g_gpu.progGsSt || !g_gpu.progPresent || !g_gpu.progRt || !g_gpu.progAlias || !g_gpu.progOutline || !g_gpu.progOutlineH || !g_gpu.progDepthMask || !g_gpu.progVram || !g_gpu.vram) { g_gpu.failed = true; std::fprintf(stderr, "[seamvk] shader program creation FAILED\n"); return false; }
+                 const uint32_t whitePx = 0xFFFFFFFFu;
+@@ -1995,6 +2011,12 @@ namespace seamvk
+     }
+     static std::atomic<bool> g_dumpReq{false};   // [dumpkey] set from the main loop (F10), consumed by renderFrame
+     void requestDump() { g_dumpReq.store(true, std::memory_order_release); }
++    void setFrameGenAllowed(bool on) { g_fgAllowed.store(on, std::memory_order_relaxed); }
++    int frameGenHz()
++    {
++        static const int hz = [](){ const char *v = std::getenv("PS2X_FRAMEGEN_HZ"); const int n = v && v[0] ? std::atoi(v) : 120; return n < 60 ? 60 : n > 360 ? 360 : n; }();
++        return on() && frameGen() ? hz : 0;
++    }
+ 
+     uint64_t lastFrameGframe() { std::lock_guard<std::mutex> lk(g_mtx); return g_frameGframe; }   // [presentlat]
+ 
+@@ -2200,15 +2222,25 @@ namespace seamvk
+     {
+         if (!on()) return;
+         const PrivRegs pr = composePriv();
+-        {   // [pacing] frames that came more than 25 ms after the previous one (the PCSX2 host's "hitches>25ms"), per second
++        {   // [pacing] frames that came more than 25 ms after the previous one (the PCSX2 host's "hitches>25ms"), per second.
++            // A hitch is late against the game's own rate: more than 25 ms AND more than 1.5x the median of the last 32
++            // intervals -- the game's 30 fps cut-scenes (33 ms every frame) counted every frame as a hitch before.
+             static std::chrono::steady_clock::time_point s_last{}, s_win{};
+             static uint32_t s_hitch = 0, s_frames = 0; static double s_worst = 0.0;
++            static double s_ring[32] = {}; static uint32_t s_ringN = 0;
+             const auto now = std::chrono::steady_clock::now();
+             if (s_last.time_since_epoch().count())
+             {
+                 const double ms = std::chrono::duration<double, std::milli>(now - s_last).count();
+-                if (ms > 25.0) ++s_hitch;
++                double med = 16.7;
++                if (s_ringN >= 8u)
++                {
++                    double tmp[32]; const uint32_t n = std::min<uint32_t>(s_ringN, 32u);
++                    std::copy(s_ring, s_ring + n, tmp); std::nth_element(tmp, tmp + n / 2, tmp + n); med = tmp[n / 2];
++                }
++                if (ms > 25.0 && ms > 1.5 * med) ++s_hitch;
+                 s_worst = std::max(s_worst, ms);
++                s_ring[s_ringN++ % 32u] = ms;
+             }
+             s_last = now; ++s_frames;
+             if (!s_win.time_since_epoch().count()) s_win = now;
+@@ -2530,8 +2562,9 @@ namespace seamvk
+         const auto tL0 = std::chrono::steady_clock::now();
+         {   // [mvpass] the frame the CRTC shows (circuit 1, else 2) and, below, the depth image its passes drew with
+             const uint64_t shown = (priv.pmode & 1u) ? priv.dispfb1 : priv.dispfb2;
+-            g_gpu.mvFbp = upscaleMode() ? (uint32_t)(shown & 0x1FFu) * 32u : ~0u; g_gpu.mvDepth = nullptr; g_gpu.nMvBatches = 0;
+-            if (upscaleMode())
++            const bool wantMotion = upscaleMode() || frameGen();   // [framegen] the generated frames need the motion too
++            g_gpu.mvFbp = wantMotion ? (uint32_t)(shown & 0x1FFu) * 32u : ~0u; g_gpu.mvDepth = nullptr; g_gpu.nMvBatches = 0;
++            if (wantMotion)
+             {   // The 3D scene's target is the one most seam meshes went to this frame, not necessarily the CRTC's: the game draws
+                 // its scene into 0xe00 and shows 0x0 and 0xe00 in turn, so on every other frame the shown buffer held no meshes,
+                 // the motion pass found nothing and the upscaler dropped its history (reset) every second frame.
+@@ -2863,7 +2896,7 @@ namespace seamvk
+             ++g_gpu.draws; g_gpu.verts += d.count;
+         }
+         if (inPass) cmd->end_render_pass();
+-        if (upscaleMode())
++        if (upscaleMode() || frameGen())
+         {   // [mvpass] PS2X_SEAMVK_MVCHECK=1: every 300th frame, the motion both ways (fresh copies vs [mvreuse]) compared on the CPU
+             static const bool s_check = [](){ const char *v = std::getenv("PS2X_SEAMVK_MVCHECK"); return v && v[0] == '1'; }();
+             static uint32_t s_n = 0;
+@@ -2948,6 +2981,12 @@ namespace seamvk
+         // per axis, so a window smaller than the render (or more than 3x larger) keeps the plain composed frame.
+         Vulkan::Image *pres = g_gpu.out.get();
+         bool presReady = false;   // pres already in TRANSFER_SRC_OPTIMAL
++        bool fgMotion = false;    // [framegen] upMv holds this frame's motion (composed pixels)
++        if (frameGen() && !upscaleMode())
++        {   // [framegen] without an upscaler the motion still goes through the aux pass into the composed frame's space
++            const bool shown1 = (priv.pmode & 1u) != 0;
++            fgMotion = composeAux(*cmd, dev, shown1 ? priv.dispfb1 : priv.dispfb2, shown1 ? priv.display1 : priv.display2);
++        }
+         if (upscaleMode())
+         {
+             uint32_t pw = g_presentW.load(std::memory_order_relaxed), ph = g_presentH.load(std::memory_order_relaxed);
+@@ -2975,6 +3014,7 @@ namespace seamvk
+                 const bool shown1 = (priv.pmode & 1u) != 0;
+                 static const bool s_noAux = [](){ const char *v = std::getenv("PS2X_SEAMVK_UPNOAUX"); return v && v[0] == '1'; }();   // diagnostics: zero depth/motion
+                 bool motion = !s_noAux && composeAux(*cmd, dev, shown1 ? priv.dispfb1 : priv.dispfb2, shown1 ? priv.display1 : priv.display2);
++                fgMotion = motion;
+                 if (!motion && ensureAux(dev))
+                 {   // a flat screen (menus, movies, loading): no depth or motion, the history restarts
+                     for (Vulkan::ImageHandle *img : { &g_gpu.upDepth, &g_gpu.upMv })
+@@ -3237,44 +3277,106 @@ namespace seamvk
+         }
+         slot.gframe = g_bt3FrameCount.load(std::memory_order_relaxed);   // [presentlat]
+         slot.jitSign = (g_gpu.upActive && g_gpu.mvValid) ? g_gpu.jitSign : -1; slot.jitPos = g_gpu.jitPos; slot.jitCycle = g_gpu.jitCycle;   // [jitcycle]
+-        // [glshare] GL imports the frame: a GPU copy into a free shared image, handed to the external queue family in the
+-        // layout GL is told about (GL_LAYOUT_SHADER_READ_ONLY_EXT). No free slot (GL not presenting): this frame is not shown.
+-        int shareSlot = -1; bool shareSkip = false;
+-        if (g_shareOn.load(std::memory_order_acquire))
++        // [framegen] The frame halfway between the last presented one and this one (fgmid.frag), into fgMid; this frame then
++        // becomes fgPrev. The game's frame interval (an EMA of the swaps) times the hand-over of the real frame.
++        bool fgHave = false;
++        if (frameGen() && g_shareOn.load(std::memory_order_acquire) && g_gpu.progFgMid)
+         {
+-            { std::lock_guard<std::mutex> lk(g_shareMtx); for (int i = 0; i < kShareSlots; ++i) if (g_share[i].st == 0) { shareSlot = i; break; } }
+-            shareSkip = shareSlot < 0;
+-            if (shareSlot >= 0)
++            const auto now = std::chrono::steady_clock::now();
++            if (g_gpu.fgLast.time_since_epoch().count())
+             {
+-                ShareSlot &s = g_share[shareSlot];   // free: no other thread reads it until it is published
+-                if (!s.img || s.w != w || s.h != h)
+-                {
+-                    auto ci = Vulkan::ImageCreateInfo::render_target(w, h, VK_FORMAT_R8G8B8A8_UNORM);
+-                    ci.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+-                    ci.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+-                    ci.misc = Vulkan::IMAGE_MISC_EXTERNAL_MEMORY_BIT;
+-                    Vulkan::ImageHandle img = dev.create_image(ci);
+-                    Vulkan::ExternalHandle eh; if (img) eh = img->export_handle();
+-                    const bool ok = img && eh.handle != Vulkan::ExternalHandle().handle;
+-                    std::lock_guard<std::mutex> lk(g_shareMtx);
+-                    closeExternal(s.mem);
+-                    if (ok) { s.img = img; s.mem = intptr_t(eh.handle); s.memSize = img->get_allocation().get_size(); s.w = w; s.h = h; ++s.gen; }
+-                    else { std::fprintf(stderr, "[glshare] exportable %ux%u image failed: back to the readback path\n", w, h); g_shareOn.store(false); shareSlot = -1; shareSkip = false; }
+-                }
++                const double ms = std::chrono::duration<double, std::milli>(now - g_gpu.fgLast).count();
++                if (ms > 4.0 && ms < 100.0) g_gpu.fgMs += 0.1 * (ms - g_gpu.fgMs);
+             }
+-            if (shareSlot >= 0)
++            g_gpu.fgLast = now;
++            auto ensure = [&](Vulkan::ImageHandle &img)
+             {
+-                ShareSlot &s = g_share[shareSlot];
+-                cmd->image_barrier(*s.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, 0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+-                cmd->copy_image(*s.img, *pres, {}, {}, { w, h, 1 }, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 });
+-                VkImageMemoryBarrier2 ib = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };   // release to the external (GL) queue family
+-                ib.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT; ib.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+-                ib.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; ib.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+-                ib.srcQueueFamilyIndex = dev.get_queue_info().family_indices[Vulkan::QUEUE_INDEX_GRAPHICS]; ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+-                ib.image = s.img->get_image(); ib.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+-                VkDependencyInfo dep = { VK_STRUCTURE_TYPE_DEPENDENCY_INFO }; dep.imageMemoryBarrierCount = 1; dep.pImageMemoryBarriers = &ib;
+-                cmd->barrier(dep);
+-            }
++                if (img && img->get_width() == w && img->get_height() == h) return true;
++                auto ci = Vulkan::ImageCreateInfo::render_target(w, h, VK_FORMAT_R8G8B8A8_UNORM);
++                ci.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
++                img = dev.create_image(ci);
++                return false;
++            };
++            const bool havePrev = ensure(g_gpu.fgPrev); ensure(g_gpu.fgMid);
++            if (havePrev)
++            {
++                const bool useMv = fgMotion && g_gpu.upMv;
++                cmd->image_barrier(*pres, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0,
++                                   VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
++                cmd->image_barrier(*g_gpu.fgMid, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0,
++                                   VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
++                Vulkan::RenderPassInfo rp = {};
++                rp.num_color_attachments = 1; rp.color_attachments[0] = &g_gpu.fgMid->get_view(); rp.store_attachments = 1u;
++                cmd->begin_render_pass(rp);
++                cmd->set_opaque_state();
++                VkViewport vp = {}; vp.width = float(w); vp.height = float(h); vp.maxDepth = 1.0f; cmd->set_viewport(vp);
++                VkRect2D sr = {}; sr.extent.width = w; sr.extent.height = h; cmd->set_scissor(sr);
++                cmd->set_program(g_gpu.progFgMid);
++                cmd->set_cull_mode(VK_CULL_MODE_NONE);
++                cmd->set_depth_test(false, false);
++                cmd->set_primitive_topology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP);
++                PresentPC p = {};
++                p.src[2] = 1.0f; p.src[3] = 1.0f; p.dst[0] = -1.0f; p.dst[1] = -1.0f; p.dst[2] = 1.0f; p.dst[3] = 1.0f;
++                if (useMv) { p.taps[0] = 1.0f / float(g_gpu.w); p.taps[1] = 1.0f / float(g_gpu.h); }   // the vectors are in composed pixels
++                cmd->push_constants(&p, 0, sizeof(p));
++                cmd->set_texture(0, 0, pres->get_view(), Vulkan::StockSampler::LinearClamp);
++                cmd->set_texture(0, 1, g_gpu.fgPrev->get_view(), Vulkan::StockSampler::LinearClamp);
++                cmd->set_texture(0, 2, useMv ? g_gpu.upMv->get_view() : g_gpu.fgPrev->get_view(), Vulkan::StockSampler::NearestClamp);   // (no motion: zero vectors)
++                cmd->draw(4);
++                cmd->end_render_pass();
++                cmd->image_barrier(*g_gpu.fgMid, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
++                                   VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
++                cmd->image_barrier(*pres, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0,
++                                   VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
++                fgHave = true;
++            }
++            cmd->image_barrier(*g_gpu.fgPrev, havePrev ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                               VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
++            cmd->copy_image(*g_gpu.fgPrev, *pres);
++            cmd->image_barrier(*g_gpu.fgPrev, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT,
++                               VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
++        }
++        // [glshare] GL imports the frame: a GPU copy into a free shared image, handed to the external queue family in the
++        // layout GL is told about (GL_LAYOUT_SHADER_READ_ONLY_EXT). No free slot (GL not presenting): this frame is not shown.
++        // A slot being filled is st 3 (neither thread's: GL takes only ready ones), so [framegen] can fill two.
++        auto shareFill = [&](Vulkan::Image &src) -> int
++        {
++            int i = -1;
++            { std::lock_guard<std::mutex> lk(g_shareMtx); for (int k = 0; k < kShareSlots; ++k) if (g_share[k].st == 0) { i = k; g_share[k].st = 3; break; } }
++            if (i < 0) return -1;
++            ShareSlot &s = g_share[i];   // free: no other thread reads it until it is published
++            if (!s.img || s.w != w || s.h != h)
++            {
++                auto ci = Vulkan::ImageCreateInfo::render_target(w, h, VK_FORMAT_R8G8B8A8_UNORM);
++                ci.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
++                ci.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
++                ci.misc = Vulkan::IMAGE_MISC_EXTERNAL_MEMORY_BIT;
++                Vulkan::ImageHandle img = dev.create_image(ci);
++                Vulkan::ExternalHandle eh; if (img) eh = img->export_handle();
++                const bool ok = img && eh.handle != Vulkan::ExternalHandle().handle;
++                std::lock_guard<std::mutex> lk(g_shareMtx);
++                closeExternal(s.mem);
++                if (ok) { s.img = img; s.mem = intptr_t(eh.handle); s.memSize = img->get_allocation().get_size(); s.w = w; s.h = h; ++s.gen; }
++                else { std::fprintf(stderr, "[glshare] exportable %ux%u image failed: back to the readback path\n", w, h); g_shareOn.store(false); s.st = 0; return -2; }
++            }
++            cmd->image_barrier(*s.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, 0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
++            cmd->copy_image(*s.img, src, {}, {}, { w, h, 1 }, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 });
++            VkImageMemoryBarrier2 ib = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };   // release to the external (GL) queue family
++            ib.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT; ib.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
++            ib.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; ib.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
++            ib.srcQueueFamilyIndex = dev.get_queue_info().family_indices[Vulkan::QUEUE_INDEX_GRAPHICS]; ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
++            ib.image = s.img->get_image(); ib.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
++            VkDependencyInfo dep = { VK_STRUCTURE_TYPE_DEPENDENCY_INFO }; dep.imageMemoryBarrierCount = 1; dep.pImageMemoryBarriers = &ib;
++            cmd->barrier(dep);
++            return i;
++        };
++        int shareSlot = -1, midSlot = -1; bool shareSkip = false;
++        if (g_shareOn.load(std::memory_order_acquire))
++        {
++            if (fgHave) { midSlot = shareFill(*g_gpu.fgMid); if (midSlot < 0) midSlot = -1; }
++            shareSlot = shareFill(*pres);
++            shareSkip = shareSlot == -1;
++            if (shareSlot < 0) shareSlot = -1;
+         }
+         slot.noReadback = shareSlot >= 0 || shareSkip;
+ #if defined(PS2X_SEAMVK_METALFX)
+@@ -3304,16 +3406,26 @@ namespace seamvk
+             ps2_seamvk_metalfx::publish(dev.get_device(), dev.get_queue_info().queues[Vulkan::QUEUE_INDEX_GRAPHICS], vkGetDeviceProcAddr, pres->get_image(), w, h);
+         }
+ #endif
+-        if (shareSlot >= 0)
+-        {   // [glshare] a fresh semaphore signalled after the copy; GL imports and waits it before sampling
+-            Vulkan::Semaphore sem = dev.request_semaphore_external(VK_SEMAPHORE_TYPE_BINARY, Vulkan::ExternalHandle::get_opaque_semaphore_handle_type());
+-            dev.submit_empty(Vulkan::CommandBuffer::Type::Generic, nullptr, sem.get());
+-            const Vulkan::ExternalHandle sh = sem->export_to_handle();
++        if (shareSlot >= 0 || midSlot >= 0)
++        {   // [glshare] a fresh semaphore per slot, signalled after the copies; GL imports and waits it before sampling
++            auto signal = [&]() -> intptr_t
++            {
++                Vulkan::Semaphore sem = dev.request_semaphore_external(VK_SEMAPHORE_TYPE_BINARY, Vulkan::ExternalHandle::get_opaque_semaphore_handle_type());
++                dev.submit_empty(Vulkan::CommandBuffer::Type::Generic, nullptr, sem.get());
++                return intptr_t(sem->export_to_handle().handle);
++            };
++            const intptr_t semMid = midSlot >= 0 ? signal() : -1, semCur = shareSlot >= 0 ? signal() : -1;
++            const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+             std::lock_guard<std::mutex> lk(g_shareMtx);
+             for (int i = 0; i < kShareSlots; ++i)
+                 if (g_share[i].st == 1) { closeExternal(g_share[i].sem); g_share[i].st = 0; }   // superseded before GL took it
+-            ShareSlot &s = g_share[shareSlot];
+-            s.sem = intptr_t(sh.handle); s.gframe = slot.gframe; s.st = 1;
++            if (midSlot >= 0) { ShareSlot &s = g_share[midSlot]; s.sem = semMid; s.gframe = slot.gframe; s.seq = ++g_shareSeq; s.due = 0; s.st = 1; }
++            if (shareSlot >= 0)
++            {   // [framegen] the real frame half a game frame after the generated one
++                ShareSlot &s = g_share[shareSlot]; s.sem = semCur; s.gframe = slot.gframe; s.seq = ++g_shareSeq;
++                static const bool s_onlyMid = [](){ const char *v = std::getenv("PS2X_FRAMEGEN_ONLYMID"); return v && v[0] == '1'; }();   // diagnostics: only the generated frames are shown
++                s.due = midSlot >= 0 ? (s_onlyMid ? std::numeric_limits<int64_t>::max() : nowNs + int64_t(g_gpu.fgMs * 0.5e6)) : 0; s.st = 1;
++            }
+         }
+         const auto tD = std::chrono::steady_clock::now();
+         if (earlyFrame())
+@@ -3458,17 +3570,20 @@ namespace seamvk
+         bool take(Frame &out)
+         {
+             std::lock_guard<std::mutex> lk(g_shareMtx);
++            // [framegen] the newest ready frame that is due; older ready ones are dropped (a generated frame GL came too late for)
++            const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++            int pick = -1;
+             for (int i = 0; i < kShareSlots; ++i)
+-            {
+-                ShareSlot &s = g_share[i];
+-                if (s.st != 1) continue;
+-                s.st = 2;
+-                out.slot = i; out.w = s.w; out.h = s.h; out.gen = s.gen; out.memSize = s.memSize; out.mem = s.mem; out.sem = s.sem;
+-                s.mem = -1; s.sem = -1;
+-                { std::lock_guard<std::mutex> lf(g_mtx); g_frameGframe = s.gframe; }   // [presentlat]
+-                return true;
+-            }
+-            return false;
++                if (g_share[i].st == 1 && g_share[i].due <= nowNs && (pick < 0 || g_share[i].seq > g_share[pick].seq)) pick = i;
++            if (pick < 0) return false;
++            for (int i = 0; i < kShareSlots; ++i)
++                if (i != pick && g_share[i].st == 1 && g_share[i].seq < g_share[pick].seq) { closeExternal(g_share[i].sem); g_share[i].st = 0; }
++            ShareSlot &s = g_share[pick];
++            s.st = 2;
++            out.slot = pick; out.w = s.w; out.h = s.h; out.gen = s.gen; out.memSize = s.memSize; out.mem = s.mem; out.sem = s.sem;
++            s.mem = -1; s.sem = -1;
++            { std::lock_guard<std::mutex> lf(g_mtx); g_frameGframe = s.gframe; }   // [presentlat]
++            return true;
+         }
+         void release(int slot)
+         {
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 8bc614a..1f559d5 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -8552,6 +8552,18 @@ void PS2Runtime::run()
+             // [glshare] the native frame as a GL texture over the renderer's own Vulkan memory (no readback, no upload);
+             // 0 when the context cannot import it (then the readback below)
+             uint32_t shw = 0, shh = 0, shTex = 0;
++            {   // [framegen] a generated frame between every two: the window loop runs at the doubled rate and shows each when due
++                static bool s_fgSet = false;
++                if (!s_fgSet && seamvk::on())
++                {
++                    s_fgSet = true;
++                    // a display under 90 Hz cannot show the extra frames: there the generated ones would only add half a
++                    // frame of delay (the launcher turns the option on by default)
++                    const int mhz = bt3GetMonitorRefreshRate(bt3GetCurrentMonitor());
++                    if (seamvk::frameGenHz() && mhz > 0 && mhz < 90) { seamvk::setFrameGenAllowed(false); std::fprintf(stderr, "[framegen] off: the display runs at %d Hz\n", mhz); }
++                    else if (const int hz = seamvk::frameGenHz()) { bt3SetTargetFPS(hz); std::fprintf(stderr, "[framegen] on: the window loop at %d Hz (display %d Hz)\n", hz, mhz); }
++                }
++            }
+ #if defined(_WIN32)
+             if (seamvk::on() && !g_ps2xD3D11Mode) shTex = seamvk::sharedPresent(ps2xGlGetProc, shw, shh);
+ #else
+diff --git a/ps2xRuntime/include/runtime/ps2_seamvk.h b/ps2xRuntime/include/runtime/ps2_seamvk.h
+index 145369e..0cab8b2 100644
+--- a/ps2xRuntime/include/runtime/ps2_seamvk.h
++++ b/ps2xRuntime/include/runtime/ps2_seamvk.h
+@@ -84,6 +84,10 @@ namespace seamvk
+     // buffer goes to Vulkan at the swap. PS2X_SEAMVK_VKPRESENT=1; the device then also enables the surface / swapchain
+     // extensions. PS2X_SEAMVK_VKPRESENT_MODE=fifo (vsync, default) | mailbox | immediate.
+     namespace vkpresent { bool wanted(); }
++    // [framegen] PS2X_SEAMVK_FRAMEGEN=1: a frame generated from the real motion between every two, through glshare; the window
++    // loop then runs at this rate (PS2X_FRAMEGEN_HZ, default 120). 0 = off.
++    int frameGenHz();
++    void setFrameGenAllowed(bool on);   // [framegen] the window thread: off where the display cannot show the extra frames
+ #else
+     // [standalone] built without Granite (no Vulkan renderer at all): the runtime's hooks fall through
+     inline bool on() { return false; }
+@@ -99,6 +103,8 @@ namespace seamvk
+     inline uint64_t lastFrameGframe() { return 0; }
+     inline void shutdown() {}
+     inline uint32_t sharedPresent(void *(*)(const char *), uint32_t &, uint32_t &) { return 0; }
++    inline int frameGenHz() { return 0; }
++    inline void setFrameGenAllowed(bool) {}
+ #endif
+ 
+     struct PrivRegs { uint64_t pmode = 0, dispfb1 = 0, display1 = 0, dispfb2 = 0, display2 = 0, bgcolor = 0; };
+diff --git a/ps2xRuntime/src/lib/seamvk/fgmid.frag b/ps2xRuntime/src/lib/seamvk/fgmid.frag
+new file mode 100644
+index 0000000..40905a4
+--- /dev/null
++++ b/ps2xRuntime/src/lib/seamvk/fgmid.frag
+@@ -0,0 +1,22 @@
++#version 450
++// [framegen] The frame halfway between the previous presented frame and this one, from the game's real motion vectors
++// (the composed frame's motion, current + mv = previous, in composed pixels). A pixel that did not change (the HUD, the
++// sky, a still picture) is the current one as is; a moving one is fetched where its surface is now and where it was,
++// half a vector each way, and the two are averaged when they agree (else the newer one: a surface that was hidden).
++layout(push_constant) uniform PCP { vec4 src; vec4 dst; vec4 alpha; vec4 taps; } pc;   // taps.xy = 1 / composed size
++layout(set = 0, binding = 0) uniform sampler2D uCur;
++layout(set = 0, binding = 1) uniform sampler2D uPrev;
++layout(set = 0, binding = 2) uniform sampler2D uMv;
++layout(location = 0) in vec2 vUv;
++layout(location = 0) out vec4 oColor;
++void main()
++{
++    vec3 c = textureLod(uCur, vUv, 0.0).rgb, p = textureLod(uPrev, vUv, 0.0).rgb;
++    vec3 d = abs(c - p);
++    if (max(d.r, max(d.g, d.b)) < 2.0 / 255.0) { oColor = vec4(c, 1.0); return; }
++    vec2 mv = textureLod(uMv, vUv, 0.0).rg * pc.taps.xy;   // in uv units
++    vec3 a = textureLod(uCur, vUv - 0.5 * mv, 0.0).rgb;
++    vec3 b = textureLod(uPrev, vUv + 0.5 * mv, 0.0).rgb;
++    vec3 e = abs(a - b);
++    oColor = vec4(max(e.r, max(e.g, e.b)) < 0.15 ? mix(a, b, 0.5) : a, 1.0);
++}
+diff --git a/ps2xRuntime/src/lib/seamvk/fgmid.frag.inc b/ps2xRuntime/src/lib/seamvk/fgmid.frag.inc
+new file mode 100644
+index 0000000..b7e9441
+--- /dev/null
++++ b/ps2xRuntime/src/lib/seamvk/fgmid.frag.inc
+@@ -0,0 +1,99 @@
++	// 1116.2.0
++	0x07230203,0x00010300,0x0008000b,0x0000007c,0x00000000,0x00020011,0x00000001,0x0006000b,
++	0x00000001,0x4c534c47,0x6474732e,0x3035342e,0x00000000,0x0003000e,0x00000000,0x00000001,
++	0x0007000f,0x00000004,0x00000004,0x6e69616d,0x00000000,0x00000011,0x00000035,0x00030010,
++	0x00000004,0x00000007,0x00030003,0x00000002,0x000001c2,0x000a0004,0x475f4c47,0x4c474f4f,
++	0x70635f45,0x74735f70,0x5f656c79,0x656e696c,0x7269645f,0x69746365,0x00006576,0x00080004,
++	0x475f4c47,0x4c474f4f,0x6e695f45,0x64756c63,0x69645f65,0x74636572,0x00657669,0x00040005,
++	0x00000004,0x6e69616d,0x00000000,0x00030005,0x00000009,0x00000063,0x00040005,0x0000000d,
++	0x72754375,0x00000000,0x00030005,0x00000011,0x00765576,0x00030005,0x00000017,0x00000070,
++	0x00040005,0x00000018,0x65725075,0x00000076,0x00030005,0x0000001d,0x00000064,0x00040005,
++	0x00000035,0x6c6f436f,0x0000726f,0x00030005,0x0000003e,0x0000766d,0x00030005,0x0000003f,
++	0x00764d75,0x00030005,0x00000044,0x00504350,0x00040006,0x00000044,0x00000000,0x00637273,
++	0x00040006,0x00000044,0x00000001,0x00747364,0x00050006,0x00000044,0x00000002,0x68706c61,
++	0x00000061,0x00050006,0x00000044,0x00000003,0x73706174,0x00000000,0x00030005,0x00000046,
++	0x00006370,0x00030005,0x0000004e,0x00000061,0x00030005,0x00000057,0x00000062,0x00030005,
++	0x0000005f,0x00000065,0x00040047,0x0000000d,0x00000021,0x00000000,0x00040047,0x0000000d,
++	0x00000022,0x00000000,0x00040047,0x00000011,0x0000001e,0x00000000,0x00040047,0x00000018,
++	0x00000021,0x00000001,0x00040047,0x00000018,0x00000022,0x00000000,0x00040047,0x00000035,
++	0x0000001e,0x00000000,0x00040047,0x0000003f,0x00000021,0x00000002,0x00040047,0x0000003f,
++	0x00000022,0x00000000,0x00030047,0x00000044,0x00000002,0x00050048,0x00000044,0x00000000,
++	0x00000023,0x00000000,0x00050048,0x00000044,0x00000001,0x00000023,0x00000010,0x00050048,
++	0x00000044,0x00000002,0x00000023,0x00000020,0x00050048,0x00000044,0x00000003,0x00000023,
++	0x00000030,0x00020013,0x00000002,0x00030021,0x00000003,0x00000002,0x00030016,0x00000006,
++	0x00000020,0x00040017,0x00000007,0x00000006,0x00000003,0x00040020,0x00000008,0x00000007,
++	0x00000007,0x00090019,0x0000000a,0x00000006,0x00000001,0x00000000,0x00000000,0x00000000,
++	0x00000001,0x00000000,0x0003001b,0x0000000b,0x0000000a,0x00040020,0x0000000c,0x00000000,
++	0x0000000b,0x0004003b,0x0000000c,0x0000000d,0x00000000,0x00040017,0x0000000f,0x00000006,
++	0x00000002,0x00040020,0x00000010,0x00000001,0x0000000f,0x0004003b,0x00000010,0x00000011,
++	0x00000001,0x0004002b,0x00000006,0x00000013,0x00000000,0x00040017,0x00000014,0x00000006,
++	0x00000004,0x0004003b,0x0000000c,0x00000018,0x00000000,0x00040015,0x00000022,0x00000020,
++	0x00000000,0x0004002b,0x00000022,0x00000023,0x00000000,0x00040020,0x00000024,0x00000007,
++	0x00000006,0x0004002b,0x00000022,0x00000027,0x00000001,0x0004002b,0x00000022,0x0000002a,
++	0x00000002,0x0004002b,0x00000006,0x0000002f,0x3c008081,0x00020014,0x00000030,0x00040020,
++	0x00000034,0x00000003,0x00000014,0x0004003b,0x00000034,0x00000035,0x00000003,0x0004002b,
++	0x00000006,0x00000037,0x3f800000,0x00040020,0x0000003d,0x00000007,0x0000000f,0x0004003b,
++	0x0000000c,0x0000003f,0x00000000,0x0006001e,0x00000044,0x00000014,0x00000014,0x00000014,
++	0x00000014,0x00040020,0x00000045,0x00000009,0x00000044,0x0004003b,0x00000045,0x00000046,
++	0x00000009,0x00040015,0x00000047,0x00000020,0x00000001,0x0004002b,0x00000047,0x00000048,
++	0x00000003,0x00040020,0x00000049,0x00000009,0x00000014,0x0004002b,0x00000006,0x00000051,
++	0x3f000000,0x0004002b,0x00000006,0x0000006c,0x3e19999a,0x00050036,0x00000002,0x00000004,
++	0x00000000,0x00000003,0x000200f8,0x00000005,0x0004003b,0x00000008,0x00000009,0x00000007,
++	0x0004003b,0x00000008,0x00000017,0x00000007,0x0004003b,0x00000008,0x0000001d,0x00000007,
++	0x0004003b,0x0000003d,0x0000003e,0x00000007,0x0004003b,0x00000008,0x0000004e,0x00000007,
++	0x0004003b,0x00000008,0x00000057,0x00000007,0x0004003b,0x00000008,0x0000005f,0x00000007,
++	0x0004003b,0x00000008,0x0000006e,0x00000007,0x0004003d,0x0000000b,0x0000000e,0x0000000d,
++	0x0004003d,0x0000000f,0x00000012,0x00000011,0x00070058,0x00000014,0x00000015,0x0000000e,
++	0x00000012,0x00000002,0x00000013,0x0008004f,0x00000007,0x00000016,0x00000015,0x00000015,
++	0x00000000,0x00000001,0x00000002,0x0003003e,0x00000009,0x00000016,0x0004003d,0x0000000b,
++	0x00000019,0x00000018,0x0004003d,0x0000000f,0x0000001a,0x00000011,0x00070058,0x00000014,
++	0x0000001b,0x00000019,0x0000001a,0x00000002,0x00000013,0x0008004f,0x00000007,0x0000001c,
++	0x0000001b,0x0000001b,0x00000000,0x00000001,0x00000002,0x0003003e,0x00000017,0x0000001c,
++	0x0004003d,0x00000007,0x0000001e,0x00000009,0x0004003d,0x00000007,0x0000001f,0x00000017,
++	0x00050083,0x00000007,0x00000020,0x0000001e,0x0000001f,0x0006000c,0x00000007,0x00000021,
++	0x00000001,0x00000004,0x00000020,0x0003003e,0x0000001d,0x00000021,0x00050041,0x00000024,
++	0x00000025,0x0000001d,0x00000023,0x0004003d,0x00000006,0x00000026,0x00000025,0x00050041,
++	0x00000024,0x00000028,0x0000001d,0x00000027,0x0004003d,0x00000006,0x00000029,0x00000028,
++	0x00050041,0x00000024,0x0000002b,0x0000001d,0x0000002a,0x0004003d,0x00000006,0x0000002c,
++	0x0000002b,0x0007000c,0x00000006,0x0000002d,0x00000001,0x00000028,0x00000029,0x0000002c,
++	0x0007000c,0x00000006,0x0000002e,0x00000001,0x00000028,0x00000026,0x0000002d,0x000500b8,
++	0x00000030,0x00000031,0x0000002e,0x0000002f,0x000300f7,0x00000033,0x00000000,0x000400fa,
++	0x00000031,0x00000032,0x00000033,0x000200f8,0x00000032,0x0004003d,0x00000007,0x00000036,
++	0x00000009,0x00050051,0x00000006,0x00000038,0x00000036,0x00000000,0x00050051,0x00000006,
++	0x00000039,0x00000036,0x00000001,0x00050051,0x00000006,0x0000003a,0x00000036,0x00000002,
++	0x00070050,0x00000014,0x0000003b,0x00000038,0x00000039,0x0000003a,0x00000037,0x0003003e,
++	0x00000035,0x0000003b,0x000100fd,0x000200f8,0x00000033,0x0004003d,0x0000000b,0x00000040,
++	0x0000003f,0x0004003d,0x0000000f,0x00000041,0x00000011,0x00070058,0x00000014,0x00000042,
++	0x00000040,0x00000041,0x00000002,0x00000013,0x0007004f,0x0000000f,0x00000043,0x00000042,
++	0x00000042,0x00000000,0x00000001,0x00050041,0x00000049,0x0000004a,0x00000046,0x00000048,
++	0x0004003d,0x00000014,0x0000004b,0x0000004a,0x0007004f,0x0000000f,0x0000004c,0x0000004b,
++	0x0000004b,0x00000000,0x00000001,0x00050085,0x0000000f,0x0000004d,0x00000043,0x0000004c,
++	0x0003003e,0x0000003e,0x0000004d,0x0004003d,0x0000000b,0x0000004f,0x0000000d,0x0004003d,
++	0x0000000f,0x00000050,0x00000011,0x0004003d,0x0000000f,0x00000052,0x0000003e,0x0005008e,
++	0x0000000f,0x00000053,0x00000052,0x00000051,0x00050083,0x0000000f,0x00000054,0x00000050,
++	0x00000053,0x00070058,0x00000014,0x00000055,0x0000004f,0x00000054,0x00000002,0x00000013,
++	0x0008004f,0x00000007,0x00000056,0x00000055,0x00000055,0x00000000,0x00000001,0x00000002,
++	0x0003003e,0x0000004e,0x00000056,0x0004003d,0x0000000b,0x00000058,0x00000018,0x0004003d,
++	0x0000000f,0x00000059,0x00000011,0x0004003d,0x0000000f,0x0000005a,0x0000003e,0x0005008e,
++	0x0000000f,0x0000005b,0x0000005a,0x00000051,0x00050081,0x0000000f,0x0000005c,0x00000059,
++	0x0000005b,0x00070058,0x00000014,0x0000005d,0x00000058,0x0000005c,0x00000002,0x00000013,
++	0x0008004f,0x00000007,0x0000005e,0x0000005d,0x0000005d,0x00000000,0x00000001,0x00000002,
++	0x0003003e,0x00000057,0x0000005e,0x0004003d,0x00000007,0x00000060,0x0000004e,0x0004003d,
++	0x00000007,0x00000061,0x00000057,0x00050083,0x00000007,0x00000062,0x00000060,0x00000061,
++	0x0006000c,0x00000007,0x00000063,0x00000001,0x00000004,0x00000062,0x0003003e,0x0000005f,
++	0x00000063,0x00050041,0x00000024,0x00000064,0x0000005f,0x00000023,0x0004003d,0x00000006,
++	0x00000065,0x00000064,0x00050041,0x00000024,0x00000066,0x0000005f,0x00000027,0x0004003d,
++	0x00000006,0x00000067,0x00000066,0x00050041,0x00000024,0x00000068,0x0000005f,0x0000002a,
++	0x0004003d,0x00000006,0x00000069,0x00000068,0x0007000c,0x00000006,0x0000006a,0x00000001,
++	0x00000028,0x00000067,0x00000069,0x0007000c,0x00000006,0x0000006b,0x00000001,0x00000028,
++	0x00000065,0x0000006a,0x000500b8,0x00000030,0x0000006d,0x0000006b,0x0000006c,0x000300f7,
++	0x00000070,0x00000000,0x000400fa,0x0000006d,0x0000006f,0x00000075,0x000200f8,0x0000006f,
++	0x0004003d,0x00000007,0x00000071,0x0000004e,0x0004003d,0x00000007,0x00000072,0x00000057,
++	0x00060050,0x00000007,0x00000073,0x00000051,0x00000051,0x00000051,0x0008000c,0x00000007,
++	0x00000074,0x00000001,0x0000002e,0x00000071,0x00000072,0x00000073,0x0003003e,0x0000006e,
++	0x00000074,0x000200f9,0x00000070,0x000200f8,0x00000075,0x0004003d,0x00000007,0x00000076,
++	0x0000004e,0x0003003e,0x0000006e,0x00000076,0x000200f9,0x00000070,0x000200f8,0x00000070,
++	0x0004003d,0x00000007,0x00000077,0x0000006e,0x00050051,0x00000006,0x00000078,0x00000077,
++	0x00000000,0x00050051,0x00000006,0x00000079,0x00000077,0x00000001,0x00050051,0x00000006,
++	0x0000007a,0x00000077,0x00000002,0x00070050,0x00000014,0x0000007b,0x00000078,0x00000079,
++	0x0000007a,0x00000037,0x0003003e,0x00000035,0x0000007b,0x000100fd,0x00010038

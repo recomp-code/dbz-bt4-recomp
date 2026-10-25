@@ -34,7 +34,7 @@ force_bilinear = true
 fps60 = false
 
 [video.hud]
-layout = 0
+layout = 1
 offset_left = 0
 offset_center = 0
 offset_right = 0

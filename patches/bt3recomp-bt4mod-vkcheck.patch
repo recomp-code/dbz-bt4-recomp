@@ -1,0 +1,171 @@
+diff --git a/ps2xRuntime/src/lib/ps2_seamvk_present.cpp b/ps2xRuntime/src/lib/ps2_seamvk_present.cpp
+index 8f5ff1b..26f6c91 100644
+--- a/ps2xRuntime/src/lib/ps2_seamvk_present.cpp
++++ b/ps2xRuntime/src/lib/ps2_seamvk_present.cpp
+@@ -35,6 +35,7 @@
+ 
+ extern "C" bool (*bt3SwapHook)(void *window);   // rcore_desktop_sdl.c: SwapScreenBuffer asks it first
+ extern "C" bool bt3VkWindow;                    // rcore_desktop_sdl.c: the game's window has no GL (GL on a hidden one)
++extern "C" bool (*bt3VkWindowCheck)(void);      // rcore_desktop_sdl.c: asked before the game's window exists
+ extern "C" void rlSetDefaultFramebuffer(unsigned int id);   // rlgl.h: the framebuffer GL's "screen" means
+ 
+ namespace seamvk
+@@ -449,10 +450,77 @@ namespace seamvk
+ 
+         bool swapHook(void *window)
+         {
+-            if (!vkpresent::wanted() || !on()) return false;
++            // only on a window that is Vulkan's alone: on a GL window a fullscreen GL surface the driver scans out directly hides
++            // the swapchain (a black screen), so GL presents there
++            if (!vkpresent::wanted() || !on() || !bt3VkWindow) return false;
+             return present(window);
+         }
+-        struct Install { Install() { bt3SwapHook = swapHook; } } g_install;
++
++        // [vkwindow] Before the game's window exists (GL current on its hidden window): can the native renderer's Vulkan device
++        // share images with this GL context? The interop extensions, and the GPU Granite will pick (its own rule: the
++        // GRANITE_VULKAN_DEVICE_INDEX override, else the best type, earlier entries first) being the one GL runs on. A hybrid
++        // laptop whose GL stayed on the integrated GPU (the exe asks the drivers for the discrete one: main.cpp) answers no,
++        // and the window stays GL's: the frame then reaches it through glshare's readback, as before 2.4.1.
++        bool windowCheck()
++        {
++            auto no = [](const char *why) { std::fprintf(stderr, "[vkwindow] %s\n", why); return false; };
++            if (const char *v = std::getenv("PS2X_VKWINDOW_CHECK")) if (v[0] == '0') return no("PS2X_VKWINDOW_CHECK=0");   // (diagnostics: the answer for another GPU)
++            const GLubyte *(__stdcall *getStringi)(GLenum, GLuint) = reinterpret_cast<decltype(getStringi)>(SDL_GL_GetProcAddress("glGetStringi"));
++            void (__stdcall *getIntegerv)(GLenum, GLint *) = reinterpret_cast<decltype(getIntegerv)>(SDL_GL_GetProcAddress("glGetIntegerv"));
++            void (__stdcall *getLuid)(GLenum, GLubyte *) = reinterpret_cast<decltype(getLuid)>(SDL_GL_GetProcAddress("glGetUnsignedBytevEXT"));
++            if (!getStringi || !getIntegerv || !getLuid) return no("GL entry points missing");
++            GLint n = 0; getIntegerv(kNumExtensions, &n);
++            int have = 0;
++            for (GLint i = 0; i < n; ++i)
++                if (const GLubyte *e = getStringi(kExtensions, GLuint(i)))
++                    for (const char *want : { "GL_EXT_memory_object_win32", "GL_EXT_semaphore_win32" })
++                        if (!std::strcmp(reinterpret_cast<const char *>(e), want)) ++have;
++            if (have < 2) return no("no GL_EXT_memory_object_win32 / GL_EXT_semaphore_win32");
++            GLubyte glLuid[8] = {}; getLuid(kDeviceLuid, glLuid);
++
++            if (!Vulkan::Context::init_loader(nullptr)) return no("no Vulkan loader");
++            VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO }; app.apiVersion = VK_API_VERSION_1_1;
++            VkInstanceCreateInfo ici = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO }; ici.pApplicationInfo = &app;
++            VkInstance inst = VK_NULL_HANDLE;
++            if (vkCreateInstance(&ici, nullptr, &inst) != VK_SUCCESS) return no("no Vulkan instance");
++            auto ip = [&](const char *name) { return vkGetInstanceProcAddr(inst, name); };
++            auto enumerate = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(ip("vkEnumeratePhysicalDevices"));
++            auto props1 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(ip("vkGetPhysicalDeviceProperties"));
++            auto props2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(ip("vkGetPhysicalDeviceProperties2"));
++            auto destroy = reinterpret_cast<PFN_vkDestroyInstance>(ip("vkDestroyInstance"));
++            std::vector<VkPhysicalDevice> gpus;
++            if (enumerate && props1 && props2)
++            {
++                uint32_t count = 0; enumerate(inst, &count, nullptr);
++                gpus.resize(count); if (count) enumerate(inst, &count, gpus.data());
++            }
++            int pick = -1;
++            if (const char *v = std::getenv("GRANITE_VULKAN_DEVICE_INDEX")) { const int i = std::atoi(v); if (v[0] && i >= 0 && i < int(gpus.size())) pick = i; }
++            if (pick < 0)
++            {
++                unsigned best = 0;
++                for (size_t i = gpus.size(); i; --i)
++                {
++                    VkPhysicalDeviceProperties p{}; props1(gpus[i - 1], &p);
++                    const unsigned score = p.apiVersion < VK_API_VERSION_1_1 ? 0u : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 3u :
++                                           p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2u : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU ? 1u : 0u;
++                    if (score >= best) { best = score; pick = int(i - 1); }
++                }
++            }
++            bool same = false; char name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE] = "?";
++            if (pick >= 0)
++            {
++                VkPhysicalDeviceIDProperties id = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES };
++                VkPhysicalDeviceProperties2 p2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 }; p2.pNext = &id;
++                props2(gpus[size_t(pick)], &p2);
++                same = id.deviceLUIDValid && !std::memcmp(id.deviceLUID, glLuid, 8);
++                std::memcpy(name, p2.properties.deviceName, sizeof(name));
++            }
++            if (destroy) destroy(inst, nullptr);
++            if (!same) { std::fprintf(stderr, "[vkwindow] GL runs on another GPU than Vulkan's %s\n", name); return false; }
++            return true;
++        }
++        struct Install { Install() { bt3SwapHook = swapHook; bt3VkWindowCheck = windowCheck; } } g_install;
+     }
+ }
+ #elif defined(PS2X_HAVE_SEAMVK)
+diff --git a/ps2xRuntime/third_party/bt3gl/src/platforms/rcore_desktop_sdl.c b/ps2xRuntime/third_party/bt3gl/src/platforms/rcore_desktop_sdl.c
+index c960c1d..c6a867f 100644
+--- a/ps2xRuntime/third_party/bt3gl/src/platforms/rcore_desktop_sdl.c
++++ b/ps2xRuntime/third_party/bt3gl/src/platforms/rcore_desktop_sdl.c
+@@ -1216,6 +1216,9 @@ bool (*bt3SwapHook)(void *window) = NULL;
+ // promote a fullscreen GL window to direct scanout over the swapchain). GL keeps its context on a hidden window and draws
+ // the screen into an off-screen framebuffer the runtime's presenter owns (rlSetDefaultFramebuffer). False: GL's window.
+ bool bt3VkWindow = false;
++// [vkwindow] asked with the GL context current on its hidden window, before the game's window exists: can the runtime's
++// Vulkan device share images with this GL (the same GPU, the interop extensions)? False: the window is GL's as before.
++bool (*bt3VkWindowCheck)(void) = NULL;
+ 
+ // Swap back buffer with front buffer (screen drawing)
+ void SwapScreenBuffer(void)
+@@ -1809,7 +1812,6 @@ int InitPlatform(void)
+     //----------------------------------------------------------------------------
+     unsigned int flags = 0;
+     flags |= SDL_WINDOW_SHOWN;
+-    if (!bt3VkWindow) flags |= SDL_WINDOW_OPENGL;
+     flags |= SDL_WINDOW_INPUT_FOCUS;
+     flags |= SDL_WINDOW_MOUSE_FOCUS;
+     flags |= SDL_WINDOW_MOUSE_CAPTURE;  // Window has mouse captured
+@@ -1884,6 +1886,24 @@ int InitPlatform(void)
+         SDL_GL_SetAttribute(SDL_GL_MULTISAMPLESAMPLES, 4);
+     }
+ 
++    // [vkwindow] the GL context first, on a hidden window of its own: the game's window gets no GL when Vulkan can show
++    // what this context draws, and stays GL's otherwise (another GPU, no interop: never a window nothing can present to)
++    if (bt3VkWindow)
++    {
++        platform.glWindow = SDL_CreateWindow("ps2x-gl", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, 64, 64, SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
++        platform.glContext = (platform.glWindow != NULL) ? SDL_GL_CreateContext(platform.glWindow) : NULL;
++        const bool ok = (platform.glContext != NULL) && ((bt3VkWindowCheck == NULL) || bt3VkWindowCheck());
++        fprintf(stderr, "[vkwindow] %s\n", ok ? "the game's window is Vulkan's; GL on a hidden window" : "Vulkan cannot show this GL context: the window stays GL's");
++        if (!ok)
++        {
++            if (platform.glContext != NULL) SDL_GL_DeleteContext(platform.glContext);
++            if (platform.glWindow != NULL) SDL_DestroyWindow(platform.glWindow);
++            platform.glContext = NULL; platform.glWindow = NULL;
++            bt3VkWindow = false;
++        }
++    }
++    if (!bt3VkWindow) flags |= SDL_WINDOW_OPENGL;
++
+     // Init window
+ #ifdef PLATFORM_DESKTOP_SDL3
+     platform.window = SDL_CreateWindow(CORE.Window.title, CORE.Window.screen.width, CORE.Window.screen.height, flags);
+@@ -1895,12 +1915,7 @@ int InitPlatform(void)
+ 
+     // Init OpenGL context
+     unsigned int _bt2 = SDL_GetTicks();
+-    if (bt3VkWindow && (platform.window != NULL))
+-    {   // [vkwindow] the context lives on a hidden window of its own; the game's window never sees GL
+-        platform.glWindow = SDL_CreateWindow("ps2x-gl", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, 64, 64, SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
+-        platform.glContext = (platform.glWindow != NULL) ? SDL_GL_CreateContext(platform.glWindow) : NULL;
+-        fprintf(stderr, "[vkwindow] the game's window is Vulkan's; GL on a hidden window (%s)\n", (platform.glContext != NULL) ? "ok" : SDL_GetError());
+-    }
++    if (platform.glWindow != NULL) SDL_GL_MakeCurrent(platform.glWindow, platform.glContext);   // [vkwindow] created above
+     else platform.glContext = SDL_GL_CreateContext(platform.window);
+     fprintf(stderr, "[bootw] SDL_GL_CreateContext: %u ms\n", SDL_GetTicks() - _bt2);
+ 
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index 75a2d92..888c716 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -538,6 +538,13 @@ static int runGsReplay(PS2Runtime &rt, const char *path)
+ extern "C" void ps2xGsRecordFlush();      // PS2X_GS_RECORD ring buffer (ps2_gs_gpu.cpp)
+ extern "C" void ps2xGsRecordOnSignal(int);
+ 
++// [vkwindow] hybrid laptops: the drivers run this exe's OpenGL on the discrete GPU (NVIDIA Optimus, AMD switchable graphics),
++// where the native renderer's Vulkan device is, so the two share the window's image instead of one GPU drawing for the other
++#ifdef _WIN32
++extern "C" __declspec(dllexport) unsigned long NvOptimusEnablement = 1;
++extern "C" __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
++#endif
++
+ // [mergefix] helpers for the merge repairs
+ #ifdef _WIN32
+ #include <io.h>

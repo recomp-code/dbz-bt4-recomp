@@ -1,0 +1,15 @@
+diff --git a/ps2xRuntime/src/lib/ps2_seamvk.cpp b/ps2xRuntime/src/lib/ps2_seamvk.cpp
+--- a/ps2xRuntime/src/lib/ps2_seamvk.cpp
++++ b/ps2xRuntime/src/lib/ps2_seamvk.cpp
+@@ -434,6 +434,11 @@
+                 g_gpu.progOutline = dev.request_program(kRtVert, sizeof(kRtVert), kOutlineFrag, sizeof(kOutlineFrag), &ov, &of);
+                 Vulkan::ResourceLayout dv = {}, df = {};   // depth mask: fullscreen triangle, depth image (1)
+                 dv.output_mask = 0x0u; df.sets[0].sampled_image_mask = 1u << 1; df.sets[0].meta[1].array_size = 1; df.output_mask = 0x1u;
++                // [maskpc] the mask's 16 B of push constants ([dofoff] dofOff): with no range in the layout the push was out of
++                // range -- NVIDIA passed the value anyway, MoltenVK did not, so the mask was never neutralised on a Mac: it wrote
++                // Z24[15:8], which wraps on the receding ground, and the haze step indexed by it drew thin light lines across
++                // the fight's floor (with the DoF blur on). Ztop and the 2:1 downscale share the layout and ignore it.
++                df.push_constant_size = 16;
+                 g_gpu.progDepthMask = dev.request_program(kRtVert, sizeof(kRtVert), kDepthMaskFrag, sizeof(kDepthMaskFrag), &dv, &df);
+                 g_gpu.progZtop = dev.request_program(kRtVert, sizeof(kRtVert), kZtopFrag, sizeof(kZtopFrag), &dv, &df);   // [ztopnative] same layout: one sampled image
+                 g_gpu.progGlowDown = dev.request_program(kRtVert, sizeof(kRtVert), kGlowDownFrag, sizeof(kGlowDownFrag), &dv, &df);   // [postnative] step 4a: one sampled image (the scene)

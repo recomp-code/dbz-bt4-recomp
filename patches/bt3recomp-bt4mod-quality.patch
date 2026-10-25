@@ -1,0 +1,80 @@
+diff --git a/ps2xRuntime/src/lib/ps2_seamvk.cpp b/ps2xRuntime/src/lib/ps2_seamvk.cpp
+index 805bad8..b5199b3 100644
+--- a/ps2xRuntime/src/lib/ps2_seamvk.cpp
++++ b/ps2xRuntime/src/lib/ps2_seamvk.cpp
+@@ -273,6 +273,7 @@ namespace seamvk
+             int jitSign = -1; uint32_t jitPos = 0; uint64_t jitCycle = 0;   // [jitcycle] PS2X_UPSCALE_JITSIGN_CYCLE=1: this frame's sign pair (0 "--", 1 "-+", 2 "+-", 3 "++"), -1 = the fixed one
+             Vulkan::ImageHandle out;            // the composed frame
+             Vulkan::ImageHandle white;          // 1x1 for untextured draws
++            Vulkan::SamplerHandle anisoWrap, anisoClamp;   // [aniso] the mipmapped draws' samplers: anisotropic, LOD-biased under an upscaler
+             Vulkan::ImageHandle outlineH;       // [outline] pass A output (minC, maxC, minF, maxF), target-sized
+             Vulkan::ImageHandle snap;           // destination snapshot for DATE draws
+             std::vector<std::pair<Vulkan::ImageHandle, int32_t>> zKeep;   // [zdecdump] depth copies taken at Z read-backs while dumping
+@@ -814,6 +815,26 @@ namespace seamvk
+                 const uint32_t whitePx = 0xFFFFFFFFu;
+                 Vulkan::ImageInitialData init = { &whitePx, 0, 0 };
+                 g_gpu.white = dev.create_image(Vulkan::ImageCreateInfo::immutable_2d_image(1, 1, VK_FORMAT_R8G8B8A8_UNORM), &init);
++                {   // [aniso] Mipmapped textures (the stage, the characters) seen at a slant -- the arena floor, the cliffs -- blurred into
++                    // their small mips: up to 16x anisotropic filtering keeps them sharp. Under a temporal upscaler the textures are also
++                    // sampled with a negative LOD bias, as NVIDIA and AMD advise (the upscaler resolves the extra detail across frames).
++                    // PS2X_TEX_ANISO=<1..16> (1 = off), PS2X_TEX_LODBIAS=<bias> override.
++                    const auto &feat = dev.get_device_features();
++                    const float maxAniso = feat.enabled_features.samplerAnisotropy ? dev.get_gpu_properties().limits.maxSamplerAnisotropy : 1.0f;
++                    static const float s_aniso = [](){ const char *v = std::getenv("PS2X_TEX_ANISO"); return v && v[0] ? float(std::atof(v)) : 16.0f; }();
++                    static const float s_bias = [](){ const char *v = std::getenv("PS2X_TEX_LODBIAS"); return v && v[0] ? float(std::atof(v)) : (upscaleMode() ? -0.5f : 0.0f); }();
++                    const float aniso = std::max(1.0f, std::min(s_aniso, maxAniso));
++                    for (int wrap = 0; wrap < 2; ++wrap)
++                    {
++                        Vulkan::SamplerCreateInfo si = {};
++                        si.mag_filter = VK_FILTER_LINEAR; si.min_filter = VK_FILTER_LINEAR; si.mipmap_mode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
++                        si.address_mode_u = si.address_mode_v = si.address_mode_w = wrap ? VK_SAMPLER_ADDRESS_MODE_REPEAT : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++                        si.mip_lod_bias = s_bias; si.anisotropy_enable = aniso > 1.0f ? VK_TRUE : VK_FALSE; si.max_anisotropy = aniso;
++                        si.compare_op = VK_COMPARE_OP_NEVER; si.min_lod = 0.0f; si.max_lod = VK_LOD_CLAMP_NONE; si.border_color = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
++                        (wrap ? g_gpu.anisoWrap : g_gpu.anisoClamp) = dev.create_sampler(si);
++                    }
++                    std::fprintf(stderr, "[aniso] mipmapped textures: %gx anisotropic, LOD bias %g\n", aniso, s_bias);
++                }
+                 {   // [reactive] "no mask"
+                     const uint32_t blackPx = 0u; Vulkan::ImageInitialData bi = { &blackPx, 0, 0 };
+                     g_gpu.black = dev.create_image(Vulkan::ImageCreateInfo::immutable_2d_image(1, 1, VK_FORMAT_R8G8B8A8_UNORM), &bi);
+@@ -1665,7 +1686,10 @@ namespace seamvk
+                 const bool texAlpha = t.tcc && (t.ate || (t.abe && t.aC == 0u));
+                 const Vulkan::StockSampler smp = hw ? ((mipsOn() && !texAlpha) ? (t.wms == 0u ? Vulkan::StockSampler::TrilinearWrap : Vulkan::StockSampler::TrilinearClamp)
+                                                                 : (t.wms == 0u ? Vulkan::StockSampler::LinearWrap : Vulkan::StockSampler::LinearClamp)) : Vulkan::StockSampler::NearestClamp;   // [mips] minified textures filter across the chain (far stage surfaces aliased at level 0)
+-                cmd.set_texture(0, 1, tex ? g_gpu.tex[t.tex]->get_view() : g_gpu.white->get_view(), smp);
++                const bool trilinear = hw && mipsOn() && !texAlpha;
++                const Vulkan::SamplerHandle &q = t.wms == 0u ? g_gpu.anisoWrap : g_gpu.anisoClamp;
++                if (trilinear && q) cmd.set_texture(0, 1, tex ? g_gpu.tex[t.tex]->get_view() : g_gpu.white->get_view(), *q);   // [aniso]
++                else cmd.set_texture(0, 1, tex ? g_gpu.tex[t.tex]->get_view() : g_gpu.white->get_view(), smp);
+                 if (hw) { pc.fA[0] |= 32768; cmd.push_constants(&pc, 0, sizeof(pc)); }
+             }
+             if (mode != 3) cmd.set_input_attachments(0, 2);   // [date] binding 2 = the pass's colour attachment as input (self-dependent subpass)
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 544bdfa..c71d147 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1680,6 +1680,24 @@ bool PS2Runtime::initialize(const char *title)
+             }
+             else
+                 bt3SetWindowSize(hostWinW, hostWinH);   // moving monitors can leave the window fitted
++            // [autoscale] PS2X_SEAMVK_SCALE=auto: the native renderer's resolution from the size it is shown at. Under a
++            // temporal upscaler the render height is ~75% of the output's (DLSS "Quality"); a fixed 2x was "Ultra
++            // Performance" on a 1440p screen and blurred the picture. 2x at least, 4x at most (1080p 2x, 1440p 3x, 4K 4x).
++            if (const char *sv = std::getenv("PS2X_SEAMVK_SCALE"); sv && !std::strcmp(sv, "auto"))
++            {
++                const int outH = winMode >= 1 ? bt3GetMonitorHeight(idx) : hostWinH;
++                const char *up = std::getenv("PS2X_SEAMVK_UPSCALE");
++                const bool upscaler = up && up[0] && std::strcmp(up, "off") != 0;
++                int sc = upscaler ? (int)std::ceil(double(outH) * 0.75 / 448.0) : (int)std::lround(double(outH) / 448.0);
++                sc = std::max(2, std::min(4, sc));
++                const std::string s = std::to_string(sc);
++#if defined(_WIN32)
++                _putenv_s("PS2X_SEAMVK_SCALE", s.c_str());
++#else
++                setenv("PS2X_SEAMVK_SCALE", s.c_str(), 1);
++#endif
++                std::fprintf(stderr, "[autoscale] shown %d px tall%s: the native renderer at %dx\n", outH, upscaler ? " through the upscaler" : "", sc);
++            }
+         }
+         _mark("window+monitor");
+         // [icon] Carry the app icon onto the runner window. Same asset

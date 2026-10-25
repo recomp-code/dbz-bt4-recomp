@@ -1,0 +1,142 @@
+diff --git "a/C:\\DBZBT4Recomp\\tmp_layers/ps2xRuntime/src/lib/ps2_seamvk.cpp" "b/C:\\DBZBT4Recomp/bt3mod/ps2xRuntime/src/lib/ps2_seamvk.cpp"
+index 1198b3e..38a0991 100644
+--- a/ps2xRuntime/src/lib/ps2_seamvk.cpp
++++ b/ps2xRuntime/src/lib/ps2_seamvk.cpp
+@@ -2081,10 +2081,18 @@ namespace seamvk
+             VkDevice dev = VK_NULL_HANDLE; VkQueue queue = VK_NULL_HANDLE; VolkDeviceTable t = {};
+             VkCommandPool pool = VK_NULL_HANDLE; VkCommandBuffer cb[3] = {};
+             NVSDK_NGX_Parameter *params = nullptr; NVSDK_NGX_Handle *feature = nullptr; uint32_t inW = 0, inH = 0, outW = 0, outH = 0;
+-            NgxImg im[5];   // colour, depth, motion, output, [reactive] the effects' mask (DLSS's bias-current-colour mask)
++            NgxImg im[6];   // colour, depth, motion, output, [reactive] the effects' mask (DLSS's bias-current-colour mask), [dlssnr] the neural pass's output
++            // [dlssnr] EXPERIMENTAL (PS2X_DLSSNR=1): NGX feature 18, the "DLSS 5" neural rendering pass, after DLSS at the output size
++            NVSDK_NGX_Parameter *nrParams = nullptr; NVSDK_NGX_Handle *nr = nullptr; uint32_t nrW = 0, nrH = 0; bool nrFailed = false;
+             std::vector<std::pair<NgxImg, uint32_t>> deadImgs; std::vector<std::pair<VkSemaphore, uint32_t>> deadSems; std::vector<std::pair<NVSDK_NGX_Handle *, uint32_t>> deadFeatures;
+         } g_ngx;
+-        constexpr VkFormat kNgxFormats[5] = { VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R32_SFLOAT, VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8_UNORM };
++        constexpr VkFormat kNgxFormats[6] = { VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R32_SFLOAT, VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8B8A8_UNORM };
++        // [dlssnr] EXPERIMENTAL, off by default, never shipped with a runtime file: NGX feature 18 ("DLSS 5" neural rendering,
++        // nvngx_dlssnr.dll). NVIDIA does not document it; the parameter names (DLSSNR.*) come from community re-implementations
++        // of the NGX receiving side and may be wrong. The DLL is NOT packaged: PS2X_DLSSNR_DIR names the folder the player keeps
++        // it in, added to NGX's search path. Any failure is logged with its NGX code and the frame stays plain DLSS.
++        bool dlssnrOn() { static const bool s = [](){ const char *v = std::getenv("PS2X_DLSSNR"); return v && v[0] == '1'; }(); return s; }
++        float dlssnrEnvF(const char *name, float def) { const char *v = std::getenv(name); return v && v[0] ? float(std::atof(v)) : def; }
+         constexpr VkImageUsageFlags kNgxUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+         bool dlssInit(Vulkan::Device &gd)
+@@ -2121,6 +2129,18 @@ namespace seamvk
+             { std::fprintf(stderr, "[dlss] NGX command buffers failed: FSR instead\n"); return false; }
+             // PS2X_DLSS_LOG=1: NGX's own log lines in ours
+             static NVSDK_NGX_FeatureCommonInfo s_info = {};
++            static std::wstring s_nrDir; static const wchar_t *s_nrPaths[1] = {};
++            if (dlssnrOn())
++            {   // [dlssnr] the folder that holds nvngx_dlssnr.dll, on NGX's search path
++                if (const char *d = std::getenv("PS2X_DLSSNR_DIR"); d && d[0])
++                {
++                    const int n = MultiByteToWideChar(CP_UTF8, 0, d, -1, nullptr, 0);
++                    s_nrDir.assign(size_t(n > 0 ? n - 1 : 0), L'\0'); if (n > 1) MultiByteToWideChar(CP_UTF8, 0, d, -1, s_nrDir.data(), n);
++                    s_nrPaths[0] = s_nrDir.c_str(); s_info.PathListInfo.Path = s_nrPaths; s_info.PathListInfo.Length = 1;
++                    std::fprintf(stderr, "[dlssnr] experimental neural pass on; NGX also looks in %s\n", d);
++                }
++                else std::fprintf(stderr, "[dlssnr] experimental neural pass on, but PS2X_DLSSNR_DIR is not set\n");
++            }
+             if (const char *v = std::getenv("PS2X_DLSS_LOG"); v && v[0] == '1')
+             {
+                 s_info.LoggingInfo.LoggingCallback = [](const char *msg, NVSDK_NGX_Logging_Level, NVSDK_NGX_Feature) { std::fprintf(stderr, "[ngx] %s", msg); };
+@@ -2156,10 +2176,11 @@ namespace seamvk
+             for (size_t i = 0; i < g_ngx.deadImgs.size();)
+                 if (g_gpu.ringNext - g_ngx.deadImgs[i].second > 4u) { ngxDropImg(g_ngx.deadImgs[i].first); g_ngx.deadImgs[i] = g_ngx.deadImgs.back(); g_ngx.deadImgs.pop_back(); }
+                 else ++i;
+-            for (int k = 0; k < 5; ++k)
++            for (int k = 0; k < 6; ++k)
+             {
++                if (k == 5 && !dlssnrOn()) continue;   // [dlssnr] its output only when asked for
+                 NgxImg &m = g_ngx.im[k];
+-                const uint32_t iw = k == 3 ? ow : w, ih = k == 3 ? oh : h;
++                const uint32_t iw = (k == 3 || k == 5) ? ow : w, ih = (k == 3 || k == 5) ? oh : h;
+                 if (m.gimg && m.gimg->get_width() == iw && m.gimg->get_height() == ih && m.view) continue;
+                 if (m.gimg) { g_ngx.deadImgs.emplace_back(m, g_gpu.ringNext); m = NgxImg(); }
+                 auto ci = Vulkan::ImageCreateInfo::render_target(iw, ih, kNgxFormats[k]);
+@@ -2194,6 +2215,58 @@ namespace seamvk
+             }
+             return true;
+         }
++        // [dlssnr] the neural pass on the NGX command buffer, after DLSS wrote im[3]: im[3] in, im[5] out (output size), the
++        // render-size depth and motion as they went to DLSS. True when im[5] holds this frame's picture.
++        const char *ngxResultName(NVSDK_NGX_Result r)
++        {
++            switch (unsigned(r)) { case 0xBAD00001u: return "FeatureNotSupported (the DLL refuses this GPU)"; case 0xBAD00002u: return "PlatformError"; case 0xBAD00004u: return "FeatureNotFound (no nvngx_dlssnr.dll on NGX's path)";
++                                   case 0xBAD00005u: return "InvalidParameter"; case 0xBAD00007u: return "NotInitialized"; case 0xBAD0000Bu: return "UnableToInitializeFeature"; case 0xBAD0000Cu: return "OutOfDate (driver too old)";
++                                   case 0xBAD00010u: return "UnsupportedParameter"; case 0xBAD00011u: return "Denied"; case 0xBAD00012u: return "NotImplemented"; default: return "?"; }
++        }
++        bool dlssnrRun(VkCommandBuffer cb, bool reset, uint32_t inW, uint32_t inH, uint32_t outW, uint32_t outH)
++        {
++            if (!dlssnrOn() || g_ngx.nrFailed || !g_ngx.im[5].view) return false;
++            auto fail = [](const char *what, NVSDK_NGX_Result r) { std::fprintf(stderr, "[dlssnr] %s failed: 0x%08x %s -- plain DLSS from here on\n", what, unsigned(r), ngxResultName(r)); g_ngx.nrFailed = true; return false; };
++            if (!g_ngx.nrParams) { const NVSDK_NGX_Result r = NVSDK_NGX_VULKAN_AllocateParameters(&g_ngx.nrParams); if (NVSDK_NGX_FAILED(r) || !g_ngx.nrParams) return fail("AllocateParameters", r); }
++            NVSDK_NGX_Parameter *p = g_ngx.nrParams;
++            auto controls = [&]() {   // the look; NVIDIA's own defaults where unset (names from the community: unverified)
++                NVSDK_NGX_Parameter_SetF(p, "DLSSNR.Intensity", dlssnrEnvF("PS2X_DLSSNR_INTENSITY", 1.0f));
++                NVSDK_NGX_Parameter_SetUI(p, "DLSSNR.Style", unsigned(dlssnrEnvF("PS2X_DLSSNR_STYLE", 0.0f)));
++            };
++            if (!g_ngx.nr || g_ngx.nrW != outW || g_ngx.nrH != outH)
++            {
++                if (g_ngx.nr) { g_ngx.deadFeatures.emplace_back(g_ngx.nr, g_gpu.ringNext); g_ngx.nr = nullptr; }
++                NVSDK_NGX_Parameter_SetUI(p, "DLSSNR.Width", outW); NVSDK_NGX_Parameter_SetUI(p, "DLSSNR.Height", outH);
++                NVSDK_NGX_Parameter_SetUI(p, "DLSSNR.DepthInverted", 1u);   // the GS depth grows towards the camera
++                NVSDK_NGX_Parameter_SetUI(p, NVSDK_NGX_Parameter_CreationNodeMask, 1u); NVSDK_NGX_Parameter_SetUI(p, NVSDK_NGX_Parameter_VisibilityNodeMask, 1u);
++                controls();
++                const NVSDK_NGX_Result r = NVSDK_NGX_VULKAN_CreateFeature1(g_ngx.dev, cb, NVSDK_NGX_Feature(18), p, &g_ngx.nr);
++                if (NVSDK_NGX_FAILED(r) || !g_ngx.nr) { g_ngx.nr = nullptr; return fail("CreateFeature (18)", r); }
++                g_ngx.nrW = outW; g_ngx.nrH = outH; reset = true;
++                std::fprintf(stderr, "[dlssnr] neural rendering feature created at %ux%u (DLSS input %ux%u)\n", outW, outH, inW, inH);
++            }
++            VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER }; mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT; mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
++            g_ngx.t.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);   // DLSS's output -> the neural pass's input
++            const VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
++            auto res = [&](int k, bool rw) { const NgxImg &m = g_ngx.im[k]; return NVSDK_NGX_Create_ImageView_Resource_VK(m.view, m.img, range, kNgxFormats[k], m.gimg->get_width(), m.gimg->get_height(), rw); };
++            NVSDK_NGX_Resource_VK col = res(3, false), out = res(5, true), dep = res(1, false), mv = res(2, false);
++            NVSDK_NGX_Parameter_SetVoidPointer(p, "DLSSNR.Color", &col); NVSDK_NGX_Parameter_SetVoidPointer(p, "DLSSNR.Output", &out);
++            NVSDK_NGX_Parameter_SetVoidPointer(p, "DLSSNR.Depth", &dep); NVSDK_NGX_Parameter_SetVoidPointer(p, "DLSSNR.MVec", &mv);
++            for (const char *n : { "DLSSNR.ColorSubrectWidth", "DLSSNR.OutputSubrectWidth" }) NVSDK_NGX_Parameter_SetUI(p, n, outW);
++            for (const char *n : { "DLSSNR.ColorSubrectHeight", "DLSSNR.OutputSubrectHeight" }) NVSDK_NGX_Parameter_SetUI(p, n, outH);
++            for (const char *n : { "DLSSNR.DepthSubrectWidth", "DLSSNR.MVecSubrectWidth" }) NVSDK_NGX_Parameter_SetUI(p, n, inW);
++            for (const char *n : { "DLSSNR.DepthSubrectHeight", "DLSSNR.MVecSubrectHeight" }) NVSDK_NGX_Parameter_SetUI(p, n, inH);
++            // the vectors are in render pixels; the pass runs at the output size (PS2X_DLSSNR_MVSCALE overrides)
++            const float mvs = dlssnrEnvF("PS2X_DLSSNR_MVSCALE", 0.0f);
++            NVSDK_NGX_Parameter_SetF(p, "DLSSNR.MVecScaleX", mvs > 0.0f ? mvs : float(outW) / float(inW)); NVSDK_NGX_Parameter_SetF(p, "DLSSNR.MVecScaleY", mvs > 0.0f ? mvs : float(outH) / float(inH));
++            NVSDK_NGX_Parameter_SetUI(p, "DLSSNR.Reset", reset ? 1u : 0u);
++            controls();
++            const NVSDK_NGX_Result r = NVSDK_NGX_VULKAN_EvaluateFeature_C(cb, g_ngx.nr, p, nullptr);
++            if (NVSDK_NGX_FAILED(r)) return fail("Evaluate", r);
++            { static bool s_once = false; if (!s_once) { s_once = true; std::fprintf(stderr, "[dlssnr] first neural frame evaluated\n"); } }
++            return true;
++        }
++        bool g_nrThisFrame = false;   // [dlssnr] im[5] holds this frame's picture (else im[3], plain DLSS)
+         // The frame's command buffer has been submitted and flushed: wait for it (an exported semaphore Granite signalled),
+         // evaluate DLSS on the NGX device; sem = the semaphore Granite must wait before touching the shared images again (-1: none).
+         bool dlssRun(Vulkan::Device &gd, bool reset, intptr_t &sem)
+@@ -2277,6 +2350,7 @@ namespace seamvk
+                 }
+                 const NVSDK_NGX_Result r = NGX_VULKAN_EVALUATE_DLSS_EXT(cb, g_ngx.feature, g_ngx.params, &ev);
+                 if (NVSDK_NGX_FAILED(r)) { static int s_n = 0; if (s_n++ < 4) std::fprintf(stderr, "[dlss] evaluate failed (0x%08x)\n", unsigned(r)); ok = false; }
++                g_nrThisFrame = ok && dlssnrRun(cb, reset, inW, inH, outW, outH);   // [dlssnr]
+             }
+             g_ngx.t.vkEndCommandBuffer(cb);
+             // NGX -> Granite: a semaphore signalled after the evaluation (also when it failed: Granite waits for it either way)
+@@ -3551,6 +3625,7 @@ namespace seamvk
+                             cmd->image_barrier(s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, 0, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0);
+                         }
+                         cmd->image_barrier(*g_ngx.im[3].gimg, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0);
++                        if (g_ngx.im[5].gimg) cmd->image_barrier(*g_ngx.im[5].gimg, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0);   // [dlssnr]
+                         dev.submit(cmd);
+                         dev.flush_frame();
+                         intptr_t sem = -1;
+@@ -3570,7 +3645,7 @@ namespace seamvk
+                         cmd = dev.request_command_buffer();
+                         if (done)
+                         {   // the upscaled image into the frame's own output image (the alpha pass and the copies below use that)
+-                            Vulkan::Image &o = *g_ngx.im[3].gimg;
++                            Vulkan::Image &o = *g_ngx.im[g_nrThisFrame ? 5 : 3].gimg;   // [dlssnr] the neural pass's picture when it ran
+                             cmd->image_barrier(o, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+                             cmd->image_barrier(*g_gpu.up, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+                             cmd->copy_image(*g_gpu.up, o);

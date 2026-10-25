@@ -1,0 +1,31 @@
+diff --git "a/C:\\DBZBT4Recomp\\tmp_layers/ps2xRuntime/third_party/bt3gl/src/platforms/rcore_desktop_sdl.c" "b/C:\\DBZBT4Recomp/bt3mod/ps2xRuntime/third_party/bt3gl/src/platforms/rcore_desktop_sdl.c"
+index c6a867f..225429b 100644
+--- a/ps2xRuntime/third_party/bt3gl/src/platforms/rcore_desktop_sdl.c
++++ b/ps2xRuntime/third_party/bt3gl/src/platforms/rcore_desktop_sdl.c
+@@ -1410,6 +1410,12 @@ void PollInputEvents(void)
+         {
+             case SDL_QUIT: CORE.Window.shouldClose = true; break;
+ 
++        #ifdef PLATFORM_DESKTOP_SDL3
++            // [vkwindow] GL keeps a hidden window alive, so closing the visible (Vulkan) window never leaves zero windows
++            // and SDL never auto-posts SDL_EVENT_QUIT. Treat the window's close request as a quit.
++            case SDL_EVENT_WINDOW_CLOSE_REQUESTED: CORE.Window.shouldClose = true; break;
++        #endif
++
+             case SDL_DROPFILE:      // Dropped file
+             {
+                 if (CORE.Window.dropFileCount == 0)
+@@ -1460,6 +1466,13 @@ void PollInputEvents(void)
+                 switch (event.window.event)
+                 {
+         #endif
++            #ifndef PLATFORM_DESKTOP_SDL3
++                    case SDL_WINDOWEVENT_CLOSE:
++                    {   // [vkwindow] closing the visible (Vulkan) window with the hidden GL window still alive gives no
++                        // SDL_QUIT (the app still has a window), so the game never saw the close. Quit on it.
++                        CORE.Window.shouldClose = true;
++                    } break;
++            #endif
+                     case SDL_WINDOWEVENT_RESIZED:
+                     case SDL_WINDOWEVENT_SIZE_CHANGED:
+                     {

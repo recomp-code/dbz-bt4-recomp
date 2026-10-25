@@ -1,0 +1,59 @@
+diff --git a/ps2xRuntime/src/lib/ps2_seamgs.cpp b/ps2xRuntime/src/lib/ps2_seamgs.cpp
+index 86a630d..b0cf21f 100644
+--- a/ps2xRuntime/src/lib/ps2_seamgs.cpp
++++ b/ps2xRuntime/src/lib/ps2_seamgs.cpp
+@@ -204,9 +204,13 @@ namespace seamgs
+             const uint32_t rel = p - (bp >> 5); ox = (rel % ppr) * pw; oy = (rel / ppr) * ph; return true;
+         }
+         template <class F> void forRectPages(uint32_t psm, uint32_t bp, uint32_t bw, uint32_t x0, uint32_t y0, uint32_t w, uint32_t h, F &&f)
+-        {   // every page a rect spans (page corners + the rect's last row/column), each once
++        {   // every page a rect spans (page corners + the rect's last row/column), each once. [kispark] A base that is not
++            // page-aligned puts each page-sized cell of the buffer across two pages (its blocks run on into the next one):
++            // the next page is listed too, or a transfer there was never applied before a read (the ki sparks' 128x128 PSMT8
++            // textures at 0x2b84 / 0x2b94 / 0x2b1c decoded with stale bytes: noisy grey blocks)
+             if (w == 0u || h == 0u) return;
+             uint32_t pw, ph; pageDims(psm, pw, ph);
++            const bool spill = (bp & 31u) != 0u;
+             uint32_t seen[64]; uint32_t ns = 0;
+             for (uint32_t y = y0;; y += ph)
+             {
+@@ -217,6 +221,11 @@ namespace seamgs
+                     const uint32_t pg = pageOf(psm, bp, bw, xx & 0x7FFu, yy & 0x7FFu);
+                     bool dup = false; for (uint32_t i = 0; i < ns; ++i) if (seen[i] == pg) { dup = true; break; }
+                     if (!dup && pg < kPages) { if (ns < 64u) seen[ns++] = pg; f(pg); }
++                    if (spill && pg + 1u < kPages)
++                    {
++                        bool dup1 = false; for (uint32_t i = 0; i < ns; ++i) if (seen[i] == pg + 1u) { dup1 = true; break; }
++                        if (!dup1) { if (ns < 64u) seen[ns++] = pg + 1u; f(pg + 1u); }
++                    }
+                     if (xx == x0 + w - 1u) break;
+                 }
+                 if (yy == y0 + h - 1u) break;
+@@ -1671,7 +1680,9 @@ namespace seamgs
+                 {   // [lazyvram] keep the bytes, stamp the pages now, write later (small transfers -- palettes, border pieces -- stay eager)
+                     const uint32_t bpp8 = (x.dpsm == PSMT8 || x.dpsm == PSMT8H) ? 8u : (x.dpsm == PSMT4 || x.dpsm == PSMT4HL || x.dpsm == PSMT4HH) ? 4u : (x.dpsm == PSMCT16 || x.dpsm == PSMCT16S || x.dpsm == PSMZ16 || x.dpsm == PSMZ16S) ? 16u : (x.dpsm == PSMCT24 || x.dpsm == PSMZ24) ? 24u : 32u;
+                     const uint64_t total = (uint64_t)x.rrw * x.rrh * bpp8 / 8u;
+-                    if (g_lazyVram && total > 4096u && x.dbw != 0u && x.rrw <= 2048u && x.rrh <= 2048u)
++                    // (page-aligned bases only: applyPage maps a page to one page-sized cell of the buffer, which an unaligned
++                    // base spreads over two pages; such transfers are written now [kispark])
++                    if (g_lazyVram && total > 4096u && x.dbw != 0u && (x.dbp & 31u) == 0u && x.rrw <= 2048u && x.rrh <= 2048u)
+                     {
+                         x.lazy = true; x.rec = g_xlogNext++;
+                         XferRec &r = g_xlog[x.rec];
+diff --git a/ps2xRuntime/src/lib/ps2_seamvk.cpp b/ps2xRuntime/src/lib/ps2_seamvk.cpp
+index 250e3ca..3bdfdda 100644
+--- a/ps2xRuntime/src/lib/ps2_seamvk.cpp
++++ b/ps2xRuntime/src/lib/ps2_seamvk.cpp
+@@ -2853,6 +2853,12 @@ namespace seamvk
+                 static const size_t s_skipTail = [](){ const char *v = std::getenv("PS2X_SEAMVK_SKIPTAIL"); return v && v[0] ? (size_t)std::atoll(v) : 0u; }();
+                 if (s_skipTail && di + s_skipTail >= f.draws.size()) { ++drawIdx; continue; }
+             }
++            {   // PS2X_SEAMVK_SKIPDRAWS=<i,j,...>: skip those draw indices in the dumped frames (diagnostic bisect)
++                static const std::vector<size_t> s_skipDraws = [](){ std::vector<size_t> v; if (const char *e = std::getenv("PS2X_SEAMVK_SKIPDRAWS")) for (const char *c = e; *c; ) { char *n = nullptr; v.push_back((size_t)std::strtoull(c, &n, 10)); if (n == c) break; c = n; while (*c == ',' || *c == ' ') ++c; } return v; }();
++                if (dumpNow && !s_skipDraws.empty() && std::find(s_skipDraws.begin(), s_skipDraws.end(), di) != s_skipDraws.end()) { ++drawIdx; continue; }
++                static const std::vector<uint32_t> s_skipTbps = [](){ std::vector<uint32_t> v; if (const char *e = std::getenv("PS2X_SEAMVK_SKIPTBP")) for (const char *c = e; *c; ) { char *n = nullptr; v.push_back((uint32_t)std::strtoul(c, &n, 16)); if (n == c) break; c = n; while (*c == ',' || *c == ' ') ++c; } return v; }();   // hex texture bases
++                if (!s_skipTbps.empty() && d.kind == 0 && t.tme && std::find(s_skipTbps.begin(), s_skipTbps.end(), t.tex0lo & 0x3FFFu) != s_skipTbps.end()) { ++drawIdx; continue; }
++            }
+             if (d.kind == 3)
+             {   // [postnative] an engine-seam step at its stream position
+                 if (inPass) { cmd->end_render_pass(); inPass = false; }

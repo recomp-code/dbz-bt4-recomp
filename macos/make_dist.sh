@@ -84,6 +84,9 @@ fi
 
 # resources: the runtime's
 cp -R "$RUNNER/assets" "$C/Resources/runtime/assets"
+# [pipewarm] the pipelines the native renderer uses (recorded over fights at 30 / 60 fps, windowed and fullscreen, and
+# the menus): built in the background at start, so a fresh install does not stop at each effect's first appearance
+cp "$HERE/seamvk_pipelines.bin" "$C/Resources/runtime/assets/seamvk_pipelines.bin"
 cp "$RUNNER/fps60_sites.txt" "$C/Resources/runtime/"
 cp "$HERE/settings.toml" "$C/Resources/runtime/settings.toml"
 # icon: the runtime's icon.png

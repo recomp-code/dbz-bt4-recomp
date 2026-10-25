@@ -1,0 +1,427 @@
+diff --git a/ps2xRuntime/src/lib/ps2_seamvk.cpp b/ps2xRuntime/src/lib/ps2_seamvk.cpp
+index 5235ec4..250e3ca 100644
+--- a/ps2xRuntime/src/lib/ps2_seamvk.cpp
++++ b/ps2xRuntime/src/lib/ps2_seamvk.cpp
+@@ -56,6 +56,9 @@ namespace ps2_seamvk_metalfx
+ #include <thread>
+ #include <condition_variable>
+ #include <unordered_set>
++#include <memory>
++#include <string>
++#include <type_traits>
+ #include <unordered_map>
+ #include <atomic>
+ extern std::atomic<uint64_t> g_bt3FrameCount;   // game_overrides.cpp: the game's frame counter
+@@ -70,6 +73,22 @@ extern std::atomic<int> g_ps2VStepMode;          // ps2_stepcensus.cpp: [fps60]
+ #include <mutex>
+ #include <vector>
+ 
++// [pipewarm] Granite keeps a command buffer's pipeline state and a render pass's formats private; these name them through
++// explicit instantiation (where access is not checked), the standard way to read a private member without changing Granite.
++namespace seamvk_rob
++{
++    template <typename Tag, typename Tag::type M> struct Rob { friend typename Tag::type get(Tag) { return M; } };
++    struct CmdState { using type = Vulkan::DeferredPipelineCompile Vulkan::CommandBuffer::*; friend type get(CmdState); };
++    template struct Rob<CmdState, &Vulkan::CommandBuffer::pipeline_state>;
++    struct RpColors { using type = VkFormat (Vulkan::RenderPass::*)[Vulkan::VULKAN_NUM_ATTACHMENTS]; friend type get(RpColors); };
++    template struct Rob<RpColors, &Vulkan::RenderPass::color_attachments>;
++    struct RpDepth { using type = VkFormat Vulkan::RenderPass::*; friend type get(RpDepth); };
++    template struct Rob<RpDepth, &Vulkan::RenderPass::depth_stencil>;
++    struct DevRp { using type = const Vulkan::RenderPass &(Vulkan::Device::*)(const Vulkan::RenderPassInfo &, bool); friend type get(DevRp); };
++    template struct Rob<DevRp, &Vulkan::Device::request_render_pass>;
++}
++extern "C" const char *ps2xExeDirC();   // main.cpp: <exeDir> (honors PS2X_EXEDIR)
++
+ namespace seamvk
+ {
+     namespace
+@@ -274,6 +293,200 @@ namespace seamvk
+             double msTake = 0, msRecord = 0, msSubmit = 0, msWait = 0;
+         };
+         Gpu g_gpu;
++        // [pipewarm] The first time a pipeline is used, Granite compiles it on the spot (MoltenVK: SPIR-V -> MSL -> Metal), and the
++        // picture stops for that long: up to 130 ms for an effect's first appearance on a Mac, until macOS has the Metal
++        // binary cached (per executable, so again after every update). Each pipeline the renderer creates is recorded
++        // (program, render pass formats, Granite's static state) in savedata/seamvk_pipelines.bin; at start every recorded
++        // pipeline is rebuilt on background threads while the game boots, so the effects find them ready. A seed list ships
++        // in assets/ (the app's), so the first start after an install is warm too. PS2X_PIPEWARM=0 turns both off;
++        // PS2X_PIPEWARM=1 turns it on beyond macOS (elsewhere the drivers keep their own caches).
++        namespace pipewarm
++        {
++            struct Sub { uint32_t nc, ci[Vulkan::VULKAN_NUM_ATTACHMENTS], ni, ii[Vulkan::VULKAN_NUM_ATTACHMENTS], depthAtt, depthLayout; };
++            struct Rec
++            {
++                uint64_t hash, progHash, rpHash;
++                uint32_t nColor, colors[Vulkan::VULKAN_NUM_ATTACHMENTS], depth, nSub, subpass, subgroupTag, pad;
++                Sub subs[2];
++                Vulkan::PipelineState st;
++                Vulkan::PotentialState pot;
++                Vulkan::VertexAttribState attribs[Vulkan::VULKAN_NUM_VERTEX_ATTRIBS];
++                VkDeviceSize strides[Vulkan::VULKAN_NUM_VERTEX_BUFFERS];
++                VkVertexInputRate rates[Vulkan::VULKAN_NUM_VERTEX_BUFFERS];
++            };
++            static_assert(std::is_trivially_copyable<Rec>::value, "pipewarm records are written as bytes");
++            constexpr char kMagic[8] = { 'P', 'S', '2', 'X', 'P', 'W', '0', '1' };
++            std::mutex mtx;
++            std::vector<Rec> recs;
++            std::unordered_set<uint64_t> known;
++            uint64_t lastHash = 0;
++            std::vector<std::thread> workers;
++            std::atomic<bool> stop{false};
++            std::atomic<uint32_t> built{0};
++
++            bool enabled()
++            {
++                static const bool on = [](){ const char *v = std::getenv("PS2X_PIPEWARM");
++#if defined(__APPLE__)
++                    return !(v && v[0] == '0');
++#else
++                    return v && v[0] == '1';
++#endif
++                }();
++                return on;
++            }
++            std::string userPath() { const char *x = ps2xExeDirC(); return std::string(x && x[0] ? x : ".") + "/savedata/seamvk_pipelines.bin"; }
++            std::string seedPath() { const char *x = ps2xExeDirC(); return std::string(x && x[0] ? x : ".") + "/assets/seamvk_pipelines.bin"; }
++
++            void load(const std::string &path)
++            {
++                FILE *fp = std::fopen(path.c_str(), "rb");
++                if (!fp) return;
++                char magic[8]; uint32_t size = 0, n = 0;
++                if (std::fread(magic, 1, 8, fp) == 8 && !std::memcmp(magic, kMagic, 8) && std::fread(&size, 4, 1, fp) == 1 && std::fread(&n, 4, 1, fp) == 1 &&
++                    size == sizeof(Rec) && n < 100000u)
++                {
++                    Rec r;
++                    for (uint32_t i = 0; i < n && std::fread(&r, sizeof(Rec), 1, fp) == 1; ++i)
++                        if (known.insert(r.hash).second) recs.push_back(r);
++                }
++                std::fclose(fp);
++            }
++            void save()
++            {   // (caller holds mtx) written whole to a temporary, then renamed over the old list
++                const std::string path = userPath(), tmp = path + ".tmp";
++                FILE *fp = std::fopen(tmp.c_str(), "wb");
++                if (!fp) return;
++                const uint32_t size = sizeof(Rec), n = uint32_t(recs.size());
++                bool ok = std::fwrite(kMagic, 1, 8, fp) == 8 && std::fwrite(&size, 4, 1, fp) == 1 && std::fwrite(&n, 4, 1, fp) == 1 &&
++                          (n == 0 || std::fwrite(recs.data(), sizeof(Rec), n, fp) == n);
++                ok = std::fclose(fp) == 0 && ok;
++                if (ok) std::rename(tmp.c_str(), path.c_str()); else std::remove(tmp.c_str());
++            }
++
++            // note: after a draw; a pipeline hash not seen before is recorded (and the list saved: new ones are rare)
++            inline void note(Vulkan::CommandBuffer &cmd)
++            {
++                if (!enabled()) return;
++                const Vulkan::DeferredPipelineCompile &c = cmd.*get(seamvk_rob::CmdState());
++                if (c.hash == lastHash || !c.program || !c.layout || !c.compatible_render_pass) return;
++                lastHash = c.hash;
++                std::lock_guard<std::mutex> lk(mtx);
++                if (!known.insert(c.hash).second) return;
++                const Vulkan::RenderPass &rp = *c.compatible_render_pass;
++                if (rp.get_num_subpasses() > 2u) return;
++                Rec r; std::memset(&r, 0, sizeof(r));
++                r.hash = c.hash; r.progHash = c.program->get_hash(); r.rpHash = rp.get_hash();
++                const auto &cols = rp.*get(seamvk_rob::RpColors());
++                for (uint32_t i = 0; i < Vulkan::VULKAN_NUM_ATTACHMENTS; ++i) { r.colors[i] = uint32_t(cols[i]); if (cols[i] != VK_FORMAT_UNDEFINED) r.nColor = i + 1u; }
++                r.depth = uint32_t(rp.*get(seamvk_rob::RpDepth()));
++                r.nSub = rp.get_num_subpasses();
++                for (uint32_t s = 0; s < r.nSub; ++s)
++                {
++                    Sub &o = r.subs[s];
++                    o.nc = rp.get_num_color_attachments(s); for (uint32_t i = 0; i < o.nc; ++i) o.ci[i] = rp.get_color_attachment(s, i).attachment;
++                    o.ni = rp.get_num_input_attachments(s); for (uint32_t i = 0; i < o.ni; ++i) o.ii[i] = rp.get_input_attachment(s, i).attachment;
++                    o.depthAtt = rp.has_depth(s) || rp.has_stencil(s) ? 1u : 0u;
++                }
++                r.subpass = c.subpass_index; r.subgroupTag = c.subgroup_size_tag;
++                r.st = c.static_state; r.pot = c.potential_static_state;
++                std::memcpy(r.attribs, c.attribs, sizeof(r.attribs)); std::memcpy(r.strides, c.strides, sizeof(r.strides)); std::memcpy(r.rates, c.input_rates, sizeof(r.rates));
++                recs.push_back(r);
++                save();
++            }
++
++            // start: (ensureGpu, once the programs exist) rebuild every recorded pipeline on background threads
++            void start(Vulkan::Device &dev, const std::vector<Vulkan::Program *> &progs)
++            {
++                if (!enabled()) return;
++                std::vector<Vulkan::DeferredPipelineCompile> jobs;
++                {
++                    std::lock_guard<std::mutex> lk(mtx);
++                    load(userPath());
++                    load(seedPath());
++                    std::unordered_map<uint64_t, Vulkan::Program *> byHash;
++                    for (Vulkan::Program *p : progs) if (p) byHash[p->get_hash()] = p;
++                    std::unordered_map<uint32_t, Vulkan::ImageHandle> dummies;   // a 4x4 image per attachment format
++                    auto dummy = [&](uint32_t fmt) -> Vulkan::ImageView * {
++                        auto it = dummies.find(fmt);
++                        if (it == dummies.end())
++                        {
++                            auto ci = Vulkan::ImageCreateInfo::render_target(4, 4, VkFormat(fmt));
++                            ci.usage |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
++                            it = dummies.emplace(fmt, dev.create_image(ci)).first;
++                        }
++                        return it->second ? &it->second->get_view() : nullptr;
++                    };
++                    VkPipelineCache cache = VK_NULL_HANDLE;
++                    {   // the device's own pipeline cache, as a command buffer starts with it
++                        auto cmd = dev.request_command_buffer();
++                        cache = ((*cmd).*get(seamvk_rob::CmdState())).cache;
++                        dev.submit_discard(cmd);
++                    }
++                    uint32_t skipped = 0;
++                    for (const Rec &r : recs)
++                    {
++                        auto pit = byHash.find(r.progHash);
++                        if (pit == byHash.end() || r.nColor > Vulkan::VULKAN_NUM_ATTACHMENTS || r.nSub > 2u) { ++skipped; continue; }
++                        Vulkan::RenderPassInfo info = {};
++                        info.num_color_attachments = r.nColor;
++                        bool ok = true;
++                        for (uint32_t i = 0; i < r.nColor && ok; ++i) ok = (info.color_attachments[i] = dummy(r.colors[i])) != nullptr;
++                        if (r.depth != VK_FORMAT_UNDEFINED && ok) ok = (info.depth_stencil = dummy(r.depth)) != nullptr;
++                        if (!ok) { ++skipped; continue; }
++                        // the recorded subpasses, or Granite's default single subpass: whichever gives the recorded hash
++                        Vulkan::RenderPassInfo::Subpass sp[2] = {};
++                        const Vulkan::RenderPass *rp = nullptr;
++                        for (int variant = 0; variant < 3 && !rp; ++variant)
++                        {
++                            Vulkan::RenderPassInfo vi = info;
++                            if (variant < 2)
++                            {
++                                for (uint32_t s = 0; s < r.nSub; ++s)
++                                {
++                                    sp[s] = {};
++                                    sp[s].num_color_attachments = r.subs[s].nc; for (uint32_t i = 0; i < r.subs[s].nc; ++i) sp[s].color_attachments[i] = r.subs[s].ci[i];
++                                    sp[s].num_input_attachments = r.subs[s].ni; for (uint32_t i = 0; i < r.subs[s].ni; ++i) sp[s].input_attachments[i] = r.subs[s].ii[i];
++                                    sp[s].depth_stencil_mode = !r.subs[s].depthAtt ? Vulkan::RenderPassInfo::DepthStencil::None
++                                                             : variant == 0 ? Vulkan::RenderPassInfo::DepthStencil::ReadWrite : Vulkan::RenderPassInfo::DepthStencil::ReadOnly;
++                                }
++                                vi.subpasses = sp; vi.num_subpasses = r.nSub;
++                            }
++                            const Vulkan::RenderPass &cand = (dev.*get(seamvk_rob::DevRp()))(vi, true);
++                            if (cand.get_hash() == r.rpHash) rp = &cand;
++                        }
++                        if (!rp) { ++skipped; continue; }
++                        Vulkan::DeferredPipelineCompile c = {};
++                        c.program = pit->second; c.layout = c.program->get_pipeline_layout(); c.compatible_render_pass = rp;
++                        c.static_state = r.st; c.potential_static_state = r.pot;
++                        std::memcpy(c.attribs, r.attribs, sizeof(r.attribs)); std::memcpy(c.strides, r.strides, sizeof(r.strides)); std::memcpy(c.input_rates, r.rates, sizeof(r.rates));
++                        c.subpass_index = r.subpass; c.subgroup_size_tag = r.subgroupTag; c.hash = r.hash; c.cache = cache;
++                        jobs.push_back(c);
++                    }
++                    std::fprintf(stderr, "[pipewarm] %zu recorded pipelines: %zu to build, %u skipped (program or render pass not found)\n", recs.size(), jobs.size(), skipped);
++                }
++                if (jobs.empty()) return;
++                auto shared = std::make_shared<std::vector<Vulkan::DeferredPipelineCompile>>(std::move(jobs));
++                auto next = std::make_shared<std::atomic<size_t>>(0);
++                const auto t0 = std::chrono::steady_clock::now();
++                const unsigned nThreads = std::max(1u, std::min(3u, std::thread::hardware_concurrency() / 4u));
++                auto left = std::make_shared<std::atomic<unsigned>>(nThreads);
++                for (unsigned t = 0; t < nThreads; ++t)
++                    workers.emplace_back([&dev, shared, next, left, t0]() {
++                        for (size_t i; !stop.load(std::memory_order_relaxed) && (i = next->fetch_add(1)) < shared->size();)
++                        {
++                            const Vulkan::DeferredPipelineCompile &c = (*shared)[i];
++                            if (c.program->get_pipeline(c.hash).pipeline == VK_NULL_HANDLE)   // (the game may have needed it first)
++                                Vulkan::CommandBuffer::build_graphics_pipeline(&dev, c, Vulkan::CommandBuffer::CompileMode::Sync);
++                            built.fetch_add(1, std::memory_order_relaxed);
++                        }
++                        if (left->fetch_sub(1) == 1u)
++                            std::fprintf(stderr, "[pipewarm] %u pipelines built in %.0f ms\n", built.load(),
++                                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
++                    });
++            }
++            void join() { stop = true; for (auto &w : workers) if (w.joinable()) w.join(); workers.clear(); }
++        }
+         // [jitcycle] PS2X_UPSCALE_JITSIGN_CYCLE=1 (with PS2X_SEAMVK_GLSHARE=0: it measures the read-back frames): the upscaler's
+         // jitter sign pair switches every 16 frames inside one fight, and the readback consumer reports the frame-to-frame
+         // change of the 3D area per pair, relative to the mean of each 4-block cycle (the four share the cycle's motion).
+@@ -584,6 +797,9 @@ namespace seamvk
+                 const uint32_t whitePx = 0xFFFFFFFFu;
+                 Vulkan::ImageInitialData init = { &whitePx, 0, 0 };
+                 g_gpu.white = dev.create_image(Vulkan::ImageCreateInfo::immutable_2d_image(1, 1, VK_FORMAT_R8G8B8A8_UNORM), &init);
++                pipewarm::start(dev, { g_gpu.progSeam, g_gpu.progGs, g_gpu.progSeamSt, g_gpu.progGsSt, g_gpu.progPresent, g_gpu.progRt, g_gpu.progAlias,
++                                       g_gpu.progOutlineH, g_gpu.progOutline, g_gpu.progDepthMask, g_gpu.progZtop, g_gpu.progVram, g_gpu.progClutPass,
++                                       g_gpu.progGlowDown, g_gpu.progGlowComp, g_gpu.progMv, g_gpu.progUpAux, g_gpu.progFgMid });   // [pipewarm]
+             }
+             if (!g_gpu.out || g_gpu.w != w || g_gpu.h != h)
+             {
+@@ -853,7 +1069,7 @@ namespace seamvk
+             if (!srcp) cmd.set_storage_buffer(0, 3, *g_gpu.vram);
+             void *ub = cmd.allocate_constant_data(0, 2, sizeof(r.clut));
+             std::memcpy(ub, r.clut, sizeof(r.clut));
+-            cmd.draw(3);
++            cmd.draw(3); pipewarm::note(cmd);
+             cmd.end_render_pass();
+             finishDecode();
+             ++g_gpu.rtDecodes;
+@@ -928,7 +1144,7 @@ namespace seamvk
+                 pc.col[0] = float(rgba & 0xFFu); pc.col[1] = float((rgba >> 8) & 0xFFu); pc.col[2] = float((rgba >> 16) & 0xFFu); pc.col[3] = float(rgba >> 24);
+                 pc.tgt[3] = n;
+                 cmd.push_constants(&pc, 0, sizeof(pc));
+-                cmd.draw(3);
++                cmd.draw(3); pipewarm::note(cmd);
+                 if (t0 + 32u < ntri)
+                 {   // the next chunk reads what this one wrote
+                     VkDependencyInfo dep = { VK_STRUCTURE_TYPE_DEPENDENCY_INFO }; VkMemoryBarrier2 mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+@@ -1056,7 +1272,7 @@ namespace seamvk
+                     (uint32_t)d.st.aA | ((uint32_t)d.st.aB << 2) | ((uint32_t)d.st.aC << 4) | ((uint32_t)d.st.aD << 6) | ((uint32_t)d.st.fix << 8) | ((uint32_t)d.st.aref << 16),
+                     d.vcol, 0u };
+                 cmd.push_constants(pcv, 0, sizeof(pcv));
+-                cmd.draw(3);
++                cmd.draw(3); pipewarm::note(cmd);
+                 cmd.end_render_pass();
+                 ++g_gpu.nativeSteps;
+                 return;
+@@ -1086,7 +1302,7 @@ namespace seamvk
+                     VkViewport vp = {}; vp.width = float(w); vp.height = float(h); vp.maxDepth = 1.0f; cmd.set_viewport(vp);
+                     VkRect2D sr = {}; sr.extent.width = std::min(w, 256u * g_gpu.scale); sr.extent.height = std::min(h, 224u * g_gpu.scale); cmd.set_scissor(sr);
+                     cmd.set_texture(0, 1, ft.img->get_view(), Vulkan::StockSampler::NearestClamp);
+-                    cmd.draw(3);
++                    cmd.draw(3); pipewarm::note(cmd);
+                     cmd.end_render_pass();
+                     // (the front end marks 0x2a00 drawn at the marker: the blur chain decodes from this target)
+                 }
+@@ -1118,7 +1334,7 @@ namespace seamvk
+                         cmd.set_texture(0, 3, zp ? zp->img->get_view() : gt.img->get_view(), Vulkan::StockSampler::NearestClamp);
+                         cmd.push_constants(&pcg, 0, sizeof(pcg));
+                     }
+-                    cmd.draw(3);
++                    cmd.draw(3); pipewarm::note(cmd);
+                     cmd.end_render_pass();
+                 }
+                 ++g_gpu.nativeSteps;
+@@ -1151,7 +1367,7 @@ namespace seamvk
+                 VkViewport vp = {}; vp.width = float(w); vp.height = float(h); vp.maxDepth = 1.0f; cmd.set_viewport(vp);
+                 VkRect2D sr = {}; sr.extent.width = w; sr.extent.height = h; cmd.set_scissor(sr);
+                 cmd.set_texture(0, 1, st.img->get_view(), Vulkan::StockSampler::NearestClamp);
+-                cmd.draw(3);
++                cmd.draw(3); pipewarm::note(cmd);
+                 cmd.end_render_pass();
+                 ++g_gpu.nativeSteps;
+                 return;
+@@ -1189,7 +1405,7 @@ namespace seamvk
+                     const uint32_t pcd[4] = { 1u, 0u, 0u, 0u };
+                     cmd.push_constants(pcd, 0, sizeof(pcd));
+                 }
+-                cmd.draw(3);
++                cmd.draw(3); pipewarm::note(cmd);
+                 cmd.end_render_pass();
+                 ++g_gpu.nativeSteps;
+                 return;
+@@ -1227,7 +1443,7 @@ namespace seamvk
+                 uint32_t *cla = static_cast<uint32_t *>(cmd.allocate_constant_data(0, 0, 256u * 4u));
+                 if (d.rt >= 0 && (size_t)d.rt < f.stepCluts.size()) std::memcpy(cla, f.stepCluts[d.rt].data(), 1024); else std::memset(cla, 0, 1024);
+                 cmd.push_constants(pcv, 0, sizeof(pcv));
+-                cmd.draw(3);
++                cmd.draw(3); pipewarm::note(cmd);
+                 cmd.end_render_pass();
+                 cmd.image_barrier(*g_gpu.outlineH, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+             }
+@@ -1252,7 +1468,7 @@ namespace seamvk
+             uint32_t *cl = static_cast<uint32_t *>(cmd.allocate_constant_data(0, 0, 256u * 4u));
+             if (d.rt >= 0 && (size_t)d.rt < f.stepCluts.size()) std::memcpy(cl, f.stepCluts[d.rt].data(), 1024); else std::memset(cl, 0, 1024);
+             cmd.push_constants(pcv, 0, sizeof(pcv));
+-            cmd.draw(3);
++            cmd.draw(3); pipewarm::note(cmd);
+             cmd.end_render_pass();
+             ++g_gpu.nativeSteps;
+         }
+@@ -1452,7 +1668,7 @@ namespace seamvk
+                 if (blend) { cmd.set_blend_factors(VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA); cmd.set_blend_op(VK_BLEND_OP_ADD); }
+                 cmd.push_constants(&p, 0, sizeof(p));
+                 cmd.set_texture(0, 0, img->get_view(), Vulkan::StockSampler::LinearClamp);
+-                cmd.draw(4);
++                cmd.draw(4); pipewarm::note(cmd);
+                 static int s_n = 0; if (s_n++ < 3) std::fprintf(stderr, "[dispvram] circuit %d fbp 0x%x shown from the VRAM decode (slot %d, %ux%u)\n", circuit, fbp, ds, img->get_width(), img->get_height());
+                 return;
+             }
+@@ -1473,7 +1689,7 @@ namespace seamvk
+             if (blend) { cmd.set_blend_factors(VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA); cmd.set_blend_op(VK_BLEND_OP_ADD); }
+             cmd.push_constants(&p, 0, sizeof(p));
+             cmd.set_texture(0, 0, it->second.img->get_view(), Vulkan::StockSampler::LinearClamp);
+-            cmd.draw(4);
++            cmd.draw(4); pipewarm::note(cmd);
+         }
+ 
+         // ---- [mvpass] real motion vectors for the upscaler ---------------------------------------------------------------
+@@ -1590,7 +1806,7 @@ namespace seamvk
+                     pc.view[0] = mb.ofx / 16.0f - g_gpu.jitGs[0]; pc.view[1] = mb.ofy / 16.0f - g_gpu.jitGs[1]; pc.view[2] = float(targetW(mb.fbw)); pc.view[3] = float(kLogicalH);
+                     pc.batch[2] = 1.0f; pc.batch[3] = float(mb.idx.size()); pc.misc[0] = float(g_gpu.scale); pc.misc[1] = mb.ofx / 16.0f; pc.misc[2] = mb.ofy / 16.0f;
+                     cmd.push_constants(&pc, 0, sizeof(pc));
+-                    cmd.draw(mb.verts);
++                    cmd.draw(mb.verts); pipewarm::note(cmd);
+                     for (uint32_t di : mb.idx) covered[di] = 1u;
+                 }
+                 chunksTotal = items.size();
+@@ -1628,7 +1844,7 @@ namespace seamvk
+                 pc.view[0] = d0.st.ofx / 16.0f - g_gpu.jitGs[0]; pc.view[1] = d0.st.ofy / 16.0f - g_gpu.jitGs[1]; pc.view[2] = float(targetW(d0.st.fbw)); pc.view[3] = float(kLogicalH);   // [jitter] as the draw
+                 pc.batch[2] = 1.0f; pc.batch[3] = float(b - a); pc.misc[0] = float(g_gpu.scale); pc.misc[1] = d0.st.ofx / 16.0f; pc.misc[2] = d0.st.ofy / 16.0f;
+                 cmd.push_constants(&pc, 0, sizeof(pc));
+-                cmd.draw(o);
++                cmd.draw(o); pipewarm::note(cmd);
+                 a = b;
+             }
+             cmd.end_render_pass();
+@@ -1691,7 +1907,7 @@ namespace seamvk
+             cmd.push_constants(&p, 0, sizeof(p));
+             cmd.set_texture(0, 0, dt->img->get_view(), Vulkan::StockSampler::NearestClamp);
+             cmd.set_texture(0, 1, g_gpu.mv->get_view(), Vulkan::StockSampler::NearestClamp);
+-            cmd.draw(4);
++            cmd.draw(4); pipewarm::note(cmd);
+             cmd.end_render_pass();
+             for (Vulkan::ImageHandle *img : { &g_gpu.upDepth, &g_gpu.upMv })
+                 cmd.image_barrier(**img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+@@ -2024,6 +2240,7 @@ namespace seamvk
+     void shutdown()
+     {   // [earlyframe] stop the readback consumer before the device goes away
+         stopRenderThread();   // [rthread] (it feeds the consumer)
++        pipewarm::join();     // [pipewarm] no pipeline build may outlive the device
+         if (!g_rbThread) return;
+         { std::lock_guard<std::mutex> lk(g_rbMtx); g_rbQuit = true; }
+         g_rbCv.notify_all();
+@@ -2784,7 +3001,7 @@ namespace seamvk
+                     const size_t bytes = size_t(d.count) * sizeof(seamgs::Vtx);
+                     void *vb = vertexData(*cmd, dev, bytes, sizeof(seamgs::Vtx));
+                     std::memcpy(vb, f.verts.data() + d.vertOff, bytes);
+-                    cmd->draw(d.count);
++                    cmd->draw(d.count); pipewarm::note(*cmd);
+                 }
+                 else
+                 {
+@@ -2804,7 +3021,7 @@ namespace seamvk
+                     uint8_t *dst = static_cast<uint8_t *>(vb);
+                     const uint8_t *src = f.verts.data() + d.vertOff;
+                     for (uint32_t v = 0; v < d.count; ++v) { std::memcpy(dst + v * 64u, src + size_t(v) * d.stride, d.stride); if (d.stride < 64u) std::memset(dst + v * 64u + d.stride, 0, 64u - d.stride); }
+-                    cmd->draw(d.count);
++                    cmd->draw(d.count); pipewarm::note(*cmd);
+                 }
+             };
+             if (d.kind == 1 && s_batch && d.stride == 48u && !dateSplit)
+@@ -2873,7 +3090,7 @@ namespace seamvk
+                     }
+                     if (!bindConsts(*cmd, dev, carr, b.size())) return;
+                     const float zw[2] = { 1.0f, float(b.size()) }; cmd->push_constants(zw, offsetof(PC, texInfo) + 8u, 8u);   // texInfo.z = 1: batched; .w = chunk count
+-                    cmd->draw(o);
++                    cmd->draw(o); pipewarm::note(*cmd);
+                     {   // [mvreuse] note this batch for the motion pass when it belongs to the shown frame's depth-tested scene
+                         const uint32_t s = g_gpu.cslot;
+                         if (d0.st.fbp == g_gpu.mvFbp && d0.st.zte && g_gpu.vmap[s] && vb >= g_gpu.vmap[s] && vb < g_gpu.vmap[s] + kVringBytes)
+@@ -3250,7 +3467,7 @@ namespace seamvk
+                         PresentPC p = {}; p.src[2] = 1.0f; p.src[3] = 1.0f; p.dst[0] = -1.0f; p.dst[1] = -1.0f; p.dst[2] = 1.0f; p.dst[3] = 1.0f; p.alpha[0] = 1.0f; p.taps[2] = 1.0f;
+                         cmd->push_constants(&p, 0, sizeof(p));
+                         cmd->set_texture(0, 0, g_gpu.white->get_view(), Vulkan::StockSampler::NearestClamp);
+-                        cmd->draw(4);
++                        cmd->draw(4); pipewarm::note(*cmd);
+                         cmd->end_render_pass();
+                         cmd->image_barrier(*g_gpu.up, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+@@ -3325,7 +3542,7 @@ namespace seamvk
+                 cmd->set_texture(0, 0, pres->get_view(), Vulkan::StockSampler::LinearClamp);
+                 cmd->set_texture(0, 1, g_gpu.fgPrev->get_view(), Vulkan::StockSampler::LinearClamp);
+                 cmd->set_texture(0, 2, useMv ? g_gpu.upMv->get_view() : g_gpu.fgPrev->get_view(), Vulkan::StockSampler::NearestClamp);   // (no motion: zero vectors)
+-                cmd->draw(4);
++                cmd->draw(4); pipewarm::note(*cmd);
+                 cmd->end_render_pass();
+                 cmd->image_barrier(*g_gpu.fgMid, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                    VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);

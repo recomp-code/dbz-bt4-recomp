@@ -1,0 +1,19 @@
+diff --git a/ps2xRuntime/src/lib/ps2_seamvk.cpp b/ps2xRuntime/src/lib/ps2_seamvk.cpp
+--- a/ps2xRuntime/src/lib/ps2_seamvk.cpp
++++ b/ps2xRuntime/src/lib/ps2_seamvk.cpp
+@@ -3000,8 +3000,13 @@
+                     if (!done && upscaleMode() != 0)
+                     {   // [metalfx] the frame so far goes to the queue now (Granite holds fence-less submissions until a flush; MoltenVK
+                         // commits it inside vkQueueSubmit), MetalFX is encoded on the same Metal queue behind it, and the rest of the
+-                        // frame continues in a new command buffer behind that. The sample offset is DLSS's: -jitOut.
+-                        static const float sx = [](){ const char *v = std::getenv("PS2X_METALFX_JITTER_SIGN"); return v && v[0] == '+' ? 1.0f : -1.0f; }();
++                        // frame continues in a new command buffer behind that.
++                        // [mfxsign] MetalFX's jitter offset is +x, -y of jitOut. Measured with the real motion vectors (mvfix): the sign
++                        // switched every 16 frames inside one fight (so the four share the same motion), 32 blocks over two
++                        // orders, frame-to-frame change of the 3D area relative to the block's mean: "+-" 0.85 (best in 13 blocks),
++                        // "--" 0.92, "++" 0.99, "-+" 1.24. DLSS's "--", picked while the vectors were all zero, was second.
++                        // PS2X_METALFX_JITTER_SIGN=<sx><sy> overrides.
++                        static const float sx = [](){ const char *v = std::getenv("PS2X_METALFX_JITTER_SIGN"); return v && v[0] == '-' ? -1.0f : 1.0f; }();
+                         static const float sy = [](){ const char *v = std::getenv("PS2X_METALFX_JITTER_SIGN"); return v && v[0] && v[1] == '+' ? 1.0f : -1.0f; }();
+                         dev.submit(cmd);
+                         dev.flush_frame();

@@ -1,0 +1,591 @@
+diff --git a/ps2xRuntime/src/lib/ps2_seamvk_present.cpp b/ps2xRuntime/src/lib/ps2_seamvk_present.cpp
+index 042868f..8f5ff1b 100644
+--- a/ps2xRuntime/src/lib/ps2_seamvk_present.cpp
++++ b/ps2xRuntime/src/lib/ps2_seamvk_present.cpp
+@@ -4,13 +4,16 @@
+ // overlay into the window's back buffer exactly as before. At the buffer swap (raylib's SwapScreenBuffer, hooked through
+ // bt3SwapHook) the back buffer is copied on the GPU into an image the native renderer's Vulkan device owns and GL imports
+ // (GL_EXT_memory_object), GL signals an exported semaphore, and Vulkan copies the image into a swapchain image and presents
+-// it. The swapchain lives on a child window covering the GL window's client area (Vulkan cannot present to a window GL has
+-// claimed); the child is disabled and transparent to hit-testing, so the mouse and keyboard still reach the GL window and
+-// SDL. GL never swaps again, so the swapchain's present mode paces the loop: FIFO (vsync, the default), or mailbox /
++// it. The swapchain presents to the game's own window: GL draws into it but never swaps it again once Vulkan has presented
++// (a frame that cannot be presented -- minimised, being resized -- is skipped, never handed back to GL), so it works in
++// exclusive fullscreen too. (It used to live on a child window over the GL one: in exclusive fullscreen Windows shows only
++// the top-level window, which no longer swapped, and the screen was black.) A driver that refuses a Vulkan swapchain on a
++// window GL has drawn into fails at the first one, and the window stays GL's. The swapchain's present mode paces the
++// loop: FIFO (vsync, the default), or mailbox /
+ // immediate (PS2X_SEAMVK_VKPRESENT_MODE) for an uncapped display. A presentation that ends in Vulkan is also what driver
+ // frame generation (NVIDIA Smooth Motion, AMD AFMF) and an own interpolator hook into.
+ //
+-// Same GPU only (the LUID check of glshare), Windows for now (macOS: a CAMetalLayer child view, the same flow). Kept in its
++// Same GPU only (the LUID check of glshare), Windows for now (macOS: the window's CAMetalLayer, the same flow). Kept in its
+ // own translation unit: <windows.h> and SDL_syswm.h collide with raylib's names.
+ #include "runtime/ps2_seamvk.h"
+ 
+@@ -31,6 +34,8 @@
+ #include <vector>
+ 
+ extern "C" bool (*bt3SwapHook)(void *window);   // rcore_desktop_sdl.c: SwapScreenBuffer asks it first
++extern "C" bool bt3VkWindow;                    // rcore_desktop_sdl.c: the game's window has no GL (GL on a hidden one)
++extern "C" void rlSetDefaultFramebuffer(unsigned int id);   // rlgl.h: the framebuffer GL's "screen" means
+ 
+ namespace seamvk
+ {
+@@ -53,6 +58,8 @@ namespace seamvk
+             kFramebuffer = 0x8D40, kReadFb = 0x8CA8, kDrawFb = 0x8CA9, kReadFbBinding = 0x8CAA, kDrawFbBinding = 0x8CA6,
+             kColorAttachment0 = 0x8CE0, kFbComplete = 0x8CD5, kColorBufferBit = 0x4000, kNearest = 0x2600, kScissorTest = 0x0C11,
+             kDedicatedMemory = 0x9581, kOpaqueWin32 = 0x9587, kDeviceLuid = 0x9599, kLayoutTransferSrc = 0x9592,
++            kColorWritemask = 0x0C23, kColorClearValue = 0x0C22,
++            kRenderbuffer = 0x8D41, kDepth24Stencil8 = 0x88F0, kDepthStencilAttachment = 0x821A,
+         };
+         struct Gl
+         {
+@@ -66,12 +73,22 @@ namespace seamvk
+             void (__stdcall *Enable)(GLenum);
+             void (__stdcall *Disable)(GLenum);
+             void (__stdcall *Flush)(void);
++            void (__stdcall *Finish)(void);
++            void (__stdcall *ColorMask)(GLboolean, GLboolean, GLboolean, GLboolean);
++            void (__stdcall *ClearColor)(float, float, float, float);
++            void (__stdcall *Clear)(GLbitfield);
++            void (__stdcall *GetBooleanv)(GLenum, GLboolean *);
++            void (__stdcall *GetFloatv)(GLenum, float *);
+             void (__stdcall *GenFramebuffers)(GLsizei, GLuint *);
+             void (__stdcall *DeleteFramebuffers)(GLsizei, const GLuint *);
+             void (__stdcall *BindFramebuffer)(GLenum, GLuint);
+             void (__stdcall *FramebufferTexture2D)(GLenum, GLenum, GLenum, GLuint, GLint);
+             GLenum (__stdcall *CheckFramebufferStatus)(GLenum);
+             void (__stdcall *BlitFramebuffer)(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum);
++            void (__stdcall *GenRenderbuffers)(GLsizei, GLuint *);
++            void (__stdcall *BindRenderbuffer)(GLenum, GLuint);
++            void (__stdcall *RenderbufferStorage)(GLenum, GLenum, GLsizei, GLsizei);
++            void (__stdcall *FramebufferRenderbuffer)(GLenum, GLenum, GLenum, GLuint);
+             void (__stdcall *GetUnsignedBytevEXT)(GLenum, GLubyte *);
+             void (__stdcall *CreateMemoryObjectsEXT)(GLsizei, GLuint *);
+             void (__stdcall *DeleteMemoryObjectsEXT)(GLsizei, const GLuint *);
+@@ -85,31 +102,6 @@ namespace seamvk
+             void (__stdcall *WaitSemaphoreEXT)(GLuint, GLuint, const GLuint *, GLuint, const GLuint *, const GLenum *);
+         } gl;
+ 
+-        // ---- the child window the swapchain presents to ------------------------------------------------------------------
+-        LRESULT CALLBACK childProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+-        {
+-            switch (msg)
+-            {
+-            case WM_NCHITTEST: return HTTRANSPARENT;   // clicks go to the GL window underneath (SDL's)
+-            case WM_ERASEBKGND: return 1;
+-            case WM_PAINT: { PAINTSTRUCT ps; BeginPaint(h, &ps); EndPaint(h, &ps); return 0; }
+-            default: return DefWindowProcW(h, msg, wp, lp);
+-            }
+-        }
+-        HWND createChild(HWND parent, int w, int h)
+-        {
+-            static ATOM s_cls = 0;
+-            if (!s_cls)
+-            {
+-                WNDCLASSW wc = {}; wc.lpfnWndProc = childProc; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = L"ps2x_vkpresent";
+-                wc.hCursor = nullptr; wc.hbrBackground = nullptr;
+-                s_cls = RegisterClassW(&wc);
+-                if (!s_cls) return nullptr;
+-            }
+-            return CreateWindowExW(WS_EX_NOPARENTNOTIFY, L"ps2x_vkpresent", L"", WS_CHILD | WS_VISIBLE | WS_DISABLED | WS_CLIPSIBLINGS,
+-                                   0, 0, w, h, parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+-        }
+-
+         // ---- presenter state ----------------------------------------------------------------------------------------------
+         constexpr uint32_t kInFlight = 2;
+         struct Presenter
+@@ -117,7 +109,8 @@ namespace seamvk
+             int state = 0;   // 0 not tried, 1 on, -1 off (GL swaps)
+             Vulkan::Device *dev = nullptr; VkDevice vk = VK_NULL_HANDLE; VkPhysicalDevice gpu = VK_NULL_HANDLE; VkInstance inst = VK_NULL_HANDLE;
+             VkQueue queue = VK_NULL_HANDLE; uint32_t family = 0;
+-            HWND parent = nullptr, child = nullptr;
++            HWND window = nullptr;   // the game's window (SDL's), where the swapchain presents
++            bool presented = false;  // Vulkan has presented to it: from then on GL must never swap it
+             VkSurfaceKHR surface = VK_NULL_HANDLE; VkSwapchainKHR swapchain = VK_NULL_HANDLE; VkFormat format = VK_FORMAT_UNDEFINED;
+             VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
+             std::vector<VkImage> images; std::vector<VkSemaphore> renderDone;   // per swapchain image
+@@ -128,6 +121,10 @@ namespace seamvk
+             Vulkan::ImageHandle shared; GLuint glTex = 0, glMem = 0, glFbo = 0;
+             VkSemaphore glDone = VK_NULL_HANDLE, vkDone = VK_NULL_HANDLE; GLuint glDoneGl = 0, vkDoneGl = 0;
+             bool vkDonePending = false;   // Vulkan has signalled vkDone and GL has not waited for it yet
++            // [vkwindow] the window is Vulkan's alone: GL draws the screen straight into the shared image (glFbo, with a
++            // depth-stencil renderbuffer, is raylib's default framebuffer), so there is no back buffer to copy
++            bool offscreen = false; GLuint glDepth = 0;
++            bool fresh = false;           // the shared image was just (re)made: this frame was drawn elsewhere, not presented
+             PFN_vkCreateWin32SurfaceKHR createSurface = nullptr; PFN_vkDestroySurfaceKHR destroySurface = nullptr;
+             PFN_vkGetPhysicalDeviceSurfaceSupportKHR surfaceSupport = nullptr; PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR surfaceCaps = nullptr;
+             PFN_vkGetPhysicalDeviceSurfaceFormatsKHR surfaceFormats = nullptr; PFN_vkGetPhysicalDeviceSurfacePresentModesKHR surfaceModes = nullptr;
+@@ -191,10 +188,13 @@ namespace seamvk
+             };
+             load(gl.GenTextures, "glGenTextures"); load(gl.DeleteTextures, "glDeleteTextures"); load(gl.BindTexture, "glBindTexture");
+             load(gl.GetIntegerv, "glGetIntegerv"); load(gl.GetError, "glGetError"); load(gl.GetStringi, "glGetStringi");
+-            load(gl.IsEnabled, "glIsEnabled"); load(gl.Enable, "glEnable"); load(gl.Disable, "glDisable"); load(gl.Flush, "glFlush");
++            load(gl.IsEnabled, "glIsEnabled"); load(gl.Enable, "glEnable"); load(gl.Disable, "glDisable"); load(gl.Flush, "glFlush"); load(gl.Finish, "glFinish");
++            load(gl.ColorMask, "glColorMask"); load(gl.ClearColor, "glClearColor"); load(gl.Clear, "glClear"); load(gl.GetBooleanv, "glGetBooleanv"); load(gl.GetFloatv, "glGetFloatv");
+             load(gl.GenFramebuffers, "glGenFramebuffers"); load(gl.DeleteFramebuffers, "glDeleteFramebuffers"); load(gl.BindFramebuffer, "glBindFramebuffer");
+             load(gl.FramebufferTexture2D, "glFramebufferTexture2D"); load(gl.CheckFramebufferStatus, "glCheckFramebufferStatus"); load(gl.BlitFramebuffer, "glBlitFramebuffer");
+             load(gl.GetUnsignedBytevEXT, "glGetUnsignedBytevEXT");
++            load(gl.GenRenderbuffers, "glGenRenderbuffers"); load(gl.BindRenderbuffer, "glBindRenderbuffer");
++            load(gl.RenderbufferStorage, "glRenderbufferStorage"); load(gl.FramebufferRenderbuffer, "glFramebufferRenderbuffer");
+             load(gl.CreateMemoryObjectsEXT, "glCreateMemoryObjectsEXT"); load(gl.DeleteMemoryObjectsEXT, "glDeleteMemoryObjectsEXT");
+             load(gl.MemoryObjectParameterivEXT, "glMemoryObjectParameterivEXT"); load(gl.TexStorageMem2DEXT, "glTexStorageMem2DEXT");
+             load(gl.ImportMemoryWin32HandleEXT, "glImportMemoryWin32HandleEXT");
+@@ -206,12 +206,9 @@ namespace seamvk
+ 
+             SDL_SysWMinfo info{}; SDL_VERSION(&info.version);
+             if (!SDL_GetWindowWMInfo(static_cast<SDL_Window *>(sdlWindow), &info) || info.subsystem != SDL_SYSWM_WINDOWS) return fail("no native window");
+-            g_p.parent = info.info.win.window;
+-            RECT rc{}; GetClientRect(g_p.parent, &rc);
+-            g_p.child = createChild(g_p.parent, std::max<int>(1, rc.right), std::max<int>(1, rc.bottom));
+-            if (!g_p.child) return fail("could not create the child window");
+-            VkWin32SurfaceCreateInfoKHR sci = { VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR }; sci.hinstance = GetModuleHandleW(nullptr); sci.hwnd = g_p.child;
+-            if (g_p.createSurface(g_p.inst, &sci, nullptr, &g_p.surface) != VK_SUCCESS) { DestroyWindow(g_p.child); g_p.child = nullptr; return fail("vkCreateWin32SurfaceKHR failed"); }
++            g_p.window = info.info.win.window;
++            VkWin32SurfaceCreateInfoKHR sci = { VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR }; sci.hinstance = GetModuleHandleW(nullptr); sci.hwnd = g_p.window;
++            if (g_p.createSurface(g_p.inst, &sci, nullptr, &g_p.surface) != VK_SUCCESS) return fail("vkCreateWin32SurfaceKHR failed");
+             VkBool32 sup = VK_FALSE; g_p.surfaceSupport(g_p.gpu, g_p.family, g_p.surface, &sup);
+             if (!sup) return fail("the graphics queue cannot present to the window");
+ 
+@@ -244,6 +241,8 @@ namespace seamvk
+             if (!g_p.glDone || !g_p.vkDone) return fail("exportable semaphores");
+             g_p.glDoneGl = importSemaphore(h1); g_p.vkDoneGl = importSemaphore(h2);
+             gl.GenFramebuffers(1, &g_p.glFbo);
++            g_p.offscreen = bt3VkWindow;
++            if (g_p.offscreen) gl.GenRenderbuffers(1, &g_p.glDepth);
+             while (gl.GetError() != 0) {}
+             static const char *const kMode[] = { "immediate", "mailbox", "fifo (vsync)", "fifo relaxed" };
+             std::fprintf(stderr, "[vkpresent] on: the window is presented through a Vulkan swapchain, %s\n", g_p.mode <= 3 ? kMode[g_p.mode] : "?");
+@@ -259,7 +258,6 @@ namespace seamvk
+         bool resize(uint32_t w, uint32_t h)
+         {
+             waitIdle();
+-            MoveWindow(g_p.child, 0, 0, int(w), int(h), FALSE);
+             VkSurfaceCapabilitiesKHR caps{}; g_p.surfaceCaps(g_p.gpu, g_p.surface, &caps);
+             if (caps.currentExtent.width != 0xFFFFFFFFu) { w = caps.currentExtent.width; h = caps.currentExtent.height; }
+             if (!w || !h) return false;   // minimised
+@@ -271,7 +269,11 @@ namespace seamvk
+             ci.preTransform = caps.currentTransform; ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR; ci.presentMode = g_p.mode; ci.clipped = VK_TRUE;
+             ci.oldSwapchain = g_p.swapchain;
+             VkSwapchainKHR sc = VK_NULL_HANDLE;
+-            if (T().vkCreateSwapchainKHR(g_p.vk, &ci, nullptr, &sc) != VK_SUCCESS) return false;
++            if (const VkResult r = T().vkCreateSwapchainKHR(g_p.vk, &ci, nullptr, &sc); r != VK_SUCCESS)
++            {
++                static int s_n = 0; if (s_n++ < 3) std::fprintf(stderr, "[vkpresent] vkCreateSwapchainKHR %ux%u failed (%d)\n", w, h, int(r));
++                return false;
++            }
+             if (g_p.swapchain) T().vkDestroySwapchainKHR(g_p.vk, g_p.swapchain, nullptr);
+             g_p.swapchain = sc;
+             uint32_t n = 0; T().vkGetSwapchainImagesKHR(g_p.vk, sc, &n, nullptr);
+@@ -283,6 +285,7 @@ namespace seamvk
+             // the shared image, imported by GL as the colour attachment of its copy target. A signal Vulkan left on vkDone
+             // is consumed first (a binary semaphore must not be signalled twice).
+             if (g_p.vkDonePending) { gl.WaitSemaphoreEXT(g_p.vkDoneGl, 0, nullptr, 0, nullptr, nullptr); g_p.vkDonePending = false; }
++            if (g_p.glTex) gl.Finish();   // GL may still be drawing into the old image's memory
+             if (g_p.glTex) { gl.DeleteTextures(1, &g_p.glTex); g_p.glTex = 0; }
+             if (g_p.glMem) { gl.DeleteMemoryObjectsEXT(1, &g_p.glMem); g_p.glMem = 0; }
+             auto ici = Vulkan::ImageCreateInfo::render_target(w, h, VK_FORMAT_R8G8B8A8_UNORM);
+@@ -304,11 +307,19 @@ namespace seamvk
+             GLint prevDraw = 0; gl.GetIntegerv(kDrawFbBinding, &prevDraw);
+             gl.BindFramebuffer(kDrawFb, g_p.glFbo);
+             gl.FramebufferTexture2D(kDrawFb, kColorAttachment0, kTex2D, g_p.glTex, 0);
++            if (g_p.offscreen)
++            {   // the screen's depth and stencil, as the window's own framebuffer had them
++                gl.BindRenderbuffer(kRenderbuffer, g_p.glDepth);
++                gl.RenderbufferStorage(kRenderbuffer, kDepth24Stencil8, GLsizei(w), GLsizei(h));
++                gl.BindRenderbuffer(kRenderbuffer, 0);
++                gl.FramebufferRenderbuffer(kDrawFb, kDepthStencilAttachment, kRenderbuffer, g_p.glDepth);
++            }
+             const GLenum st = gl.CheckFramebufferStatus(kDrawFb);
+             gl.BindFramebuffer(kDrawFb, GLuint(prevDraw));
+             if (st != kFbComplete || gl.GetError() != 0) { std::fprintf(stderr, "[vkpresent] the shared %ux%u image is not a complete GL framebuffer (0x%x)\n", w, h, st); return false; }
+             g_p.vkDonePending = false;   // a fresh image: nothing of Vulkan's to wait for
+             g_p.w = w; g_p.h = h;
++            if (g_p.offscreen) { rlSetDefaultFramebuffer(g_p.glFbo); g_p.fresh = true; }
+             std::fprintf(stderr, "[vkpresent] swapchain %ux%u, %u images\n", w, h, n);
+             return true;
+         }
+@@ -326,11 +337,33 @@ namespace seamvk
+         {
+             if (g_p.state == 0 && !init(sdlWindow)) return false;
+             if (g_p.state != 1) return false;
+-            RECT rc{}; GetClientRect(g_p.parent, &rc);
++            // a frame that cannot be presented: before the first present GL swaps it as always; after it, it is skipped (GL
++            // swapping a window Vulkan presents to is undefined), with a short sleep so a minimised window does not spin
++            // (off screen there is no GL window to hand a frame to: it is always skipped)
++            auto skip = [&]() { if (!g_p.presented && !g_p.offscreen) return false; SDL_Delay(8); return true; };
++            RECT rc{}; GetClientRect(g_p.window, &rc);
+             const uint32_t cw = uint32_t(std::max<LONG>(0, rc.right)), ch = uint32_t(std::max<LONG>(0, rc.bottom));
+-            int dw = 0, dh = 0; SDL_GL_GetDrawableSize(static_cast<SDL_Window *>(sdlWindow), &dw, &dh);
+-            if (!cw || !ch || dw <= 0 || dh <= 0) return false;   // minimised: GL's swap (cheap, nothing shown)
+-            if ((cw != g_p.w || ch != g_p.h || !g_p.swapchain) && !resize(cw, ch)) return false;
++            int dw = int(cw), dh = int(ch);
++            if (!g_p.offscreen) SDL_GL_GetDrawableSize(static_cast<SDL_Window *>(sdlWindow), &dw, &dh);
++            if (!cw || !ch || dw <= 0 || dh <= 0) return skip();   // minimised
++            if ((cw != g_p.w || ch != g_p.h || !g_p.swapchain) && !resize(cw, ch))
++            {
++                if (!g_p.presented && !g_p.swapchain)
++                {
++                    if (g_p.offscreen) std::fprintf(stderr, "[vkwindow] no swapchain on the game's window: nothing can show it\n");
++                    return fail("no swapchain on the game's window");   // the driver refuses it: GL keeps the window
++                }
++                return skip();
++            }
++            // the screen's framebuffer for whatever GL draws next (the off-screen one when the window is Vulkan's)
++            auto screen = [](GLint b) { return GLuint((b == 0 && g_p.offscreen) ? GLint(g_p.glFbo) : b); };
++            if (g_p.fresh)
++            {   // this frame was drawn before the image existed: the next one is the first drawn into it
++                g_p.fresh = false;
++                GLint r = 0, d = 0; gl.GetIntegerv(kReadFbBinding, &r); gl.GetIntegerv(kDrawFbBinding, &d);
++                gl.BindFramebuffer(kReadFb, screen(r)); gl.BindFramebuffer(kDrawFb, screen(d));
++                return true;
++            }
+ 
+             const uint32_t fi = g_p.frame % kInFlight;
+             T().vkWaitForFences(g_p.vk, 1, &g_p.fence[fi], VK_TRUE, UINT64_MAX);
+@@ -338,20 +371,32 @@ namespace seamvk
+             VkResult ar = T().vkAcquireNextImageKHR(g_p.vk, g_p.swapchain, UINT64_MAX, g_p.acquired[fi], VK_NULL_HANDLE, &idx);
+             if (ar == VK_ERROR_OUT_OF_DATE_KHR)
+             {
+-                if (!resize(cw, ch)) return false;
++                if (!resize(cw, ch)) return skip();
+                 ar = T().vkAcquireNextImageKHR(g_p.vk, g_p.swapchain, UINT64_MAX, g_p.acquired[fi], VK_NULL_HANDLE, &idx);
+             }
+-            if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) return false;   // (nothing signalled between the APIs yet: GL swaps)
++            if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) return skip();   // (nothing signalled between the APIs yet)
+ 
+-            // GL: the back buffer into the shared image, flipped (GL rows count upwards, the swapchain's downwards)
++            // GL: the back buffer into the shared image, flipped (GL rows count upwards, the swapchain's downwards). Off
++            // screen GL drew the frame into it already (the right way up for GL: Vulkan's copy flips it).
+             if (g_p.vkDonePending) { const GLenum lay = kLayoutTransferSrc; gl.WaitSemaphoreEXT(g_p.vkDoneGl, 0, nullptr, 1, &g_p.glTex, &lay); }
+             GLint prevRead = 0, prevDraw = 0; gl.GetIntegerv(kReadFbBinding, &prevRead); gl.GetIntegerv(kDrawFbBinding, &prevDraw);
+             const bool scissor = gl.IsEnabled(kScissorTest) != 0;
+             if (scissor) gl.Disable(kScissorTest);
+-            gl.BindFramebuffer(kReadFb, 0); gl.BindFramebuffer(kDrawFb, g_p.glFbo);
+-            const GLint sw = std::min<GLint>(dw, GLint(g_p.w)), sh = std::min<GLint>(dh, GLint(g_p.h));
+-            gl.BlitFramebuffer(0, dh - sh, sw, dh, 0, GLint(sh), sw, 0, kColorBufferBit, kNearest);
+-            gl.BindFramebuffer(kReadFb, GLuint(prevRead)); gl.BindFramebuffer(kDrawFb, GLuint(prevDraw));
++            gl.BindFramebuffer(kDrawFb, g_p.glFbo);
++            if (!g_p.offscreen)
++            {
++                gl.BindFramebuffer(kReadFb, 0);
++                const GLint sw = std::min<GLint>(dw, GLint(g_p.w)), sh = std::min<GLint>(dh, GLint(g_p.h));
++                gl.BlitFramebuffer(0, dh - sh, sw, dh, 0, GLint(sh), sw, 0, kColorBufferBit, kNearest);
++            }
++            {   // opaque: the back buffer's alpha is the GS's destination alpha (mostly 0). A window the compositor draws ignores
++                // it, but a fullscreen window the display scans out directly does not: the picture came out black
++                GLboolean mask[4] = { 1, 1, 1, 1 }; float cc[4] = {};
++                gl.GetBooleanv(kColorWritemask, mask); gl.GetFloatv(kColorClearValue, cc);
++                gl.ColorMask(0, 0, 0, 1); gl.ClearColor(0.0f, 0.0f, 0.0f, 1.0f); gl.Clear(kColorBufferBit);
++                gl.ColorMask(mask[0], mask[1], mask[2], mask[3]); gl.ClearColor(cc[0], cc[1], cc[2], cc[3]);
++            }
++            gl.BindFramebuffer(kReadFb, screen(prevRead)); gl.BindFramebuffer(kDrawFb, screen(prevDraw));
+             if (scissor) gl.Enable(kScissorTest);
+             { const GLenum lay = kLayoutTransferSrc; gl.SignalSemaphoreEXT(g_p.glDoneGl, 0, nullptr, 1, &g_p.glTex, &lay); }
+             gl.Flush();
+@@ -369,6 +414,7 @@ namespace seamvk
+             VkImageBlit bl = {};
+             bl.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }; bl.dstSubresource = bl.srcSubresource;
+             bl.srcOffsets[1] = { int32_t(g_p.w), int32_t(g_p.h), 1 }; bl.dstOffsets[1] = bl.srcOffsets[1];
++            if (g_p.offscreen) { bl.srcOffsets[0].y = int32_t(g_p.h); bl.srcOffsets[1].y = 0; }   // GL's rows bottom-up
+             T().vkCmdBlitImage(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_NEAREST);   // (the formats may differ in channel order)
+             barrier(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0);
+@@ -390,7 +436,12 @@ namespace seamvk
+             const VkResult pr = sr == VK_SUCCESS ? T().vkQueuePresentKHR(g_p.queue, &pi) : sr;
+             g_p.dev->external_queue_unlock();
+             if (sr != VK_SUCCESS) return fail("vkQueueSubmit failed");
+-            g_p.vkDonePending = true;
++            g_p.vkDonePending = true; g_p.presented = true;
++            if (g_p.offscreen)
++            {   // GL draws the next frame into the image Vulkan is copying from: its next commands wait for the copy
++                const GLenum lay = kLayoutTransferSrc; gl.WaitSemaphoreEXT(g_p.vkDoneGl, 0, nullptr, 1, &g_p.glTex, &lay);
++                g_p.vkDonePending = false;
++            }
+             ++g_p.frame;
+             if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) g_p.w = 0;   // recreated at the next swap
+             return true;
+diff --git a/ps2xRuntime/third_party/bt3gl/src/platforms/rcore_desktop_sdl.c b/ps2xRuntime/third_party/bt3gl/src/platforms/rcore_desktop_sdl.c
+index 6a9ea55..c960c1d 100644
+--- a/ps2xRuntime/third_party/bt3gl/src/platforms/rcore_desktop_sdl.c
++++ b/ps2xRuntime/third_party/bt3gl/src/platforms/rcore_desktop_sdl.c
+@@ -81,6 +81,7 @@
+ typedef struct {
+     SDL_Window *window;
+     SDL_GLContext glContext;
++    SDL_Window *glWindow;   // [vkwindow] the hidden window that holds the GL context when the game's window is Vulkan's (NULL: window)
+ 
+     SDL_GameController *gamepad[MAX_GAMEPADS];
+     SDL_Cursor *cursor;
+@@ -466,14 +467,14 @@ void ToggleFullscreen(void)
+         }
+         else
+         {
+-#if defined(__APPLE__)
+             // [macfs] macOS: fullscreen in its own Space at the display's own resolution. SDL_WINDOW_FULLSCREEN switched the
+             // display mode to the window's size (1280x800 on a MacBook Pro), and the native renderer's MetalFX then had
+             // nothing larger to upscale to.
++            // [deskfs] Windows too: borderless fullscreen at the display's own mode, which the compositor always shows. In
++            // exclusive fullscreen the GL context owned the screen, and a picture the native renderer presented through its
++            // Vulkan swapchain (vkpresent) never reached it: black. Windows 10/11 flip a borderless fullscreen window
++            // directly, so it costs nothing over exclusive.
+             SDL_SetWindowFullscreen(platform.window, SDL_WINDOW_FULLSCREEN_DESKTOP);
+-#else
+-            SDL_SetWindowFullscreen(platform.window, SDL_WINDOW_FULLSCREEN);
+-#endif
+             CORE.Window.flags |= FLAG_FULLSCREEN_MODE;
+             CORE.Window.fullscreen = true;
+         }
+@@ -545,7 +546,7 @@ void SetWindowState(unsigned int flags)
+         if ((monitor >= 0) && (monitor < monitorCount))
+     #endif
+         {
+-            SDL_SetWindowFullscreen(platform.window, SDL_WINDOW_FULLSCREEN);
++            SDL_SetWindowFullscreen(platform.window, SDL_WINDOW_FULLSCREEN_DESKTOP);   // [deskfs] borderless (see ToggleFullscreen)
+             CORE.Window.fullscreen = true;
+         }
+         else TRACELOG(LOG_WARNING, "SDL: Failed to find selected monitor");
+@@ -1211,12 +1212,16 @@ void DisableCursor(void)
+ 
+ // [vkpresent] the runtime's presenter: true = it showed the back buffer itself (a Vulkan swapchain), so GL does not swap
+ bool (*bt3SwapHook)(void *window) = NULL;
++// [vkwindow] set by the runtime before InitWindow: the game's window is Vulkan's alone (no GL on it, so no driver can
++// promote a fullscreen GL window to direct scanout over the swapchain). GL keeps its context on a hidden window and draws
++// the screen into an off-screen framebuffer the runtime's presenter owns (rlSetDefaultFramebuffer). False: GL's window.
++bool bt3VkWindow = false;
+ 
+ // Swap back buffer with front buffer (screen drawing)
+ void SwapScreenBuffer(void)
+ {
+     if (bt3SwapHook && bt3SwapHook((void *)platform.window)) return;
+-    SDL_GL_SwapWindow(platform.window);
++    SDL_GL_SwapWindow(platform.glWindow ? platform.glWindow : platform.window);
+ }
+ 
+ //----------------------------------------------------------------------------------
+@@ -1804,7 +1809,7 @@ int InitPlatform(void)
+     //----------------------------------------------------------------------------
+     unsigned int flags = 0;
+     flags |= SDL_WINDOW_SHOWN;
+-    flags |= SDL_WINDOW_OPENGL;
++    if (!bt3VkWindow) flags |= SDL_WINDOW_OPENGL;
+     flags |= SDL_WINDOW_INPUT_FOCUS;
+     flags |= SDL_WINDOW_MOUSE_FOCUS;
+     flags |= SDL_WINDOW_MOUSE_CAPTURE;  // Window has mouse captured
+@@ -1813,7 +1818,7 @@ int InitPlatform(void)
+     if ((CORE.Window.flags & FLAG_FULLSCREEN_MODE) > 0)
+     {
+         CORE.Window.fullscreen = true;
+-        flags |= SDL_WINDOW_FULLSCREEN;
++        flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;   // [deskfs] borderless (see ToggleFullscreen)
+     }
+ 
+     //if ((CORE.Window.flags & FLAG_WINDOW_HIDDEN) == 0) flags |= SDL_WINDOW_HIDDEN;
+@@ -1890,7 +1895,13 @@ int InitPlatform(void)
+ 
+     // Init OpenGL context
+     unsigned int _bt2 = SDL_GetTicks();
+-    platform.glContext = SDL_GL_CreateContext(platform.window);
++    if (bt3VkWindow && (platform.window != NULL))
++    {   // [vkwindow] the context lives on a hidden window of its own; the game's window never sees GL
++        platform.glWindow = SDL_CreateWindow("ps2x-gl", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, 64, 64, SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
++        platform.glContext = (platform.glWindow != NULL) ? SDL_GL_CreateContext(platform.glWindow) : NULL;
++        fprintf(stderr, "[vkwindow] the game's window is Vulkan's; GL on a hidden window (%s)\n", (platform.glContext != NULL) ? "ok" : SDL_GetError());
++    }
++    else platform.glContext = SDL_GL_CreateContext(platform.window);
+     fprintf(stderr, "[bootw] SDL_GL_CreateContext: %u ms\n", SDL_GetTicks() - _bt2);
+ 
+     // Check window and glContext have been initialized successfully
+@@ -1987,6 +1998,7 @@ void ClosePlatform(void)
+ {
+     SDL_FreeCursor(platform.cursor); // Free cursor
+     SDL_GL_DeleteContext(platform.glContext); // Deinitialize OpenGL context
++    if (platform.glWindow != NULL) SDL_DestroyWindow(platform.glWindow);
+     SDL_DestroyWindow(platform.window);
+     SDL_Quit(); // Deinitialize SDL internal global state
+ }
+diff --git a/ps2xRuntime/third_party/bt3gl/src/rlgl.h b/ps2xRuntime/third_party/bt3gl/src/rlgl.h
+index 99e5ccc..5bfc890 100644
+--- a/ps2xRuntime/third_party/bt3gl/src/rlgl.h
++++ b/ps2xRuntime/third_party/bt3gl/src/rlgl.h
+@@ -662,6 +662,9 @@ RLAPI void rlDisableShader(void);                       // Disable shader progra
+ // Framebuffer state
+ RLAPI void rlEnableFramebuffer(unsigned int id);        // Enable render texture (fbo)
+ RLAPI void rlDisableFramebuffer(void);                  // Disable render texture (fbo), return to default framebuffer
++RLAPI void rlSetDefaultFramebuffer(unsigned int id);   // [vkwindow] the framebuffer drawing to the screen means (0: the window's own)
++RLAPI unsigned int rlGetDefaultFramebuffer(void);
++RLAPI void rlBindFramebufferScreen(unsigned int target, unsigned int framebuffer); // [vkwindow] glBindFramebuffer with 0 meaning the screen's
+ RLAPI unsigned int rlGetActiveFramebuffer(void);        // Get the currently active render texture (fbo), 0 for default framebuffer
+ RLAPI void rlActiveDrawBuffers(int count);              // Activate multiple draw color buffers
+ RLAPI void rlBlitFramebuffer(int srcX, int srcY, int srcWidth, int srcHeight, int dstX, int dstY, int dstWidth, int dstHeight, int bufferMask); // Blit active framebuffer to main framebuffer
+@@ -1834,21 +1837,49 @@ void rlEnableFramebuffer(unsigned int id)
+ #endif
+ }
+ 
+-// return the active render texture (fbo)
++// [vkwindow] The framebuffer that stands for the screen: 0 (the window's) unless the window is presented through Vulkan,
++// where GL draws off screen into an FBO the runtime sets (ps2_seamvk_present.cpp). Every unbind goes back to it.
++// Every loader in the binary (glad's here and in the vendored copy, the altGL table, the GS renderer's own) binds through
++// rlBindFramebufferScreen, which maps 0 to it, so code that "unbinds" anywhere lands on the screen's framebuffer.
++static unsigned int rlDefaultFbo = 0;
++#if defined(GRAPHICS_API_OPENGL_33) || defined(GRAPHICS_API_OPENGL_ES3)
++static PFNGLBINDFRAMEBUFFERPROC rlRealBindFramebuffer = NULL;
++static void GLAD_API_PTR rlBindFramebufferRedirect(GLenum target, GLuint framebuffer) { rlRealBindFramebuffer(target, (framebuffer != 0) ? framebuffer : rlDefaultFbo); }
++#endif
++void rlSetDefaultFramebuffer(unsigned int id)
++{
++    rlDefaultFbo = id;
++#if defined(GRAPHICS_API_OPENGL_33) || defined(GRAPHICS_API_OPENGL_ES3)
++    if ((id != 0) && (rlRealBindFramebuffer == NULL) && (glad_glBindFramebuffer != NULL))
++    {
++        rlRealBindFramebuffer = glad_glBindFramebuffer;
++        glad_glBindFramebuffer = rlBindFramebufferRedirect;
++    }
++#endif
++}
++unsigned int rlGetDefaultFramebuffer(void) { return rlDefaultFbo; }
++void rlBindFramebufferScreen(unsigned int target, unsigned int framebuffer)
++{
++#if defined(GRAPHICS_API_OPENGL_33) || defined(GRAPHICS_API_OPENGL_ES3)
++    glBindFramebuffer(target, (framebuffer != 0) ? framebuffer : rlDefaultFbo);
++#endif
++}
++
++// return the active render texture (fbo) (0 for the screen's)
+ unsigned int rlGetActiveFramebuffer(void)
+ {
+     GLint fboId = 0;
+ #if (defined(GRAPHICS_API_OPENGL_33) || defined(GRAPHICS_API_OPENGL_ES3)) && defined(RLGL_RENDER_TEXTURES_HINT)
+     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fboId);
+ #endif
+-    return fboId;
++    return ((unsigned int)fboId == rlDefaultFbo) ? 0 : (unsigned int)fboId;
+ }
+ 
+ // Disable rendering to texture
+ void rlDisableFramebuffer(void)
+ {
+ #if (defined(GRAPHICS_API_OPENGL_33) || defined(GRAPHICS_API_OPENGL_ES2)) && defined(RLGL_RENDER_TEXTURES_HINT)
+-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
++    glBindFramebuffer(GL_FRAMEBUFFER, rlDefaultFbo);
+ #endif
+ }
+ 
+@@ -3931,7 +3962,7 @@ void *rlReadTexturePixels(unsigned int id, int width, int height, int format)
+     pixels = (unsigned char *)RL_MALLOC(rlGetPixelDataSize(width, height, RL_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8));
+     glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+ 
+-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
++    glBindFramebuffer(GL_FRAMEBUFFER, rlDefaultFbo);
+ 
+     // Clean up temporal fbo
+     rlUnloadFramebuffer(fboId);
+@@ -3979,7 +4010,7 @@ unsigned int rlLoadFramebuffer(void)
+ 
+ #if (defined(GRAPHICS_API_OPENGL_33) || defined(GRAPHICS_API_OPENGL_ES2)) && defined(RLGL_RENDER_TEXTURES_HINT)
+     glGenFramebuffers(1, &fboId);       // Create the framebuffer object
+-    glBindFramebuffer(GL_FRAMEBUFFER, 0);   // Unbind any framebuffer
++    glBindFramebuffer(GL_FRAMEBUFFER, rlDefaultFbo);   // Unbind any framebuffer
+ #endif
+ 
+     return fboId;
+@@ -4023,7 +4054,7 @@ void rlFramebufferAttach(unsigned int fboId, unsigned int texId, int attachType,
+         default: break;
+     }
+ 
+-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
++    glBindFramebuffer(GL_FRAMEBUFFER, rlDefaultFbo);
+ #endif
+ }
+ 
+@@ -4051,7 +4082,7 @@ bool rlFramebufferComplete(unsigned int id)
+         }
+     }
+ 
+-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
++    glBindFramebuffer(GL_FRAMEBUFFER, rlDefaultFbo);
+ 
+     result = (status == GL_FRAMEBUFFER_COMPLETE);
+ #endif
+@@ -4081,7 +4112,7 @@ void rlUnloadFramebuffer(unsigned int id)
+     // NOTE: If a texture object is deleted while its image is attached to the *currently bound* framebuffer,
+     // the texture image is automatically detached from the currently bound framebuffer
+ 
+-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
++    glBindFramebuffer(GL_FRAMEBUFFER, rlDefaultFbo);
+     glDeleteFramebuffers(1, &id);
+ 
+     TRACELOG(RL_LOG_INFO, "FBO: [ID %i] Unloaded framebuffer from VRAM (GPU)", id);
+diff --git a/ps2xRuntime/src/lib/ps2_gs_gpu_renderer.cpp b/ps2xRuntime/src/lib/ps2_gs_gpu_renderer.cpp
+index c43c611..0c7c30c 100644
+--- a/ps2xRuntime/src/lib/ps2_gs_gpu_renderer.cpp
++++ b/ps2xRuntime/src/lib/ps2_gs_gpu_renderer.cpp
+@@ -7382,7 +7382,9 @@ namespace wingl
+         if (!p_##name) p_##name = reinterpret_cast<void (*) params>(wingl::get(#name));                  \
+         if (p_##name) p_##name args;                                                                     \
+     }
+-PS2X_WINGL(glBindFramebuffer, (unsigned target, unsigned framebuffer), (target, framebuffer))
++// [vkwindow] through rlgl, where 0 means the screen's framebuffer (an off-screen one when the window is Vulkan's)
++extern "C" void rlBindFramebufferScreen(unsigned int target, unsigned int framebuffer);
++extern "C" void glBindFramebuffer(unsigned target, unsigned framebuffer) { rlBindFramebufferScreen(target, framebuffer); }
+ PS2X_WINGL(glBlitFramebuffer, (int sx0, int sy0, int sx1, int sy1, int dx0, int dy0, int dx1, int dy1, unsigned mask, unsigned filter), (sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask, filter))
+ PS2X_WINGL(glActiveTexture, (unsigned int texture), (texture))
+ PS2X_WINGL(glGetUniformiv, (unsigned int program, int location, int *params), (program, location, params))
+@@ -7406,7 +7408,7 @@ PS2X_WINGL(glBindVertexArray, (unsigned int array), (array))
+ static void ps2xWinGlResolve()
+ {
+ #define R(name) if (!p_##name) p_##name = reinterpret_cast<decltype(p_##name)>(wingl::get(#name));
+-    R(glBindFramebuffer) R(glBlitFramebuffer) R(glActiveTexture) R(glGetUniformiv) R(glGetUniformfv) R(glGenQueries)
++    R(glBlitFramebuffer) R(glActiveTexture) R(glGetUniformiv) R(glGetUniformfv) R(glGenQueries)
+     R(glGenBuffers) R(glDeleteBuffers) R(glBindBuffer) R(glBufferData) R(glGetBufferSubData)
+     R(glBeginQuery) R(glEndQuery) R(glGetQueryObjectuiv) R(glGetFramebufferAttachmentParameteriv) R(glGenVertexArrays)
+     R(glUseProgram) R(glUniform1i) R(glUniform1f) R(glBindVertexArray)
+diff --git a/ps2xRuntime/src/gfx/gl/GlApi.cpp b/ps2xRuntime/src/gfx/gl/GlApi.cpp
+index 6faba6c..c30ba9d 100644
+--- a/ps2xRuntime/src/gfx/gl/GlApi.cpp
++++ b/ps2xRuntime/src/gfx/gl/GlApi.cpp
+@@ -10,6 +10,8 @@
+ #  include <dlfcn.h>
+ #endif
+ 
++extern "C" void rlBindFramebufferScreen(unsigned int target, unsigned int framebuffer);   // rlgl.h
++
+ namespace ps2xgl
+ {
+ #define PS2XGL_DEF(ret, name, args) ret (*gl##name) args = nullptr;
+@@ -47,6 +49,8 @@ namespace ps2xgl
+ #define PS2XGL_LOAD(ret, name, args) gl##name = reinterpret_cast<ret (*) args>(load("gl" #name));
+         PS2XGL_FUNCS(PS2XGL_LOAD)
+ #undef PS2XGL_LOAD
++        // [vkwindow] binds go through rlgl, where 0 means the screen's framebuffer (an off-screen one when the window is Vulkan's)
++        if (glBindFramebuffer) glBindFramebuffer = [](GLenum target, GLuint fb) { rlBindFramebufferScreen(target, fb); };
+ 
+         // glBindFragDataLocationIndexed is optional (dual-source blending); the layer disables
+         // the dual-source path when it is absent.
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 5b383df..544bdfa 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -219,6 +219,7 @@ extern "C" __declspec(dllimport) void *__stdcall wglGetProcAddress(const char *)
+ #else
+ #include <SDL_video.h>   // [linuxfix] SDL_GL_GetProcAddress: the window and its GL context are SDL's
+ #endif
++extern "C" bool bt3VkWindow;   // [vkwindow] rcore_desktop_sdl.c: the game's window is Vulkan's (GL on a hidden one)
+ #if defined(PS2X_PGO_GEN)
+ extern "C" int __llvm_profile_write_file(void);   // [pgo] LLVM's profile runtime (instrumented builds only)
+ #endif
+@@ -1627,7 +1628,12 @@ bool PS2Runtime::initialize(const char *title)
+         static const bool s_retina = [](){ const char *v = std::getenv("PS2X_RETINA"); return !(v && v[0] == '0'); }();
+         if (!ps2_gslive::requested() && s_retina) bt3SetConfigFlags(FLAG_WINDOW_HIGHDPI);
+ #endif
+-        ps2xHostPrepareWindow();   // [window] DPI hints must precede the window (SDL init happens inside)
++#if defined(_WIN32) && defined(PS2X_HAVE_SEAMVK)
++        {   // [vkwindow] the native renderer presenting through Vulkan: the window is Vulkan's alone (GL draws off screen on a
++            // hidden one), so no driver promotes a fullscreen GL window to direct scanout over the swapchain (a black screen)
++            bt3VkWindow = seamvk::vkpresent::wanted() && seamvk::on() && !ps2_gslive::requested();
++        }
++#endif        ps2xHostPrepareWindow();   // [window] DPI hints must precede the window (SDL init happens inside)
+         _mark("sdl hints");
+         bt3InitWindow(hostWinW, hostWinH, title);
+         _mark("init window");

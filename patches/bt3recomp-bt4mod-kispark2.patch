@@ -1,0 +1,67 @@
+diff --git a/ps2xRuntime/src/lib/ps2_seamgs.cpp b/ps2xRuntime/src/lib/ps2_seamgs.cpp
+index b0cf21f..2e89ce5 100644
+--- a/ps2xRuntime/src/lib/ps2_seamgs.cpp
++++ b/ps2xRuntime/src/lib/ps2_seamgs.cpp
+@@ -690,7 +690,7 @@ namespace seamgs
+         const bool g_texContent = [](){ const char *v = std::getenv("PS2X_SEAMGS_TEXCONTENT"); return !(v && v[0] == '0'); }();
+         struct ContentImg { uint32_t w, h; uint64_t share; uint64_t lastUse; };
+         std::unordered_map<uint64_t, ContentImg> g_contentImgs; std::unordered_set<uint64_t> g_contentSeen;
+-        uint64_t g_contentHits = 0, g_contentRegs = 0, g_contentMiss = 0, g_contentNoKey = 0;
++        uint64_t g_contentHits = 0, g_contentRegs = 0, g_contentMiss = 0, g_contentNoKey = 0, g_contentByBytes = 0;
+         bool contentKeyFor(uint64_t tex0, uint64_t texa, bool needTexa, uint64_t &key, std::vector<std::pair<uint16_t, uint32_t>> &pages, uint32_t *clut, bool &indexed)
+         {
+             const uint32_t tbp = (uint32_t)(tex0 & 0x3FFFu), tbw = (uint32_t)((tex0 >> 14) & 0x3Fu), psm = (uint32_t)((tex0 >> 20) & 0x3Fu);
+@@ -698,18 +698,37 @@ namespace seamgs
+             const uint32_t w = 1u << std::min(tw, 10u), h = 1u << std::min(th, 10u);
+             uint64_t k = fnv(&tex0, 8);
+             if (needTexa) k = fnv(&texa, 8, k);
+-            bool ok = true; pages.clear();
++            bool ok = true, covered = true; pages.clear();
+             forRectPages(psm, tbp, tbw, 0u, 0u, w, h, [&](uint32_t p) {
+                 if (!ok) return;
+                 if (g_pageDrawn[p] != 0u && g_pageDrawn[p] >= g_pageWrite[p]) { ok = false; return; }
+                 pages.emplace_back((uint16_t)p, g_pageWrite[p]);
++                if (!covered) return;
+                 const int64_t cv = g_pageCover[p]; const XferRec *r = cv ? xrec((uint64_t)cv) : nullptr;
+-                if (!r) { ok = false; return; }
+-                uint32_t ox, oy; if (!pageOrigin(r->dpsm, r->dbp, r->dbw, p, ox, oy)) { ok = false; return; }
++                uint32_t ox, oy;
++                if (!r || !pageOrigin(r->dpsm, r->dbp, r->dbw, p, ox, oy)) { covered = false; return; }
+                 const uint32_t mix[4] = { ox - r->dsax, oy - r->dsay, r->rrw, r->dpsm };
+                 k = fnv(&r->hash, 8, k); k = fnv(mix, sizeof(mix), k);
+             });
+             if (!ok || pages.empty()) return false;
++            if (!covered)
++            {   // [kispark2] A page that is not exactly one pending transfer's bytes -- the ki sparks' textures at unaligned bases,
++                // which go to the mirror at once since [kispark], or pages several partial uploads share: the key is the bytes
++                // themselves (the pages written out, 8 KB hashed each, a few us). Before, those textures had no key and were
++                // decoded and uploaded every frame: record 10.5 -> 21.6 ms per frame on an M2 Pro (60 -> 47 fps).
++                k = fnv(&tex0, 8, 0x9E3779B97F4A7C15ull);
++                if (needTexa) k = fnv(&texa, 8, k);
++                for (const auto &pg : pages)
++                {
++                    touchPage(pg.first);
++                    const uint64_t *q = reinterpret_cast<const uint64_t *>(g_vram + size_t(pg.first) * 8192u);
++                    uint64_t h0 = 1469598103934665603ull, h1 = 0x9E3779B97F4A7C15ull, h2 = 0xC2B2AE3D27D4EB4Full, h3 = 0x165667B19E3779F9ull;
++                    for (uint32_t i = 0; i < 1024u; i += 4) { h0 = (h0 ^ q[i]) * 1099511628211ull; h1 = (h1 ^ q[i + 1]) * 1099511628211ull; h2 = (h2 ^ q[i + 2]) * 1099511628211ull; h3 = (h3 ^ q[i + 3]) * 1099511628211ull; }
++                    const uint64_t ph[2] = { ((h0 ^ (h1 >> 7)) * 1099511628211ull) ^ ((h2 ^ (h3 << 9)) * 0x9E3779B97F4A7C15ull), uint64_t(pg.first) };
++                    k = fnv(ph, sizeof(ph), k);
++                }
++                ++g_contentByBytes;
++            }
+             indexed = psm == PSMT8 || psm == PSMT4 || psm == PSMT8H || psm == PSMT4HL || psm == PSMT4HH;
+             if (indexed)
+             {
+@@ -2041,9 +2060,9 @@ namespace seamgs
+             if (g_hostSkipChecks) std::fprintf(stderr, "[hostskip] verify: %llu tags checked, %llu mismatches\n", (unsigned long long)g_hostSkipChecks, (unsigned long long)g_hostSkipMismatch);
+             std::fprintf(stderr, "[nativehud] per frame: on %d inv %.3f active %d | mapped %.1f split %.1f scissors %.1f ink dropped %.1f scaled %.1f shadows dropped %.1f\n", g_ws.on ? 1 : 0, g_ws.inv, g_ws.active ? 1 : 0, g_ws.mapped / 300.0, g_ws.split / 300.0, g_ws.scissors / 300.0, g_ws.inkDropped / 300.0, g_ws.inkScaled / 300.0, g_ws.shadowDropped / 300.0);
+             g_ws.mapped = g_ws.split = g_ws.scissors = g_ws.inkDropped = g_ws.inkScaled = g_ws.shadowDropped = 0;
+-            std::fprintf(stderr, "[lazyvram] per frame: %.1f transfers captured (%.0f KB), %.1f pages applied late, %zu pending records | [texcontent] hits %.2f regs %.2f first-sightings %.2f no-key %.2f per frame, %zu images shared\n",
+-                         g_lazyCaptured / 300.0, g_lazyBytes / 300.0 / 1024.0, g_lazyApplied / 300.0, g_xlog.size(), g_contentHits / 300.0, g_contentRegs / 300.0, g_contentMiss / 300.0, g_contentNoKey / 300.0, g_contentImgs.size());
+-            g_lazyCaptured = g_lazyBytes = g_lazyApplied = 0; g_contentHits = g_contentRegs = g_contentMiss = g_contentNoKey = 0;
++            std::fprintf(stderr, "[lazyvram] per frame: %.1f transfers captured (%.0f KB), %.1f pages applied late, %zu pending records | [texcontent] hits %.2f regs %.2f first-sightings %.2f no-key %.2f by-bytes %.2f per frame, %zu images shared\n",
++                         g_lazyCaptured / 300.0, g_lazyBytes / 300.0 / 1024.0, g_lazyApplied / 300.0, g_xlog.size(), g_contentHits / 300.0, g_contentRegs / 300.0, g_contentMiss / 300.0, g_contentNoKey / 300.0, g_contentByBytes / 300.0, g_contentImgs.size());
++            g_lazyCaptured = g_lazyBytes = g_lazyApplied = 0; g_contentHits = g_contentRegs = g_contentMiss = g_contentNoKey = g_contentByBytes = 0;
+             std::fprintf(stderr, "[seamgs] host draws in/out/dropped per prog:");
+             for (int i = 0; i < 5; ++i) std::fprintf(stderr, " %d:%llu/%llu/%llu", i, (unsigned long long)g_hostIn[i], (unsigned long long)g_hostOut[i], (unsigned long long)g_hostDropped[i]);
+             std::fprintf(stderr, "\n");

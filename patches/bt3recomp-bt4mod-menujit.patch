@@ -1,0 +1,16 @@
+diff --git a/ps2xRuntime/src/lib/ps2_seamvk.cpp b/ps2xRuntime/src/lib/ps2_seamvk.cpp
+index 9e095f3..d8285c8 100644
+--- a/ps2xRuntime/src/lib/ps2_seamvk.cpp
++++ b/ps2xRuntime/src/lib/ps2_seamvk.cpp
+@@ -3180,7 +3180,10 @@ namespace seamvk
+                         cmd = dev.request_command_buffer();
+                     }
+ #endif
+-                    g_gpu.upActive = done;   // [jitter] next frame jitters only behind a working temporal upscaler
++                    // [jitter] next frame jitters only behind a working temporal upscaler that keeps its history: a frame with no 3D
++                    // motion (menus, 2D screens) resets it every frame, and a reset upscaler shows the jittered frame as it is, so the
++                    // whole picture shook by the jitter (up to ~1 px at a Retina fullscreen) whatever the sign. [menujit]
++                    g_gpu.upActive = done && !reset;
+ #if defined(PS2X_SEAMVK_METALFX)
+                     if (done && ps2_seamvk_metalfx::glReady())
+                     {   // [macshare] the window's texture reads alpha as 1 itself (swizzle): no full-size alpha pass over the output

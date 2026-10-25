@@ -1,32 +1,28 @@
 #!/bin/bash
 # Builds the ready-to-play Mac package: DBZ_BT4.app (and DBZ_BT4_Mac.zip next to it). Like windows/make_dist.ps1 it has
 # no ISO, ELF or disc data: the app copies the ELF out of the player's ISO the first time.
-#   Contents/MacOS/      DBZ_BT4 (launcher), pcsx2-gsrunner (PCSX2's GS on Metal)
+# The Mac game runs only on the runtime's own renderer (seamvk on MoltenVK + MetalFX): no PCSX2 GS host in the package.
+#   Contents/MacOS/      DBZ_BT4 (launcher)
 #   Contents/Helpers/    Game.app: ps2EntryRunner (the recompiled game), a UI element (no Dock icon)
-#   Contents/Frameworks/ the GS host's dylibs (SDL3, freetype, png, webp...), rewritten to load from here, and
-#                        libMoltenVK.dylib (the native renderer's Vulkan; the launcher hands its path to the runner)
-#   Contents/Resources/  PCSX2's resources (shaders, fonts, GameIndex.yaml), runtime/ (assets, fps60_sites.txt,
-#                        settings.toml), presets/ (one ini per launcher quality), AppIcon.icns
+#   Contents/Frameworks/ the runner's dylibs, rewritten to load from here, and libMoltenVK.dylib (the native
+#                        renderer's Vulkan; the launcher hands its path to the runner)
+#   Contents/Resources/  runtime/ (assets, fps60_sites.txt, settings.toml), AppIcon.icns
 # Inputs (see the README's "Native macOS" section):
 #   RUNNER  the runner built for macOS 14 (macos/build_runner.sh: bt3mod-native/build-native, CMAKE_OSX_DEPLOYMENT_TARGET=14.0,
-#           static minimal FFmpeg): the PCSX2 host qualities and the native renderer (seamvk + MetalFX) in one binary
+#           static minimal FFmpeg) with the native renderer (seamvk + MetalFX)
 #   MVK     MoltenVK's dylib (default Homebrew's molten-vk; it links only system frameworks)
-#   GSHOST  pcsx2-gsrunner (pcsx2/build-mac), RES its resources folder
 # Usage: macos/make_dist.sh [version]
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-REPO="$(dirname "$HERE")"
 R=~/NBAStreetRecomp
 VERSION="${1:-1.0}"
 RUNNER="${RUNNER:-$R/bt3mod-native/build-native/ps2xRuntime}"
 MVK="${MVK:-/opt/homebrew/lib/libMoltenVK.dylib}"
-GSHOST="${GSHOST:-$R/pcsx2/build-mac/pcsx2-gsrunner/pcsx2-gsrunner}"
-RES="${RES:-$R/gshost-dbz/resources}"
 OUT="${OUT:-$R/dbz/macdist}"
 APP="$OUT/DBZ_BT4.app"
 
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks" "$APP/Contents/Resources/runtime" "$APP/Contents/Resources/presets"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks" "$APP/Contents/Resources/runtime"
 C="$APP/Contents"
 sed "s/@VERSION@/$VERSION/g" "$HERE/Info.plist" > "$C/Info.plist"
 
@@ -50,8 +46,7 @@ cat > "$C/Helpers/Game.app/Contents/Info.plist" <<PLIST
 PLIST
 "$HERE/build_launcher.sh" "$C/MacOS/DBZ_BT4"
 cp "$RUNNER/ps2EntryRunner" "$G/"
-cp "$GSHOST" "$C/MacOS/"
-strip -x "$G/ps2EntryRunner" "$C/MacOS/pcsx2-gsrunner"
+strip -x "$G/ps2EntryRunner"
 # [native] the native renderer's Vulkan driver: MoltenVK, opened by path (the launcher sets GRANITE_VULKAN_LIBRARY)
 cp -L "$MVK" "$C/Frameworks/libMoltenVK.dylib"
 chmod u+w "$C/Frameworks/libMoltenVK.dylib"
@@ -66,7 +61,7 @@ fix_refs() {   # fix_refs <binary>: point its non-system dylib references at Fra
 # copy each referenced install name (the name the binaries ask for, e.g. libSDL3.0.dylib) until nothing new shows up
 while :; do
     added=0
-    for bin in "$G/ps2EntryRunner" "$C/MacOS/pcsx2-gsrunner" "$C"/Frameworks/*.dylib; do
+    for bin in "$G/ps2EntryRunner" "$C"/Frameworks/*.dylib; do
         [ -f "$bin" ] || continue
         for dep in $(otool -L "$bin" | tail -n +2 | awk '{print $1}' | grep -E '^/(opt|usr/local|Users)/'); do
             name="$(basename "$dep")"
@@ -80,26 +75,17 @@ while :; do
     done
     [ $added = 0 ] && break
 done
-for bin in "$G/ps2EntryRunner" "$C/MacOS/pcsx2-gsrunner" "$C"/Frameworks/*.dylib; do
+for bin in "$G/ps2EntryRunner" "$C"/Frameworks/*.dylib; do
     [ -f "$bin" ] && fix_refs "$bin"
 done
 if otool -L "$C/MacOS/"* "$G/"* "$C"/Frameworks/*.dylib 2>/dev/null | grep -E '^\s/(opt|usr/local|Users)/'; then
     echo "a binary still loads a library from this Mac (above)" >&2; exit 1
 fi
 
-# resources: PCSX2's (CocoaTools::GetResourcePath = the bundle's Resources) and the runtime's
-cp -R "$RES/" "$C/Resources/"
+# resources: the runtime's
 cp -R "$RUNNER/assets" "$C/Resources/runtime/assets"
 cp "$RUNNER/fps60_sites.txt" "$C/Resources/runtime/"
 cp "$HERE/settings.toml" "$C/Resources/runtime/settings.toml"
-# quality presets (the launcher copies one to ~/Library/Application Support/DBZ_BT4/gshost the first time it is used;
-# the in-game F1 menu rewrites that copy). UserHacks_TCOffsetByScale picks the outline offset for each scale.
-P="$C/Resources/presets"
-cp "$REPO/gshost/dbz.ini" "$P/dbz.ini"
-sed -e 's/^upscale_multiplier = 6/upscale_multiplier = 4/' "$REPO/gshost/dbz.ini" > "$P/dbz_4x.ini"
-sed -e 's/^upscale_multiplier = 6/upscale_multiplier = 3/' "$REPO/gshost/dbz.ini" > "$P/dbz_3x.ini"
-{ sed -e 's/^upscale_multiplier = 6/upscale_multiplier = 3/' "$REPO/gshost/dbz.ini"; echo "NbaUpscaler = 1"; } > "$P/dbz_metalfx.ini"
-
 # icon: the runtime's icon.png
 ICON="$OUT/AppIcon.iconset"
 rm -rf "$ICON"; mkdir -p "$ICON"
@@ -114,7 +100,7 @@ cp "$HERE/LEEME.txt" "$OUT/LEEME.txt"
 
 # ad-hoc signature, inside out (Apple Silicon refuses unsigned code)
 codesign --force -s - "$C"/Frameworks/*.dylib
-codesign --force -s - "$G/ps2EntryRunner" "$C/MacOS/pcsx2-gsrunner"
+codesign --force -s - "$G/ps2EntryRunner"
 codesign --force -s - "$C/Helpers/Game.app"
 codesign --force -s - "$APP"
 codesign --verify --deep --strict "$APP"

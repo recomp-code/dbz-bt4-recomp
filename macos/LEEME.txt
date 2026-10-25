@@ -44,16 +44,15 @@ https://teambt4.wixsite.com/teambt4projects
 Requisitos
 ----------
 - Mac con Apple Silicon (M1 o mas nuevo) y macOS 14 o mas nuevo.
-- Calidad "Maxima" (6x): M Pro / Max / Ultra.  "Alta" (4x) y "Equilibrada" (3x): el resto.
-  "Apple MetalFX": 3x reescalado a la resolucion de tu pantalla; pide casi el doble de GPU que 3x.
-  Con 60 fps la GPU trabaja el doble: si da tirones, baja la calidad (F1 dentro del juego).
+- El juego usa su propio renderizador (sin emulador de graficos): dibuja a 2x y Apple MetalFX lo reescala a la
+  resolucion real de tu pantalla (Retina). En un M2 Pro las peleas van a 60 fps en pantalla completa.
 
 Controles
 ---------
 Mando (Xbox, PlayStation o MFi conectado al Mac) o teclado:
   flechas = cruceta, WASD = stick izquierdo, Z/X/C/V = Cuadrado/Cruz/Circulo/Triangulo,
   Q/E = L1/R1, 1/3 = L2/R2, Enter = START, Retroceso = SELECT.
-F1 (o mantener START 1,5 s) = opciones: resolucion interna, MetalFX, 60 fps, mostrar FPS...
+F1 (o mantener START 1,5 s) = opciones del juego: 60 fps, mostrar FPS...
 F11 o Alt+Enter = pantalla completa / ventana.  Cmd+Q en la ventana del juego = salir.
 
 Todo desbloqueado: "Contenido desbloqueado" en AJUSTES (activado de serie) abre todos los personajes,

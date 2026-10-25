@@ -1,0 +1,130 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Interrupt.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Interrupt.cpp
+index fa6fa6b..dad1c7e 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Interrupt.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Interrupt.cpp
+@@ -1,3 +1,17 @@
++#if defined(_WIN32)
++#include <immintrin.h>
++// [vblankjit] the few Win32 calls the precise wait needs (no <windows.h>: it collides with the runtime's headers, as
++// ThreadNaming.h works around the same way)
++extern "C"
++{
++    __declspec(dllimport) void *__stdcall CreateWaitableTimerExW(void *attrs, const wchar_t *name, unsigned long flags, unsigned long access);
++    __declspec(dllimport) int __stdcall SetWaitableTimerEx(void *timer, const long long *due, long period, void *apc, void *arg, void *wakeContext, unsigned long tolerableDelay);
++    __declspec(dllimport) unsigned long __stdcall WaitForSingleObject(void *handle, unsigned long ms);
++    __declspec(dllimport) int __stdcall SetThreadPriority(void *thread, int priority);
++    __declspec(dllimport) void *__stdcall GetCurrentThread(void);
++}
++#endif#include <vector>
++#include <algorithm>
+ #if defined(__APPLE__)
+ #include <mach/mach_time.h>
+ #include <pthread/qos.h>
+@@ -533,6 +547,34 @@ namespace ps2_syscalls
+     }
+ 
+     extern "C" bool ps2xFrameStepOn();   // ps2_runtime.cpp: frame-stepped mode (the controller delivers the ticks)
++#if defined(_WIN32)
++    // [vblankjit] Windows' wait primitives wake ~0.8 ms late on average and up to ~3 ms (the condition-variable wait rides the
++    // system timer), so the 60 Hz vblanks came unevenly. The precise wait: a high-resolution waitable timer up to 0.3 ms
++    // before the deadline, then a short spin. Measured late: avg 0.8 ms / p99 2 ms / max 2.9 ms before.
++    static bool vblankPreciseOn() { static const bool s = [](){ const char *v = std::getenv("PS2X_VBLANK_PRECISE"); return !(v && v[0] == '0'); }(); return s; }
++    static void preciseWaitUntilWin(std::chrono::steady_clock::time_point t)
++    {
++        using clock = std::chrono::steady_clock;
++        static thread_local void *s_timer = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002u /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, 0x1F0003u /* TIMER_ALL_ACCESS */);
++        const auto spinFrom = t - std::chrono::microseconds(300);
++        const auto now = clock::now();
++        if (spinFrom > now)
++        {
++            const long long due = -(long long)(std::chrono::duration_cast<std::chrono::nanoseconds>(spinFrom - now).count() / 100);   // 100 ns units, relative
++            if (!(s_timer && SetWaitableTimerEx(s_timer, &due, 0, nullptr, nullptr, nullptr, 0) && WaitForSingleObject(s_timer, 0xFFFFFFFFu) == 0u))
++                std::this_thread::sleep_until(spinFrom);   // (no high-resolution timer before Windows 10 1803)
++        }
++        while (clock::now() < t) _mm_pause();
++    }
++#endif
++    extern "C" void ps2xPreciseWaitUntilNs(int64_t steadyNs)
++    {   // [vblankjit] the frame-stepped (online) loop's vblank wait, on the same precise path (ps2_runtime.cpp)
++        const std::chrono::steady_clock::time_point t{std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::nanoseconds(steadyNs))};
++#if defined(_WIN32)
++        if (vblankPreciseOn()) { preciseWaitUntilWin(t); return; }
++#endif
++        std::this_thread::sleep_until(t);
++    }
+     extern "C" void ps2xInterruptTick(uint8_t *rdram, PS2Runtime *runtime)
+     {
+         const int saved = g_currentThreadId;
+@@ -548,6 +590,9 @@ namespace ps2_syscalls
+         using clock = std::chrono::steady_clock;
+         (void)vblankPeriodNow();   // [perf2] starts the benchmark clock with the worker
+         auto nextTick = clock::now() + vblankPeriodNow();
++#if defined(_WIN32)
++        if (vblankPreciseOn()) SetThreadPriority(GetCurrentThread(), 2 /* THREAD_PRIORITY_HIGHEST */);   // [vblankjit] the 60 Hz tick before ordinary work
++#endif
+ #if defined(__APPLE__)
+         // [vblankpace] macOS coalesces the timers of ordinary threads: this worker woke 5 ms late on average (up to 8) after
+         // each deadline, so the vblanks -- and the frames sent to the GS host -- came 16-24 ms apart, and the 60 Hz display
+@@ -566,6 +611,8 @@ namespace ps2_syscalls
+                 std::unique_lock<std::mutex> lock(g_irq_worker_mutex);
+ #if defined(__APPLE__)
+                 const auto coarse = s_precise ? nextTick - std::chrono::milliseconds(2) : nextTick;
++#elif defined(_WIN32)
++                const auto coarse = vblankPreciseOn() ? nextTick - std::chrono::milliseconds(3) : nextTick;   // [vblankjit]
+ #else
+                 const auto coarse = nextTick;
+ #endif
+@@ -575,6 +622,9 @@ namespace ps2_syscalls
+                     break;
+                 }
+             }
++#if defined(_WIN32)
++            if (vblankPreciseOn()) preciseWaitUntilWin(nextTick);   // [vblankjit]
++#endif
+ #if defined(__APPLE__)
+             if (s_precise)
+             {   // steady_clock is mach_absolute_time-based on macOS: the same deadline in mach ticks
+@@ -585,6 +635,19 @@ namespace ps2_syscalls
+ #endif
+ 
+             const auto now = clock::now();
++            {   // [vblankjit] PS2X_VBLANK_STATS=1: how late this worker wakes after each vblank deadline (us), every 300 ticks
++                static const bool s_vs = [](){ const char *v = std::getenv("PS2X_VBLANK_STATS"); return v && v[0] == '1'; }();
++                if (s_vs && now >= nextTick)
++                {
++                    static std::vector<double> s_late; s_late.push_back(std::chrono::duration<double, std::micro>(now - nextTick).count());
++                    if (s_late.size() >= 300u)
++                    {
++                        std::sort(s_late.begin(), s_late.end()); double sum = 0; for (double x : s_late) sum += x;
++                        std::fprintf(stderr, "[vblankjit] late us: avg %.0f p50 %.0f p99 %.0f max %.0f\n", sum / s_late.size(), s_late[s_late.size() / 2], s_late[s_late.size() * 99 / 100], s_late.back());
++                        s_late.clear();
++                    }
++                }
++            }
+             int ticksToProcess = 0;
+             const auto period = vblankPeriodNow();
+             while (now >= nextTick && ticksToProcess < kMaxCatchupTicks)
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 793dfe7..8a8593f 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -5910,6 +5910,7 @@ void ps2xKernelSetCurrentTid(int tid);
+ #if defined(__APPLE__)
+ #include <mach/mach_time.h>
+ #endif
++extern "C" void ps2xPreciseWaitUntilNs(int64_t steadyNs);   // [vblankjit] Interrupt.cpp
+ static void ps2xPreciseSleepUntil(std::chrono::steady_clock::time_point t)
+ {
+ #if defined(__APPLE__)
+@@ -5923,6 +5924,11 @@ static void ps2xPreciseSleepUntil(std::chrono::steady_clock::time_point t)
+         if (left > 0) mach_wait_until(mach_absolute_time() + static_cast<uint64_t>(left) * s_tb.denom / s_tb.numer);
+         return;
+     }
++#elif defined(_WIN32)
++    {   // [vblankjit] Windows: the interrupt worker's precise wait (Interrupt.cpp)
++        ps2xPreciseWaitUntilNs((int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count());
++        return;
++    }
+ #endif
+     std::this_thread::sleep_until(t);
+ }

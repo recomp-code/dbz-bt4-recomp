@@ -1,0 +1,244 @@
+diff --git a/ps2xRuntime/src/lib/ps2_seamvk.cpp b/ps2xRuntime/src/lib/ps2_seamvk.cpp
+index 7da1778..9ce3428 100644
+--- a/ps2xRuntime/src/lib/ps2_seamvk.cpp
++++ b/ps2xRuntime/src/lib/ps2_seamvk.cpp
+@@ -186,9 +186,11 @@ namespace seamvk
+                 }
+                 static uint32_t mixKey(uint64_t k) { k ^= k >> 33; k *= 0xff51afd7ed558ccdull; k ^= k >> 33; return uint32_t(k); }
+                 static float dist(const Consts &a, const Consts &b)
+-                {   // the matrices that place the mesh (stage / effects: A, B; characters: the bones A, B and the projection E)
++                {   // where the instance sits: the translation rows of A and B (stage / effects: screen and clip; characters: the
++                    // two bones). Instances of one mesh differ there; the full 48 floats made a field of identical grass tufts
++                    // quadratic (12% of the GS thread uncapped).
+                     float d = 0.0f;
+-                    for (int r = 0; r < 4; ++r) for (int k = 0; k < 4; ++k) d += std::fabs(a.A[r][k] - b.A[r][k]) + std::fabs(a.B[r][k] - b.B[r][k]) + std::fabs(a.E[r][k] - b.E[r][k]);
++                    for (int k = 0; k < 4; ++k) d += std::fabs(a.A[3][k] - b.A[3][k]) + std::fabs(a.B[3][k] - b.B[3][k]);
+                     return d;
+                 }
+                 uint32_t head(uint64_t k) const
+@@ -199,10 +201,14 @@ namespace seamvk
+                 const Consts *best(uint64_t k, const Consts &c) const
+                 {
+                     const Consts *b = nullptr; float bd = 0.0f;
+-                    for (uint32_t s = head(k); s; s = next[s - 1u]) { const float d = dist(consts[s - 1u], c); if (!b || d < bd) { b = &consts[s - 1u]; bd = d; } }
++                    for (uint32_t s = head(k); s; s = next[s - 1u])
++                    {
++                        const float d = dist(consts[s - 1u], c);
++                        if (!b || d < bd) { b = &consts[s - 1u]; bd = d; if (d == 0.0f) break; }   // (unmoved: nothing can be closer)
++                    }
+                     return b;
+                 }
+-                void insert(uint64_t k, const Consts &c)
++                uint32_t insert(uint64_t k, const Consts &c)   // -> the new entry's index
+                 {
+                     if ((keys.size() + 1u) * 2u > slot.size())
+                     {   // keep the load under one half (a frame can have far more chunks than the last: menu -> fight)
+@@ -215,7 +221,7 @@ namespace seamvk
+                         }
+                     }
+                     for (uint32_t i = mixKey(k) & mask;; i = (i + 1u) & mask)
+-                        if (!slot[i] || keys[slot[i] - 1u] == k) { keys.push_back(k); consts.push_back(c); next.push_back(slot[i]); slot[i] = uint32_t(keys.size()); return; }
++                        if (!slot[i] || keys[slot[i] - 1u] == k) { keys.push_back(k); consts.push_back(c); next.push_back(slot[i]); slot[i] = uint32_t(keys.size()); return slot[i] - 1u; }
+                 }
+             } mvPrev, mvCur;
+             bool mvValid = false;                                 // this frame's motion pass found the displayed scene's meshes
+@@ -342,7 +348,16 @@ namespace seamvk
+         }
+         // [batch] write n Consts into this frame's ring and bind them as the seam program's storage buffer (binding 0)
+         static constexpr VkDeviceSize kCringBytes = 8u << 20;
++        Consts *allocConsts(Vulkan::CommandBuffer &cmd, Vulkan::Device &dev, size_t n, unsigned binding = 0);
+         bool bindConsts(Vulkan::CommandBuffer &cmd, Vulkan::Device &dev, const Consts *arr, size_t n, unsigned binding = 0)
++        {
++            Consts *dst = allocConsts(cmd, dev, n, binding);
++            if (dst) std::memcpy(dst, arr, sizeof(Consts) * n);
++            return dst != nullptr;
++        }
++        // [mvcopy] n constant blocks for binding, written by the caller straight into the ring (the motion pass gathers
++        // the previous frame's blocks from scattered entries: a staging vector first was one more 2 MB copy a frame)
++        Consts *allocConsts(Vulkan::CommandBuffer &cmd, Vulkan::Device &dev, size_t n, unsigned binding)
+         {
+             const uint32_t s = g_gpu.cslot;
+             if (!g_gpu.cring[s])
+@@ -353,12 +368,11 @@ namespace seamvk
+             }
+             const VkDeviceSize bytes = VkDeviceSize(sizeof(Consts)) * n;
+             VkDeviceSize off = (g_gpu.coff + 255u) & ~VkDeviceSize(255u);
+-            if (off + bytes > kCringBytes) { static int s_warn = 0; if (s_warn++ < 3) std::fprintf(stderr, "[seamvk] constants ring full (%zu chunks)\n", n); return false; }
+-            std::memcpy(g_gpu.cmap[s] + off, arr, bytes);
++            if (off + bytes > kCringBytes) { static int s_warn = 0; if (s_warn++ < 3) std::fprintf(stderr, "[seamvk] constants ring full (%zu chunks)\n", n); return nullptr; }
+             g_gpu.coff = off + bytes;
+             cmd.set_storage_buffer(0, binding, *g_gpu.cring[s], off, bytes);
+             g_gpu.lastCOff = off; g_gpu.lastCBytes = bytes;
+-            return true;
++            return reinterpret_cast<Consts *>(g_gpu.cmap[s] + off);
+         }
+         // [vring] vertex data for binding 0 from this frame's ring, bound at its offset. Granite's vertex pool hands out 4 KB
+         // blocks and gives anything larger (most GS draws, every seam batch: ~2.8 MB a fight frame) a dedicated buffer that
+@@ -1435,9 +1449,8 @@ namespace seamvk
+                 auto ci = Vulkan::ImageCreateInfo::render_target(tw, th, VK_FORMAT_R16G16_SFLOAT); ci.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+                 g_gpu.mv = dev.create_image(ci);
+             }
+-            struct Item { uint32_t di; const Consts *prev; };
++            struct Item { uint32_t di; const Consts *prev; uint32_t self; };   // self: this chunk's entry in mvCur
+             static std::vector<Item> items; items.clear();
+-            static std::vector<Consts> self; self.clear(); self.reserve(f.draws.size());   // (reserved: items point into it)
+             g_gpu.mvCur.clear(g_gpu.mvPrev.keys.size() + 256u);
+             size_t matched = 0;
+             for (uint32_t i = 0; i < f.draws.size(); ++i)
+@@ -1447,13 +1460,14 @@ namespace seamvk
+                 const uint64_t h = chunkKey(f, d);
+                 // [mvofs] the kept constants carry the draw's XYOFFSET in view.xy (a field the shaders do not otherwise read): the
+                 // game shakes the screen on heavy hits by moving the offset, not the matrices, and that is motion too
+-                self.push_back(d.c); Consts &cc = self.back();
++                const uint32_t ci = g_gpu.mvCur.insert(h, d.c);
++                Consts &cc = g_gpu.mvCur.consts[ci];
+                 cc.view[0] = d.st.ofx / 16.0f; cc.view[1] = d.st.ofy / 16.0f; cc.view[2] = cc.view[3] = 0.0f;
+-                g_gpu.mvCur.insert(h, cc);
+                 const Consts *p = g_gpu.mvPrev.best(h, d.c);   // [mvinst] the closest instance of this mesh last frame
+                 if (p) ++matched;
+-                items.push_back(Item{ i, p ? p : &cc });       // no match: its own constants and offset, no motion
++                items.push_back(Item{ i, p, ci });
+             }
++            for (Item &x : items) if (!x.prev) x.prev = &g_gpu.mvCur.consts[x.self];   // no match: its own constants and offset, no motion (mvCur has stopped growing)
+             {   // PS2X_SEAMVK_MVLOG=1: chunks and matches, once a second
+                 static const bool s_log = [](){ const char *v = std::getenv("PS2X_SEAMVK_MVLOG"); return v && v[0] == '1'; }();
+                 static uint32_t s_n = 0; if (s_log && ++s_n % 60u == 0u) std::fprintf(stderr, "[mvpass] fbp 0x%x: %zu chunks, %zu matched last frame\n", g_gpu.mvFbp, items.size(), matched);
+@@ -1498,9 +1512,9 @@ namespace seamvk
+                     bool ok = mb.slot == g_gpu.cslot && g_gpu.vring[mb.slot] && g_gpu.cring[mb.slot];
+                     for (uint32_t di : mb.idx) if (di >= prevOf.size() || !prevOf[di]) { ok = false; break; }   // (a chunk the key pass skipped)
+                     if (!ok) continue;
+-                    parr.resize(mb.idx.size());
+-                    for (size_t k = 0; k < mb.idx.size(); ++k) parr[k] = *prevOf[mb.idx[k]];
+-                    if (!bindConsts(cmd, dev, parr.data(), parr.size(), 1)) break;
++                    Consts *pdst = allocConsts(cmd, dev, mb.idx.size(), 1);
++                    if (!pdst) break;
++                    for (size_t k = 0; k < mb.idx.size(); ++k) std::memcpy(&pdst[k], prevOf[mb.idx[k]], sizeof(Consts));
+                     cmd.set_storage_buffer(0, 0, *g_gpu.cring[mb.slot], mb.cOff, mb.cBytes);
+                     cmd.set_vertex_binding(0, *g_gpu.vring[mb.slot], mb.vOff, 48);
+                     MvPC pc = {};
+@@ -1925,8 +1939,10 @@ namespace seamvk
+ 
+     uint64_t lastFrameGframe() { std::lock_guard<std::mutex> lk(g_mtx); return g_frameGframe; }   // [presentlat]
+ 
++    void stopRenderThread();
+     void shutdown()
+     {   // [earlyframe] stop the readback consumer before the device goes away
++        stopRenderThread();   // [rthread] (it feeds the consumer)
+         if (!g_rbThread) return;
+         { std::lock_guard<std::mutex> lk(g_rbMtx); g_rbQuit = true; }
+         g_rbCv.notify_all();
+@@ -1943,6 +1959,7 @@ namespace seamvk
+     }
+ 
+     // ---- [standalone] own device + stream-ordered display block ---------------------------------------------------
++    void renderList(Vulkan::Device &dev, const PrivRegs &priv, seamgs::FrameList &f);   // [rthread] one taken frame list
+     namespace
+     {
+         // [seamfeat] What the seam's shaders need beyond what stock Granite enables: VK_EXT_shader_stencil_export (gs/outline/
+@@ -2002,6 +2019,39 @@ namespace seamvk
+         uint64_t g_streamDispfb1 = 0; bool g_haveStreamFlip = false;
+         std::atomic<uint32_t> g_presentW{0}, g_presentH{0};
+         extern "C" bool ps2xStage1FenceC();
++        bool ensureOwnDevice();
++        // [rthread] The GS thread parsed the game's packets AND recorded the Vulkan frame, one after the other, and was the
++        // limit uncapped (~87% busy). At the swap it now only takes the frame list and queues it; a render thread records
++        // and submits it while the GS thread parses the next frame. Two lists in turn: at most one queued and one being
++        // rendered (the GS thread waits for a free one, so it never runs more than a frame ahead). The front end and the
++        // renderer share nothing but the list (texture slots are uploaded in list order, on the render thread). The render
++        // thread is the only one that records, so it takes Granite's thread index 0. PS2X_SEAMVK_RTHREAD=0: one thread.
++        bool renderThreadOn() { static const bool s = [](){ const char *v = std::getenv("PS2X_SEAMVK_RTHREAD"); return !(v && v[0] == '0'); }(); return s; }
++        struct RenderJob { seamgs::FrameList list; PrivRegs priv; };
++        RenderJob g_rtJobs[2]; bool g_rtBusy[2] = {};
++        std::mutex g_rtMtx; std::condition_variable g_rtCv; std::deque<int> g_rtQueue; bool g_rtQuit = false;
++        std::thread *g_rtThread = nullptr;   // heap-held, joined by shutdown()
++        std::atomic<uint32_t> g_outH1x{448u};   // [wshud] the output height in the 1x domain, for the GS thread's noteSwap
++        void rtWorker()
++        {
++            for (;;)
++            {
++                int j;
++                {
++                    std::unique_lock<std::mutex> lk(g_rtMtx);
++                    g_rtCv.wait(lk, []{ return g_rtQuit || !g_rtQueue.empty(); });
++                    if (g_rtQuit) return;
++                    j = g_rtQueue.front(); g_rtQueue.pop_front();
++                }
++                if (ensureOwnDevice())
++                {
++                    renderList(g_own->dev, g_rtJobs[j].priv, g_rtJobs[j].list);
++                    g_own->dev.next_frame_context();
++                }
++                { std::lock_guard<std::mutex> lk(g_rtMtx); g_rtBusy[j] = false; }
++                g_rtCv.notify_all();
++            }
++        }
+         bool ensureOwnDevice()
+         {
+             static thread_local bool t_reg = false;
+@@ -2085,7 +2135,6 @@ namespace seamvk
+     void onSwap()
+     {
+         if (!on()) return;
+-        if (!ensureOwnDevice()) return;
+         const PrivRegs pr = composePriv();
+         {   // [pacing] frames that came more than 25 ms after the previous one (the PCSX2 host's "hitches>25ms"), per second
+             static std::chrono::steady_clock::time_point s_last{}, s_win{};
+@@ -2105,21 +2154,52 @@ namespace seamvk
+                 s_win = now; s_hitch = 0; s_frames = 0; s_worst = 0.0;
+             }
+         }
+-        ps2x_wshud::noteSwap(g_gpu.h ? g_gpu.h / g_gpu.oscale : 448u);   // [wshud] the walker's per-frame reset (scanout height in the 1x domain: the output image is CRTC size x OUTPUT scale, not render scale -- dividing by the render scale gave 298 at scale 3 and switched the HUD squeeze off)
+-        renderFrame(g_own->dev, pr);
+-        g_own->dev.next_frame_context();   // fences and command buffers recycle per context
++        ps2x_wshud::noteSwap(g_outH1x.load(std::memory_order_relaxed));   // [wshud] the walker's per-frame reset (scanout height in the 1x domain: the output image is CRTC size x OUTPUT scale, not render scale -- dividing by the render scale gave 298 at scale 3 and switched the HUD squeeze off)
++        if (!renderThreadOn())
++        {
++            if (!ensureOwnDevice()) return;
++            renderFrame(g_own->dev, pr);
++            g_own->dev.next_frame_context();   // fences and command buffers recycle per context
++            return;
++        }
++        // [rthread] hand the frame to the render thread and go back to parsing the next one
++        if (!g_rtThread) g_rtThread = new std::thread(rtWorker);
++        int j = -1;
++        {
++            std::unique_lock<std::mutex> lk(g_rtMtx);
++            g_rtCv.wait(lk, [&]{ if (g_rtQuit) return true; for (int k = 0; k < 2; ++k) if (!g_rtBusy[k]) { j = k; return true; } return false; });
++            if (g_rtQuit) return;   // (shutting down)
++        }
++        RenderJob &job = g_rtJobs[j];   // free: only this thread touches it until it is queued
++        { const uint64_t db[2] = { pr.dispfb1, pr.dispfb2 }; seamgs::takeFrame(job.list, db, (uint32_t)(pr.pmode & 3u)); }   // [dispvram]
++        job.priv = pr;
++        { std::lock_guard<std::mutex> lk(g_rtMtx); g_rtBusy[j] = true; g_rtQueue.push_back(j); }
++        g_rtCv.notify_all();
++    }
++
++    void stopRenderThread()
++    {   // [rthread] the queued frames are dropped; the one being recorded finishes first
++        if (!g_rtThread) return;
++        { std::lock_guard<std::mutex> lk(g_rtMtx); g_rtQuit = true; }
++        g_rtCv.notify_all();
++        g_rtThread->join(); delete g_rtThread; g_rtThread = nullptr;
+     }
+ 
+     void renderFrame(Vulkan::Device &dev, const PrivRegs &priv)
+     {
+-        const auto tA = std::chrono::steady_clock::now();
+         // [framereuse] one list for the process: takeFrame swaps it with the front end's, which clears it and refills the
+         // same vectors. A fresh local here handed the front end empty vectors every frame (~550 draws, ~2.8 MB of verts
+         // regrown from zero and freed again: ~25% of the GS thread in the uncapped fight).
+         static seamgs::FrameList s_frameList;
+-        seamgs::FrameList &f = s_frameList;
+-        { const uint64_t db[2] = { priv.dispfb1, priv.dispfb2 }; seamgs::takeFrame(f, db, (uint32_t)(priv.pmode & 3u)); }   // [dispvram]
++        { const uint64_t db[2] = { priv.dispfb1, priv.dispfb2 }; seamgs::takeFrame(s_frameList, db, (uint32_t)(priv.pmode & 3u)); }   // [dispvram]
++        renderList(dev, priv, s_frameList);
++    }
++
++    void renderList(Vulkan::Device &dev, const PrivRegs &priv, seamgs::FrameList &f)
++    {
++        const auto tA = std::chrono::steady_clock::now();
+         if (!ensureGpu(dev)) return;
++        g_outH1x.store(g_gpu.h ? g_gpu.h / g_gpu.oscale : 448u, std::memory_order_relaxed);   // [rthread] (the last frame's, as before)
+         const auto tB = std::chrono::steady_clock::now();
+         const uint32_t sc = g_gpu.scale;
+         const auto tU0 = std::chrono::steady_clock::now();

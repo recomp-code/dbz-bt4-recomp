@@ -1,0 +1,29 @@
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 1f559d5..5b383df 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -219,6 +219,9 @@ extern "C" __declspec(dllimport) void *__stdcall wglGetProcAddress(const char *)
+ #else
+ #include <SDL_video.h>   // [linuxfix] SDL_GL_GetProcAddress: the window and its GL context are SDL's
+ #endif
++#if defined(PS2X_PGO_GEN)
++extern "C" int __llvm_profile_write_file(void);   // [pgo] LLVM's profile runtime (instrumented builds only)
++#endif
+ namespace
+ {
+     // [linuxfix] Platform GL entry-point loader for the shared gfx::gl context. It only existed as a
+@@ -1758,6 +1761,14 @@ bool PS2Runtime::initialize(const char *title)
+ #endif
+         (void)ps2x::GetVideoStatus();   // [vstatus] one-shot: what the Video tab will report
+         bt3SetTargetFPS(60);
++#if defined(PS2X_PGO_GEN)
++        {   // [pgo] the instrumented build (tools\build_pgo.cmd) writes its profile after PS2X_PGO_WRITE_AT seconds: the training
++            // run is stopped from outside, and the profile runtime would only write it at a normal exit
++            const char *v = std::getenv("PS2X_PGO_WRITE_AT"); const int secs = v && v[0] ? std::atoi(v) : 0;
++            if (secs > 0)
++                std::thread([secs]() { std::this_thread::sleep_for(std::chrono::seconds(secs)); const int r = __llvm_profile_write_file(); std::fprintf(stderr, "[pgo] profile written (%d)\n", r); }).detach();
++        }
++#endif
+         {   // [texreplace] Index replacements at STARTUP rather than lazily on the first texture
+             // decode, so the overlay's Texture Replacement switch is correctly enabled/disabled
+             // from the moment it opens and the "[texreplace] indexed N" line appears at boot.

@@ -4,7 +4,7 @@
 # The bt3mod tree is BT3-Recomp e22a34b + patches/bt3recomp-bt4mod-full.patch + bt3recomp-bt4mod-windows.patch +
 # bt3recomp-bt4mod-macos.patch + bt3recomp-bt4mod-perf.patch + bt3recomp-bt4mod-unlock.patch
 # + bt3recomp-bt4mod-netstats.patch + bt3recomp-bt4mod-movieend.patch + bt3recomp-bt4mod-livebatch.patch
-# + bt3recomp-bt4mod-perf2.patch + bt3recomp-bt4mod-seamperf.patch + bt3recomp-bt4mod-glshare.patch + bt3recomp-bt4mod-upscale.patch + bt3recomp-bt4mod-fsr2.patch + bt3recomp-bt4mod-netnative.patch + bt3recomp-bt4mod-descfix.patch + bt3recomp-bt4mod-parity.patch + bt3recomp-bt4mod-pacing.patch + bt3recomp-bt4mod-metalfx.patch + bt3recomp-bt4mod-maskpc.patch + bt3recomp-bt4mod-mvfix.patch + bt3recomp-bt4mod-rthread.patch + bt3recomp-bt4mod-mfxsign.patch, with the game code generated as in the README's
+# + bt3recomp-bt4mod-perf2.patch + bt3recomp-bt4mod-seamperf.patch + bt3recomp-bt4mod-glshare.patch + bt3recomp-bt4mod-upscale.patch + bt3recomp-bt4mod-fsr2.patch + bt3recomp-bt4mod-netnative.patch + bt3recomp-bt4mod-descfix.patch + bt3recomp-bt4mod-parity.patch + bt3recomp-bt4mod-pacing.patch + bt3recomp-bt4mod-metalfx.patch + bt3recomp-bt4mod-maskpc.patch + bt3recomp-bt4mod-mvfix.patch + bt3recomp-bt4mod-rthread.patch + bt3recomp-bt4mod-mfxsign.patch + bt3recomp-bt4mod-jitsign.patch, with the game code generated as in the README's
 # "Native macOS" section. The tree is bt3mod-native (BT3MOD= overrides): there, full.patch goes in without
 # ps2xRuntime/third_party/parallel-gs (it keeps parallel-gs-moltenvk / granite-moltenvk), and the native renderer
 # (seamvk) needs Granite's volk and khronos/vulkan-headers. One runner for both: the PCSX2 host qualities and the

@@ -1,0 +1,159 @@
+diff --git a/ps2xRuntime/src/lib/ps2_seamvk.cpp b/ps2xRuntime/src/lib/ps2_seamvk.cpp
+index 27d7a27..506d224 100644
+--- a/ps2xRuntime/src/lib/ps2_seamvk.cpp
++++ b/ps2xRuntime/src/lib/ps2_seamvk.cpp
+@@ -235,6 +235,7 @@ namespace seamvk
+             // meshes through their viewport origin) and in composed-frame pixels (what the upscaler is told); upActive: the
+             // upscaler ran last frame (no jitter without a temporal resolve: it would shimmer)
+             float jitGs[2] = {}, jitOut[2] = {}; uint32_t jitIdx = 0; bool upActive = false;
++            int jitSign = -1; uint32_t jitPos = 0; uint64_t jitCycle = 0;   // [jitcycle] PS2X_UPSCALE_JITSIGN_CYCLE=1: this frame's sign pair (0 "--", 1 "-+", 2 "+-", 3 "++"), -1 = the fixed one
+             Vulkan::ImageHandle out;            // the composed frame
+             Vulkan::ImageHandle white;          // 1x1 for untextured draws
+             Vulkan::ImageHandle outlineH;       // [outline] pass A output (minC, maxC, minF, maxF), target-sized
+@@ -242,7 +243,7 @@ namespace seamvk
+             std::vector<std::pair<Vulkan::ImageHandle, int32_t>> zKeep;   // [zdecdump] depth copies taken at Z read-backs while dumping
+             Vulkan::BufferHandle readback;
+             struct TsMark { uint8_t cat; Vulkan::QueryPoolHandle q; };   // [gputime] GPU timestamps: cat = the category that STARTS at this mark
+-            struct Pending { Vulkan::BufferHandle buf; Vulkan::Fence fence; uint32_t w = 0, h = 0; bool live = false; std::vector<TsMark> ts; uint64_t gframe = 0; bool noReadback = false; };   // [presentlat] gframe: the game frame this output belongs to   // [glshare] noReadback: the frame went to a shared image (the fence still guards the rings)
++            struct Pending { Vulkan::BufferHandle buf; Vulkan::Fence fence; uint32_t w = 0, h = 0; bool live = false; std::vector<TsMark> ts; uint64_t gframe = 0; bool noReadback = false; int jitSign = -1; uint32_t jitPos = 0; uint64_t jitCycle = 0; };   // [presentlat] gframe: the game frame this output belongs to   // [glshare] noReadback: the frame went to a shared image (the fence still guards the rings)
+             std::unordered_map<uint64_t, Vulkan::ImageHandle> shared;   // [seampack] texture-pack replacement images by name key, for the session
+             std::vector<Vulkan::ImageHandle> hoistFree;   // [hoist] images no draw in flight references any more, by size
+             uint64_t hoistFreeBytes = 0;                    // [poolcap] what hoistFree holds, so the pool is capped by bytes and not by count
+@@ -264,6 +265,53 @@ namespace seamvk
+             double msTake = 0, msRecord = 0, msSubmit = 0, msWait = 0;
+         };
+         Gpu g_gpu;
++        // [jitcycle] PS2X_UPSCALE_JITSIGN_CYCLE=1 (with PS2X_SEAMVK_GLSHARE=0: it measures the read-back frames): the upscaler's
++        // jitter sign pair switches every 16 frames inside one fight, and the readback consumer reports the frame-to-frame
++        // change of the 3D area per pair, relative to the mean of each 4-block cycle (the four share the cycle's motion).
++        // Separate runs cannot tell the pairs apart: the fight varies more between runs than the sign does.
++        bool jitCycle() { static const bool s = [](){ const char *v = std::getenv("PS2X_UPSCALE_JITSIGN_CYCLE"); return v && v[0] == '1'; }(); return s; }
++        void jitSigns(float fixedX, float fixedY, float &sx, float &sy)
++        {
++            if (g_gpu.jitSign < 0) { sx = fixedX; sy = fixedY; return; }
++            sx = (g_gpu.jitSign & 2) ? 1.0f : -1.0f; sy = (g_gpu.jitSign & 1) ? 1.0f : -1.0f;
++        }
++        void jitCycleSample(const uint8_t *rgba, uint32_t w, uint32_t h, int sign, uint32_t pos, uint64_t cycle)
++        {
++            static std::vector<uint8_t> s_prev; static uint32_t s_w = 0, s_h = 0;
++            static uint64_t s_cycle = ~0ull; static double s_sum[4]; static uint32_t s_n[4];
++            static double s_ratio[4]; static uint32_t s_wins[4], s_cycles = 0;
++            static const char *const kName[4] = { "--", "-+", "+-", "++" };
++            if (cycle != s_cycle)
++            {   // the last cycle, when all four pairs got most of their block: each against the cycle's mean
++                bool full = s_cycle != ~0ull; for (int k = 0; k < 4; ++k) full = full && s_n[k] >= 8u;
++                if (full)
++                {
++                    double m[4], mean = 0; for (int k = 0; k < 4; ++k) { m[k] = s_sum[k] / s_n[k]; mean += m[k] / 4.0; }
++                    int best = 0;
++                    for (int k = 0; k < 4; ++k) { if (mean > 0) s_ratio[k] += m[k] / mean; if (m[k] < m[best]) best = k; }
++                    ++s_wins[best]; ++s_cycles;
++                    if (s_cycles % 8u == 0u)
++                    {
++                        std::fprintf(stderr, "[jitcycle] %u cycles, change relative to the cycle mean (lower = steadier):", s_cycles);
++                        for (int k = 0; k < 4; ++k) std::fprintf(stderr, " %s %.3f (best %u)", kName[k], s_ratio[k] / s_cycles, s_wins[k]);
++                        std::fprintf(stderr, "\n");
++                    }
++                }
++                s_cycle = cycle; for (int k = 0; k < 4; ++k) { s_sum[k] = 0; s_n[k] = 0; }
++            }
++            const bool same = s_w == w && s_h == h && s_prev.size() == size_t(w) * h;
++            if (!same) { s_prev.assign(size_t(w) * h, 0); s_w = w; s_h = h; }
++            double sum = 0; uint64_t n = 0;
++            for (uint32_t y = h / 6u; y < h; ++y)
++                for (uint32_t x = 0; x < w; ++x)
++                {
++                    const uint8_t *q = rgba + (size_t(y) * w + x) * 4u;
++                    const uint8_t l = uint8_t((77u * q[0] + 150u * q[1] + 29u * q[2]) >> 8);
++                    uint8_t &pl = s_prev[size_t(y) * w + x];
++                    sum += std::abs(int(l) - int(pl)); ++n; pl = l;
++                }
++            if (same && pos != 0u && n) { s_sum[sign] += sum / double(n); ++s_n[sign]; }   // (a block's first frame still carries the last pair's history)
++        }
+ 
+         // [earlyframe] The readback consumer: the frame used to be handed to the presenter at the NEXT swap (renderFrame
+         // recorded frame N, then waited for frame N-1's readback and published it), so the image on screen was 1.29 game
+@@ -306,6 +354,7 @@ namespace seamvk
+                 if (!p.noReadback)
+                 {
+                     const uint8_t *src = static_cast<const uint8_t *>(g_gpu.dev->map_host_buffer(*p.buf, Vulkan::MEMORY_ACCESS_READ_BIT));
++                    if (p.jitSign >= 0) jitCycleSample(src, p.w, p.h, p.jitSign, p.jitPos, p.jitCycle);   // [jitcycle]
+                     {
+                         std::lock_guard<std::mutex> lk(g_mtx);
+                         g_frame.assign(src, src + size_t(p.w) * p.h * 4u);
+@@ -1829,12 +1878,15 @@ namespace seamvk
+                 ev.InRenderSubrectDimensions.Width = inW; ev.InRenderSubrectDimensions.Height = inH;
+                 ev.InReset = reset ? 1 : 0;
+                 ev.InMVScaleX = 1.0f; ev.InMVScaleY = 1.0f;   // pixels of the render resolution, pointing at the previous frame
+-                {   // [jitter] the scene was drawn shifted by jitOut composed pixels (right, down), so the sample point moved the other
+-                    // way: DLSS takes the sample offset, -jitOut. Measured (40 dumped frames, mean frame-to-frame change of the 3D area):
+-                    // "--" 1.91, no jitter 2.62, "++" 2.79 (the visible shake). PS2X_DLSS_JITTER_SIGN=<sx><sy> overrides.
+-                    static const float sx = [](){ const char *v = std::getenv("PS2X_DLSS_JITTER_SIGN"); return v && v[0] == '+' ? 1.0f : -1.0f; }();
+-                    static const float sy = [](){ const char *v = std::getenv("PS2X_DLSS_JITTER_SIGN"); return v && v[0] && v[1] == '+' ? 1.0f : -1.0f; }();
+-                    ev.InJitterOffsetX = sx * g_gpu.jitOut[0]; ev.InJitterOffsetY = sy * g_gpu.jitOut[1];
++                {   // [jitter] DLSS takes +jitOut (the scene was drawn shifted by jitOut composed pixels, right and down).
++                    // [jitsign] Measured with the real motion vectors (mvfix) by PS2X_UPSCALE_JITSIGN_CYCLE=1 (the four pairs in turn
++                    // inside one fight), frame-to-frame change of the 3D area relative to each cycle's mean, two runs of 48 cycles:
++                    // "++" 0.894 / 0.856 (best in 26 / 25 cycles), "+-" 0.991 / 0.963, "-+" 0.981 / 1.073, "--" 1.134 / 1.107. The
++                    // earlier "--" was picked while every vector was zero. PS2X_DLSS_JITTER_SIGN=<sx><sy> overrides.
++                    static const float sx = [](){ const char *v = std::getenv("PS2X_DLSS_JITTER_SIGN"); return v && v[0] == '-' ? -1.0f : 1.0f; }();
++                    static const float sy = [](){ const char *v = std::getenv("PS2X_DLSS_JITTER_SIGN"); return v && v[0] && v[1] == '-' ? -1.0f : 1.0f; }();
++                    float jx, jy; jitSigns(sx, sy, jx, jy);   // [jitcycle]
++                    ev.InJitterOffsetX = jx * g_gpu.jitOut[0]; ev.InJitterOffsetY = jy * g_gpu.jitOut[1];
+                 }
+                 const NVSDK_NGX_Result r = NGX_VULKAN_EVALUATE_DLSS_EXT(cb, g_ngx.feature, g_ngx.params, &ev);
+                 if (NVSDK_NGX_FAILED(r)) { static int s_n = 0; if (s_n++ < 4) std::fprintf(stderr, "[dlss] evaluate failed (0x%08x)\n", unsigned(r)); ok = false; }
+@@ -1897,11 +1949,14 @@ namespace seamvk
+             d.motionVectors = ffxGetTextureResourceGranite(&g_fsr2.ctx, &mv, &mv.get_view());
+             d.output = ffxGetTextureResourceGranite(&g_fsr2.ctx, &out, &out.get_view(), FFX_RESOURCE_STATE_UNORDERED_ACCESS);
+             d.motionVectorScale = { 1.0f, 1.0f };   // pixels of the render resolution, pointing at the previous frame
+-            {   // the sample offset in x as DLSS, y the other way (FSR2 counts y upwards). Measured as for DLSS (40 dumped frames,
+-                // frame-to-frame change): "-+" 2.07, "--" 2.99, "++" 2.89, "+-" 2.93. PS2X_FSR2_JITTER_SIGN=<sx><sy> overrides.
+-                static const float sx = [](){ const char *v = std::getenv("PS2X_FSR2_JITTER_SIGN"); return v && v[0] == '+' ? 1.0f : -1.0f; }();
++            {   // [jitsign] +jitOut, as DLSS (both take the offset in pixels). Measured as for DLSS, three runs of 48 cycles: "++"
++                // 1.084 / 0.910 / 0.913 (best in 13 / 20 / 20 cycles), "+-" 1.024 / 0.885 / 0.989, "-+" 0.957 / 0.988 / 1.027,
++                // "--" 0.935 / 1.217 / 1.071: FSR2 is far less sensitive to it than DLSS; "++" wins the most cycles and matches
++                // DLSS. (The earlier "-+" was picked while every vector was zero.) PS2X_FSR2_JITTER_SIGN=<sx><sy> overrides.
++                static const float sx = [](){ const char *v = std::getenv("PS2X_FSR2_JITTER_SIGN"); return v && v[0] == '-' ? -1.0f : 1.0f; }();
+                 static const float sy = [](){ const char *v = std::getenv("PS2X_FSR2_JITTER_SIGN"); return v && v[0] && v[1] == '-' ? -1.0f : 1.0f; }();
+-                d.jitterOffset = { sx * g_gpu.jitOut[0], sy * g_gpu.jitOut[1] };
++                float jx, jy; jitSigns(sx, sy, jx, jy);   // [jitcycle]
++                d.jitterOffset = { jx * g_gpu.jitOut[0], jy * g_gpu.jitOut[1] };
+             }
+             d.renderSize = { inW, inH };
+             d.enableSharpening = true; d.sharpness = 0.3f;
+@@ -2496,6 +2551,11 @@ namespace seamvk
+                 auto halton = [](uint32_t i, uint32_t b) { float f = 1.0f, r = 0.0f; while (i) { f /= float(b); r += f * float(i % b); i /= b; } return r; };
+                 const uint32_t i = (g_gpu.jitIdx++ % phases) + 1u;
+                 g_gpu.jitOut[0] = halton(i, 2) - 0.5f; g_gpu.jitOut[1] = halton(i, 3) - 0.5f;
++                if (jitCycle())
++                {   // [jitcycle] the four sign pairs in turn, 16 frames each, in both orders: they share the fight's motion
++                    const uint64_t blk = g_gpu.frames / 16u, k = blk % 4u;
++                    g_gpu.jitSign = int(((blk / 4u) & 1u) ? 3u - k : k); g_gpu.jitPos = uint32_t(g_gpu.frames % 16u); g_gpu.jitCycle = blk / 4u;
++                }
+                 if (srcW && srcH) { g_gpu.jitGs[0] = g_gpu.jitOut[0] * float(srcW) / float(g_gpu.w); g_gpu.jitGs[1] = g_gpu.jitOut[1] * float(srcH) / float(g_gpu.h); }
+             }
+         }
+@@ -3088,12 +3148,13 @@ namespace seamvk
+                         // PS2X_METALFX_JITTER_SIGN=<sx><sy> overrides.
+                         static const float sx = [](){ const char *v = std::getenv("PS2X_METALFX_JITTER_SIGN"); return v && v[0] == '-' ? -1.0f : 1.0f; }();
+                         static const float sy = [](){ const char *v = std::getenv("PS2X_METALFX_JITTER_SIGN"); return v && v[0] && v[1] == '+' ? 1.0f : -1.0f; }();
++                        float mx, my; jitSigns(sx, sy, mx, my);   // [jitcycle]
+                         dev.submit(cmd);
+                         dev.flush_frame();
+                         done = ps2_seamvk_metalfx::run(dev.get_device(), dev.get_queue_info().queues[Vulkan::QUEUE_INDEX_GRAPHICS], vkGetDeviceProcAddr,
+                                                        g_gpu.out->get_image(), g_gpu.upDepth->get_image(), g_gpu.upMv->get_image(), g_gpu.up->get_image(),
+                                                        g_gpu.w, g_gpu.h, g_gpu.up->get_width(), g_gpu.up->get_height(),
+-                                                       sx * g_gpu.jitOut[0], sy * g_gpu.jitOut[1], reset);
++                                                       mx * g_gpu.jitOut[0], my * g_gpu.jitOut[1], reset);
+                         cmd = dev.request_command_buffer();
+                     }
+ #endif
+@@ -3144,6 +3205,7 @@ namespace seamvk
+             g_rbCv.wait(lk, [&]{ return !slot.live; });
+         }
+         slot.gframe = g_bt3FrameCount.load(std::memory_order_relaxed);   // [presentlat]
++        slot.jitSign = (g_gpu.upActive && g_gpu.mvValid) ? g_gpu.jitSign : -1; slot.jitPos = g_gpu.jitPos; slot.jitCycle = g_gpu.jitCycle;   // [jitcycle]
+         // [glshare] GL imports the frame: a GPU copy into a free shared image, handed to the external queue family in the
+         // layout GL is told about (GL_LAYOUT_SHADER_READ_ONLY_EXT). No free slot (GL not presenting): this frame is not shown.
+         int shareSlot = -1; bool shareSkip = false;

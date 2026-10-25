@@ -1,0 +1,32 @@
+diff --git a/ps2xRuntime/third_party/bt3gl/src/rcore.c b/ps2xRuntime/third_party/bt3gl/src/rcore.c
+index ba23df7..a526fd7 100644
+--- a/ps2xRuntime/third_party/bt3gl/src/rcore.c
++++ b/ps2xRuntime/third_party/bt3gl/src/rcore.c
+@@ -104,6 +104,9 @@
+ 
+ #include "utils.h"                  // Required for: TRACELOG() macros
+ 
++#if defined(__APPLE__)
++#include <mach/mach_time.h>   // [macwait] mach_wait_until
++#endif
+ #include <stdlib.h>                 // Required for: srand(), rand(), atexit()
+ #include <stdio.h>                  // Required for: sprintf() [Used in OpenURL()]
+ #include <string.h>                 // Required for: strrchr(), strcmp(), strlen(), memset()
+@@ -1744,7 +1747,16 @@ void WaitTime(double seconds)
+         while (nanosleep(&req, &req) == -1) continue;
+     #endif
+     #if defined(__APPLE__)
+-        usleep(sleepSeconds*1000000.0);
++        // [macwait] macOS coalesces ordinary threads' timers: usleep woke ~0.7 ms late, and the 60 fps frame cap ran the
++        // window at ~57 fps (17.4 ms per frame) against a 60 fps game, one frame dropped every ~20. Sleep to 2 ms before
++        // the deadline and wait the rest with mach_wait_until, as the runtime's vblank clock does ([vblankpace]).
++        {
++            static mach_timebase_info_data_t tb = { 0, 0 };
++            if (tb.denom == 0) mach_timebase_info(&tb);
++            const uint64_t deadline = mach_absolute_time() + (uint64_t)(sleepSeconds*1e9*(double)tb.denom/(double)tb.numer);
++            if (sleepSeconds > 0.002) usleep((useconds_t)((sleepSeconds - 0.002)*1000000.0));
++            mach_wait_until(deadline);
++        }
+     #endif
+ 
+     #if defined(SUPPORT_PARTIALBUSY_WAIT_LOOP)

@@ -1,0 +1,502 @@
+diff --git a/ps2xRuntime/src/lib/ps2_seamvk.cpp b/ps2xRuntime/src/lib/ps2_seamvk.cpp
+index 92048a6..9e095f3 100644
+--- a/ps2xRuntime/src/lib/ps2_seamvk.cpp
++++ b/ps2xRuntime/src/lib/ps2_seamvk.cpp
+@@ -2145,8 +2145,13 @@ namespace seamvk
+             static const char *const devExts[] = { "VK_EXT_metal_objects" };
+             const uint32_t numDevExts = 1;
+ #else
+-            static const char *const *devExts = nullptr;
+-            const uint32_t numDevExts = 0;
++            // [vkpresent] the window's swapchain (ps2_seamvk_present.cpp): only when asked for (a device without it would fail)
++            static const char *const kSwapExt[] = { "VK_KHR_swapchain" };
++            const char *const *devExts = vkpresent::wanted() ? kSwapExt : nullptr;
++            const uint32_t numDevExts = vkpresent::wanted() ? 1u : 0u;
++            if (vkpresent::wanted())
++                for (const char *e : { "VK_KHR_surface", "VK_KHR_win32_surface" })
++                    if (std::find_if(instExts.begin(), instExts.end(), [&](const char *x) { return !std::strcmp(x, e); }) == instExts.end()) instExts.push_back(e);
+ #endif
+             if (!g_own->ctx.init_instance_and_device(instExts.empty() ? nullptr : instExts.data(), uint32_t(instExts.size()), devExts, numDevExts,
+                                                      Vulkan::CONTEXT_CREATION_ENABLE_PUSH_DESCRIPTOR_BIT | descFlags))
+@@ -3448,6 +3453,7 @@ namespace seamvk
+             std::memcpy(luid, p.deviceLUID, 8); std::memcpy(deviceUuid, p.deviceUUID, 16); std::memcpy(driverUuid, p.driverUUID, 16);
+             return true;
+         }
++        Vulkan::Device *device() { return g_own && g_own->inited ? &g_own->dev : nullptr; }
+         void enable(bool on) { g_shareOn.store(on && g_own && g_own->dev.get_device_features().supports_external, std::memory_order_release); }
+         bool take(Frame &out)
+         {
+diff --git a/ps2xRuntime/src/lib/ps2_seamvk_present.cpp b/ps2xRuntime/src/lib/ps2_seamvk_present.cpp
+new file mode 100644
+index 0000000..042868f
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_seamvk_present.cpp
+@@ -0,0 +1,409 @@
++// [vkpresent] The window presented through a Vulkan swapchain instead of GL's SwapBuffers (PS2X_SEAMVK_VKPRESENT=1).
++//
++// The window and everything drawn into it stay GL's: raylib draws the game frame (glshare's texture), the movies and every
++// overlay into the window's back buffer exactly as before. At the buffer swap (raylib's SwapScreenBuffer, hooked through
++// bt3SwapHook) the back buffer is copied on the GPU into an image the native renderer's Vulkan device owns and GL imports
++// (GL_EXT_memory_object), GL signals an exported semaphore, and Vulkan copies the image into a swapchain image and presents
++// it. The swapchain lives on a child window covering the GL window's client area (Vulkan cannot present to a window GL has
++// claimed); the child is disabled and transparent to hit-testing, so the mouse and keyboard still reach the GL window and
++// SDL. GL never swaps again, so the swapchain's present mode paces the loop: FIFO (vsync, the default), or mailbox /
++// immediate (PS2X_SEAMVK_VKPRESENT_MODE) for an uncapped display. A presentation that ends in Vulkan is also what driver
++// frame generation (NVIDIA Smooth Motion, AMD AFMF) and an own interpolator hook into.
++//
++// Same GPU only (the LUID check of glshare), Windows for now (macOS: a CAMetalLayer child view, the same flow). Kept in its
++// own translation unit: <windows.h> and SDL_syswm.h collide with raylib's names.
++#include "runtime/ps2_seamvk.h"
++
++#if defined(PS2X_HAVE_SEAMVK) && defined(_WIN32) && defined(PS2X_HAVE_SDL2)
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include "ps2_host_sdl.h"
++#include <SDL_syswm.h>
++#include "device.hpp"
++#include "image.hpp"
++#include <algorithm>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <type_traits>
++#include <vector>
++
++extern "C" bool (*bt3SwapHook)(void *window);   // rcore_desktop_sdl.c: SwapScreenBuffer asks it first
++
++namespace seamvk
++{
++    namespace vkpresent
++    {
++        bool wanted()
++        {
++            static const bool s = [](){ const char *v = std::getenv("PS2X_SEAMVK_VKPRESENT"); return v && v[0] == '1'; }();
++            return s;
++        }
++    }
++
++    namespace
++    {
++        // ---- GL entry points (no GL headers in this file) --------------------------------------------------------------
++        typedef unsigned GLenum, GLuint, GLbitfield; typedef int GLint, GLsizei; typedef uint64_t GLuint64; typedef unsigned char GLubyte, GLboolean;
++        enum : GLenum
++        {
++            kTex2D = 0x0DE1, kRGBA8 = 0x8058, kTexBinding2D = 0x8069, kExtensions = 0x1F03, kNumExtensions = 0x821D,
++            kFramebuffer = 0x8D40, kReadFb = 0x8CA8, kDrawFb = 0x8CA9, kReadFbBinding = 0x8CAA, kDrawFbBinding = 0x8CA6,
++            kColorAttachment0 = 0x8CE0, kFbComplete = 0x8CD5, kColorBufferBit = 0x4000, kNearest = 0x2600, kScissorTest = 0x0C11,
++            kDedicatedMemory = 0x9581, kOpaqueWin32 = 0x9587, kDeviceLuid = 0x9599, kLayoutTransferSrc = 0x9592,
++        };
++        struct Gl
++        {
++            void (__stdcall *GenTextures)(GLsizei, GLuint *);
++            void (__stdcall *DeleteTextures)(GLsizei, const GLuint *);
++            void (__stdcall *BindTexture)(GLenum, GLuint);
++            void (__stdcall *GetIntegerv)(GLenum, GLint *);
++            GLenum (__stdcall *GetError)(void);
++            const GLubyte *(__stdcall *GetStringi)(GLenum, GLuint);
++            GLboolean (__stdcall *IsEnabled)(GLenum);
++            void (__stdcall *Enable)(GLenum);
++            void (__stdcall *Disable)(GLenum);
++            void (__stdcall *Flush)(void);
++            void (__stdcall *GenFramebuffers)(GLsizei, GLuint *);
++            void (__stdcall *DeleteFramebuffers)(GLsizei, const GLuint *);
++            void (__stdcall *BindFramebuffer)(GLenum, GLuint);
++            void (__stdcall *FramebufferTexture2D)(GLenum, GLenum, GLenum, GLuint, GLint);
++            GLenum (__stdcall *CheckFramebufferStatus)(GLenum);
++            void (__stdcall *BlitFramebuffer)(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum);
++            void (__stdcall *GetUnsignedBytevEXT)(GLenum, GLubyte *);
++            void (__stdcall *CreateMemoryObjectsEXT)(GLsizei, GLuint *);
++            void (__stdcall *DeleteMemoryObjectsEXT)(GLsizei, const GLuint *);
++            void (__stdcall *MemoryObjectParameterivEXT)(GLuint, GLenum, const GLint *);
++            void (__stdcall *TexStorageMem2DEXT)(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLuint, GLuint64);
++            void (__stdcall *ImportMemoryWin32HandleEXT)(GLuint, GLuint64, GLenum, void *);
++            void (__stdcall *GenSemaphoresEXT)(GLsizei, GLuint *);
++            void (__stdcall *DeleteSemaphoresEXT)(GLsizei, const GLuint *);
++            void (__stdcall *ImportSemaphoreWin32HandleEXT)(GLuint, GLenum, void *);
++            void (__stdcall *SignalSemaphoreEXT)(GLuint, GLuint, const GLuint *, GLuint, const GLuint *, const GLenum *);
++            void (__stdcall *WaitSemaphoreEXT)(GLuint, GLuint, const GLuint *, GLuint, const GLuint *, const GLenum *);
++        } gl;
++
++        // ---- the child window the swapchain presents to ------------------------------------------------------------------
++        LRESULT CALLBACK childProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
++        {
++            switch (msg)
++            {
++            case WM_NCHITTEST: return HTTRANSPARENT;   // clicks go to the GL window underneath (SDL's)
++            case WM_ERASEBKGND: return 1;
++            case WM_PAINT: { PAINTSTRUCT ps; BeginPaint(h, &ps); EndPaint(h, &ps); return 0; }
++            default: return DefWindowProcW(h, msg, wp, lp);
++            }
++        }
++        HWND createChild(HWND parent, int w, int h)
++        {
++            static ATOM s_cls = 0;
++            if (!s_cls)
++            {
++                WNDCLASSW wc = {}; wc.lpfnWndProc = childProc; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = L"ps2x_vkpresent";
++                wc.hCursor = nullptr; wc.hbrBackground = nullptr;
++                s_cls = RegisterClassW(&wc);
++                if (!s_cls) return nullptr;
++            }
++            return CreateWindowExW(WS_EX_NOPARENTNOTIFY, L"ps2x_vkpresent", L"", WS_CHILD | WS_VISIBLE | WS_DISABLED | WS_CLIPSIBLINGS,
++                                   0, 0, w, h, parent, nullptr, GetModuleHandleW(nullptr), nullptr);
++        }
++
++        // ---- presenter state ----------------------------------------------------------------------------------------------
++        constexpr uint32_t kInFlight = 2;
++        struct Presenter
++        {
++            int state = 0;   // 0 not tried, 1 on, -1 off (GL swaps)
++            Vulkan::Device *dev = nullptr; VkDevice vk = VK_NULL_HANDLE; VkPhysicalDevice gpu = VK_NULL_HANDLE; VkInstance inst = VK_NULL_HANDLE;
++            VkQueue queue = VK_NULL_HANDLE; uint32_t family = 0;
++            HWND parent = nullptr, child = nullptr;
++            VkSurfaceKHR surface = VK_NULL_HANDLE; VkSwapchainKHR swapchain = VK_NULL_HANDLE; VkFormat format = VK_FORMAT_UNDEFINED;
++            VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
++            std::vector<VkImage> images; std::vector<VkSemaphore> renderDone;   // per swapchain image
++            uint32_t w = 0, h = 0;                                              // client / swapchain / shared image size
++            VkCommandPool pool = VK_NULL_HANDLE; VkCommandBuffer cb[kInFlight] = {}; VkFence fence[kInFlight] = {}; VkSemaphore acquired[kInFlight] = {};
++            uint32_t frame = 0;
++            // the image GL copies the back buffer into, and the two semaphores between the APIs (exported once, reused)
++            Vulkan::ImageHandle shared; GLuint glTex = 0, glMem = 0, glFbo = 0;
++            VkSemaphore glDone = VK_NULL_HANDLE, vkDone = VK_NULL_HANDLE; GLuint glDoneGl = 0, vkDoneGl = 0;
++            bool vkDonePending = false;   // Vulkan has signalled vkDone and GL has not waited for it yet
++            PFN_vkCreateWin32SurfaceKHR createSurface = nullptr; PFN_vkDestroySurfaceKHR destroySurface = nullptr;
++            PFN_vkGetPhysicalDeviceSurfaceSupportKHR surfaceSupport = nullptr; PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR surfaceCaps = nullptr;
++            PFN_vkGetPhysicalDeviceSurfaceFormatsKHR surfaceFormats = nullptr; PFN_vkGetPhysicalDeviceSurfacePresentModesKHR surfaceModes = nullptr;
++        } g_p;
++
++        const VolkDeviceTable &T() { return g_p.dev->get_device_table(); }
++        bool fail(const char *why)
++        {
++            std::fprintf(stderr, "[vkpresent] %s -- the window keeps GL's own swap\n", why);
++            g_p.state = -1;
++            return false;
++        }
++        bool hasGlExtension(const char *name)
++        {
++            GLint n = 0; gl.GetIntegerv(kNumExtensions, &n);
++            for (GLint i = 0; i < n; ++i) { const GLubyte *e = gl.GetStringi(kExtensions, GLuint(i)); if (e && !std::strcmp(reinterpret_cast<const char *>(e), name)) return true; }
++            return false;
++        }
++        VkSemaphore exportableSemaphore(HANDLE &handle)
++        {
++            VkExportSemaphoreCreateInfo ex = { VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO }; ex.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
++            VkSemaphoreCreateInfo ci = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO }; ci.pNext = &ex;
++            VkSemaphore s = VK_NULL_HANDLE;
++            if (T().vkCreateSemaphore(g_p.vk, &ci, nullptr, &s) != VK_SUCCESS) return VK_NULL_HANDLE;
++            VkSemaphoreGetWin32HandleInfoKHR hi = { VK_STRUCTURE_TYPE_SEMAPHORE_GET_WIN32_HANDLE_INFO_KHR }; hi.semaphore = s; hi.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
++            if (!T().vkGetSemaphoreWin32HandleKHR || T().vkGetSemaphoreWin32HandleKHR(g_p.vk, &hi, &handle) != VK_SUCCESS) { T().vkDestroySemaphore(g_p.vk, s, nullptr); return VK_NULL_HANDLE; }
++            return s;
++        }
++        GLuint importSemaphore(HANDLE handle)
++        {
++            GLuint s = 0; gl.GenSemaphoresEXT(1, &s);
++            gl.ImportSemaphoreWin32HandleEXT(s, kOpaqueWin32, handle);
++            CloseHandle(handle);
++            return s;
++        }
++
++        bool init(void *sdlWindow)
++        {
++            uint8_t luid[8], devUuid[16], drvUuid[16]; bool luidValid = false;
++            if (!share::deviceIds(luid, luidValid, devUuid, drvUuid)) return false;   // the device does not exist yet: GL swaps this frame
++            g_p.dev = share::device();
++            if (!g_p.dev) return false;
++            g_p.vk = g_p.dev->get_device(); g_p.gpu = g_p.dev->get_physical_device(); g_p.inst = g_p.dev->get_instance();
++            g_p.family = g_p.dev->get_queue_info().family_indices[Vulkan::QUEUE_INDEX_GRAPHICS];
++            g_p.queue = g_p.dev->get_queue_info().queues[Vulkan::QUEUE_INDEX_GRAPHICS];
++            if (!T().vkCreateSwapchainKHR || !T().vkGetSemaphoreWin32HandleKHR) return fail("the device has no VK_KHR_swapchain / external semaphores");
++            auto ip = [](const char *n) { return vkGetInstanceProcAddr(g_p.inst, n); };
++            g_p.createSurface = reinterpret_cast<PFN_vkCreateWin32SurfaceKHR>(ip("vkCreateWin32SurfaceKHR"));
++            g_p.destroySurface = reinterpret_cast<PFN_vkDestroySurfaceKHR>(ip("vkDestroySurfaceKHR"));
++            g_p.surfaceSupport = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceSupportKHR>(ip("vkGetPhysicalDeviceSurfaceSupportKHR"));
++            g_p.surfaceCaps = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(ip("vkGetPhysicalDeviceSurfaceCapabilitiesKHR"));
++            g_p.surfaceFormats = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceFormatsKHR>(ip("vkGetPhysicalDeviceSurfaceFormatsKHR"));
++            g_p.surfaceModes = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfacePresentModesKHR>(ip("vkGetPhysicalDeviceSurfacePresentModesKHR"));
++            if (!g_p.createSurface || !g_p.surfaceSupport || !g_p.surfaceCaps || !g_p.surfaceFormats || !g_p.surfaceModes) return fail("the instance has no VK_KHR_win32_surface");
++
++            int missing = 0;
++            auto load = [&](auto &fn, const char *name)
++            {
++                void *p = SDL_GL_GetProcAddress(name);
++                fn = reinterpret_cast<std::remove_reference_t<decltype(fn)>>(p); if (!p) ++missing;
++            };
++            load(gl.GenTextures, "glGenTextures"); load(gl.DeleteTextures, "glDeleteTextures"); load(gl.BindTexture, "glBindTexture");
++            load(gl.GetIntegerv, "glGetIntegerv"); load(gl.GetError, "glGetError"); load(gl.GetStringi, "glGetStringi");
++            load(gl.IsEnabled, "glIsEnabled"); load(gl.Enable, "glEnable"); load(gl.Disable, "glDisable"); load(gl.Flush, "glFlush");
++            load(gl.GenFramebuffers, "glGenFramebuffers"); load(gl.DeleteFramebuffers, "glDeleteFramebuffers"); load(gl.BindFramebuffer, "glBindFramebuffer");
++            load(gl.FramebufferTexture2D, "glFramebufferTexture2D"); load(gl.CheckFramebufferStatus, "glCheckFramebufferStatus"); load(gl.BlitFramebuffer, "glBlitFramebuffer");
++            load(gl.GetUnsignedBytevEXT, "glGetUnsignedBytevEXT");
++            load(gl.CreateMemoryObjectsEXT, "glCreateMemoryObjectsEXT"); load(gl.DeleteMemoryObjectsEXT, "glDeleteMemoryObjectsEXT");
++            load(gl.MemoryObjectParameterivEXT, "glMemoryObjectParameterivEXT"); load(gl.TexStorageMem2DEXT, "glTexStorageMem2DEXT");
++            load(gl.ImportMemoryWin32HandleEXT, "glImportMemoryWin32HandleEXT");
++            load(gl.GenSemaphoresEXT, "glGenSemaphoresEXT"); load(gl.DeleteSemaphoresEXT, "glDeleteSemaphoresEXT"); load(gl.ImportSemaphoreWin32HandleEXT, "glImportSemaphoreWin32HandleEXT");
++            load(gl.SignalSemaphoreEXT, "glSignalSemaphoreEXT"); load(gl.WaitSemaphoreEXT, "glWaitSemaphoreEXT");
++            if (missing) return fail("GL entry points missing");
++            if (!hasGlExtension("GL_EXT_memory_object_win32") || !hasGlExtension("GL_EXT_semaphore_win32")) return fail("no GL_EXT_memory_object_win32 / GL_EXT_semaphore_win32");
++            if (luidValid) { GLubyte g8[8] = {}; gl.GetUnsignedBytevEXT(kDeviceLuid, g8); if (std::memcmp(g8, luid, 8)) return fail("the GL context is on another GPU"); }
++
++            SDL_SysWMinfo info{}; SDL_VERSION(&info.version);
++            if (!SDL_GetWindowWMInfo(static_cast<SDL_Window *>(sdlWindow), &info) || info.subsystem != SDL_SYSWM_WINDOWS) return fail("no native window");
++            g_p.parent = info.info.win.window;
++            RECT rc{}; GetClientRect(g_p.parent, &rc);
++            g_p.child = createChild(g_p.parent, std::max<int>(1, rc.right), std::max<int>(1, rc.bottom));
++            if (!g_p.child) return fail("could not create the child window");
++            VkWin32SurfaceCreateInfoKHR sci = { VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR }; sci.hinstance = GetModuleHandleW(nullptr); sci.hwnd = g_p.child;
++            if (g_p.createSurface(g_p.inst, &sci, nullptr, &g_p.surface) != VK_SUCCESS) { DestroyWindow(g_p.child); g_p.child = nullptr; return fail("vkCreateWin32SurfaceKHR failed"); }
++            VkBool32 sup = VK_FALSE; g_p.surfaceSupport(g_p.gpu, g_p.family, g_p.surface, &sup);
++            if (!sup) return fail("the graphics queue cannot present to the window");
++
++            uint32_t nm = 0; g_p.surfaceModes(g_p.gpu, g_p.surface, &nm, nullptr);
++            std::vector<VkPresentModeKHR> modes(nm); if (nm) g_p.surfaceModes(g_p.gpu, g_p.surface, &nm, modes.data());
++            const char *mv = std::getenv("PS2X_SEAMVK_VKPRESENT_MODE");
++            VkPresentModeKHR want = VK_PRESENT_MODE_FIFO_KHR;
++            if (mv && !std::strcmp(mv, "mailbox")) want = VK_PRESENT_MODE_MAILBOX_KHR;
++            else if (mv && !std::strcmp(mv, "immediate")) want = VK_PRESENT_MODE_IMMEDIATE_KHR;
++            g_p.mode = VK_PRESENT_MODE_FIFO_KHR; for (VkPresentModeKHR m : modes) if (m == want) g_p.mode = want;
++            uint32_t nf = 0; g_p.surfaceFormats(g_p.gpu, g_p.surface, &nf, nullptr);
++            std::vector<VkSurfaceFormatKHR> fmts(nf); if (nf) g_p.surfaceFormats(g_p.gpu, g_p.surface, &nf, fmts.data());
++            g_p.format = VK_FORMAT_UNDEFINED;
++            for (const VkSurfaceFormatKHR &f : fmts)   // the GL picture is already gamma-encoded: a UNORM swapchain, never an sRGB one
++                if ((f.format == VK_FORMAT_B8G8R8A8_UNORM || f.format == VK_FORMAT_R8G8B8A8_UNORM) && f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) { g_p.format = f.format; break; }
++            if (g_p.format == VK_FORMAT_UNDEFINED) return fail("no 8-bit UNORM swapchain format");
++
++            VkCommandPoolCreateInfo pci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO }; pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; pci.queueFamilyIndex = g_p.family;
++            if (T().vkCreateCommandPool(g_p.vk, &pci, nullptr, &g_p.pool) != VK_SUCCESS) return fail("command pool");
++            VkCommandBufferAllocateInfo ai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO }; ai.commandPool = g_p.pool; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = kInFlight;
++            T().vkAllocateCommandBuffers(g_p.vk, &ai, g_p.cb);
++            for (uint32_t i = 0; i < kInFlight; ++i)
++            {
++                VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO }; fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
++                T().vkCreateFence(g_p.vk, &fci, nullptr, &g_p.fence[i]);
++                VkSemaphoreCreateInfo sc = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO }; T().vkCreateSemaphore(g_p.vk, &sc, nullptr, &g_p.acquired[i]);
++            }
++            HANDLE h1 = nullptr, h2 = nullptr;
++            g_p.glDone = exportableSemaphore(h1); g_p.vkDone = exportableSemaphore(h2);
++            if (!g_p.glDone || !g_p.vkDone) return fail("exportable semaphores");
++            g_p.glDoneGl = importSemaphore(h1); g_p.vkDoneGl = importSemaphore(h2);
++            gl.GenFramebuffers(1, &g_p.glFbo);
++            while (gl.GetError() != 0) {}
++            static const char *const kMode[] = { "immediate", "mailbox", "fifo (vsync)", "fifo relaxed" };
++            std::fprintf(stderr, "[vkpresent] on: the window is presented through a Vulkan swapchain, %s\n", g_p.mode <= 3 ? kMode[g_p.mode] : "?");
++            g_p.state = 1;
++            return true;
++        }
++
++        void waitIdle()
++        {
++            T().vkWaitForFences(g_p.vk, kInFlight, g_p.fence, VK_TRUE, UINT64_MAX);
++        }
++        // (re)creates the swapchain and the shared image at the window's client size
++        bool resize(uint32_t w, uint32_t h)
++        {
++            waitIdle();
++            MoveWindow(g_p.child, 0, 0, int(w), int(h), FALSE);
++            VkSurfaceCapabilitiesKHR caps{}; g_p.surfaceCaps(g_p.gpu, g_p.surface, &caps);
++            if (caps.currentExtent.width != 0xFFFFFFFFu) { w = caps.currentExtent.width; h = caps.currentExtent.height; }
++            if (!w || !h) return false;   // minimised
++            VkSwapchainCreateInfoKHR ci = { VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR };
++            ci.surface = g_p.surface; ci.minImageCount = std::max(caps.minImageCount, 3u);
++            if (caps.maxImageCount) ci.minImageCount = std::min(ci.minImageCount, caps.maxImageCount);
++            ci.imageFormat = g_p.format; ci.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR; ci.imageExtent = { w, h }; ci.imageArrayLayers = 1;
++            ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT; ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
++            ci.preTransform = caps.currentTransform; ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR; ci.presentMode = g_p.mode; ci.clipped = VK_TRUE;
++            ci.oldSwapchain = g_p.swapchain;
++            VkSwapchainKHR sc = VK_NULL_HANDLE;
++            if (T().vkCreateSwapchainKHR(g_p.vk, &ci, nullptr, &sc) != VK_SUCCESS) return false;
++            if (g_p.swapchain) T().vkDestroySwapchainKHR(g_p.vk, g_p.swapchain, nullptr);
++            g_p.swapchain = sc;
++            uint32_t n = 0; T().vkGetSwapchainImagesKHR(g_p.vk, sc, &n, nullptr);
++            g_p.images.resize(n); T().vkGetSwapchainImagesKHR(g_p.vk, sc, &n, g_p.images.data());
++            for (VkSemaphore s : g_p.renderDone) T().vkDestroySemaphore(g_p.vk, s, nullptr);
++            g_p.renderDone.assign(n, VK_NULL_HANDLE);
++            for (VkSemaphore &s : g_p.renderDone) { VkSemaphoreCreateInfo sci = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO }; T().vkCreateSemaphore(g_p.vk, &sci, nullptr, &s); }
++
++            // the shared image, imported by GL as the colour attachment of its copy target. A signal Vulkan left on vkDone
++            // is consumed first (a binary semaphore must not be signalled twice).
++            if (g_p.vkDonePending) { gl.WaitSemaphoreEXT(g_p.vkDoneGl, 0, nullptr, 0, nullptr, nullptr); g_p.vkDonePending = false; }
++            if (g_p.glTex) { gl.DeleteTextures(1, &g_p.glTex); g_p.glTex = 0; }
++            if (g_p.glMem) { gl.DeleteMemoryObjectsEXT(1, &g_p.glMem); g_p.glMem = 0; }
++            auto ici = Vulkan::ImageCreateInfo::render_target(w, h, VK_FORMAT_R8G8B8A8_UNORM);
++            ici.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
++            ici.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
++            ici.misc = Vulkan::IMAGE_MISC_EXTERNAL_MEMORY_BIT;
++            g_p.shared = g_p.dev->create_image(ici);
++            if (!g_p.shared) return false;
++            const Vulkan::ExternalHandle eh = g_p.shared->export_handle();
++            if (eh.handle == Vulkan::ExternalHandle().handle) return false;
++            gl.CreateMemoryObjectsEXT(1, &g_p.glMem);
++            const GLint one = 1; gl.MemoryObjectParameterivEXT(g_p.glMem, kDedicatedMemory, &one);
++            gl.ImportMemoryWin32HandleEXT(g_p.glMem, g_p.shared->get_allocation().get_size(), kOpaqueWin32, eh.handle);
++            GLint prevTex = 0; gl.GetIntegerv(kTexBinding2D, &prevTex);
++            gl.GenTextures(1, &g_p.glTex); gl.BindTexture(kTex2D, g_p.glTex);
++            gl.TexStorageMem2DEXT(kTex2D, 1, kRGBA8, GLsizei(w), GLsizei(h), g_p.glMem, 0);
++            gl.BindTexture(kTex2D, GLuint(prevTex));
++            CloseHandle(eh.handle);   // consumed at TexStorage time (as glshare)
++            GLint prevDraw = 0; gl.GetIntegerv(kDrawFbBinding, &prevDraw);
++            gl.BindFramebuffer(kDrawFb, g_p.glFbo);
++            gl.FramebufferTexture2D(kDrawFb, kColorAttachment0, kTex2D, g_p.glTex, 0);
++            const GLenum st = gl.CheckFramebufferStatus(kDrawFb);
++            gl.BindFramebuffer(kDrawFb, GLuint(prevDraw));
++            if (st != kFbComplete || gl.GetError() != 0) { std::fprintf(stderr, "[vkpresent] the shared %ux%u image is not a complete GL framebuffer (0x%x)\n", w, h, st); return false; }
++            g_p.vkDonePending = false;   // a fresh image: nothing of Vulkan's to wait for
++            g_p.w = w; g_p.h = h;
++            std::fprintf(stderr, "[vkpresent] swapchain %ux%u, %u images\n", w, h, n);
++            return true;
++        }
++
++        void barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout to, uint32_t srcFam, uint32_t dstFam,
++                     VkPipelineStageFlags srcStage, VkAccessFlags srcAccess, VkPipelineStageFlags dstStage, VkAccessFlags dstAccess)
++        {
++            VkImageMemoryBarrier b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
++            b.oldLayout = from; b.newLayout = to; b.srcQueueFamilyIndex = srcFam; b.dstQueueFamilyIndex = dstFam;
++            b.srcAccessMask = srcAccess; b.dstAccessMask = dstAccess; b.image = img; b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
++            T().vkCmdPipelineBarrier(cb, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &b);
++        }
++
++        bool present(void *sdlWindow)
++        {
++            if (g_p.state == 0 && !init(sdlWindow)) return false;
++            if (g_p.state != 1) return false;
++            RECT rc{}; GetClientRect(g_p.parent, &rc);
++            const uint32_t cw = uint32_t(std::max<LONG>(0, rc.right)), ch = uint32_t(std::max<LONG>(0, rc.bottom));
++            int dw = 0, dh = 0; SDL_GL_GetDrawableSize(static_cast<SDL_Window *>(sdlWindow), &dw, &dh);
++            if (!cw || !ch || dw <= 0 || dh <= 0) return false;   // minimised: GL's swap (cheap, nothing shown)
++            if ((cw != g_p.w || ch != g_p.h || !g_p.swapchain) && !resize(cw, ch)) return false;
++
++            const uint32_t fi = g_p.frame % kInFlight;
++            T().vkWaitForFences(g_p.vk, 1, &g_p.fence[fi], VK_TRUE, UINT64_MAX);
++            uint32_t idx = 0;
++            VkResult ar = T().vkAcquireNextImageKHR(g_p.vk, g_p.swapchain, UINT64_MAX, g_p.acquired[fi], VK_NULL_HANDLE, &idx);
++            if (ar == VK_ERROR_OUT_OF_DATE_KHR)
++            {
++                if (!resize(cw, ch)) return false;
++                ar = T().vkAcquireNextImageKHR(g_p.vk, g_p.swapchain, UINT64_MAX, g_p.acquired[fi], VK_NULL_HANDLE, &idx);
++            }
++            if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) return false;   // (nothing signalled between the APIs yet: GL swaps)
++
++            // GL: the back buffer into the shared image, flipped (GL rows count upwards, the swapchain's downwards)
++            if (g_p.vkDonePending) { const GLenum lay = kLayoutTransferSrc; gl.WaitSemaphoreEXT(g_p.vkDoneGl, 0, nullptr, 1, &g_p.glTex, &lay); }
++            GLint prevRead = 0, prevDraw = 0; gl.GetIntegerv(kReadFbBinding, &prevRead); gl.GetIntegerv(kDrawFbBinding, &prevDraw);
++            const bool scissor = gl.IsEnabled(kScissorTest) != 0;
++            if (scissor) gl.Disable(kScissorTest);
++            gl.BindFramebuffer(kReadFb, 0); gl.BindFramebuffer(kDrawFb, g_p.glFbo);
++            const GLint sw = std::min<GLint>(dw, GLint(g_p.w)), sh = std::min<GLint>(dh, GLint(g_p.h));
++            gl.BlitFramebuffer(0, dh - sh, sw, dh, 0, GLint(sh), sw, 0, kColorBufferBit, kNearest);
++            gl.BindFramebuffer(kReadFb, GLuint(prevRead)); gl.BindFramebuffer(kDrawFb, GLuint(prevDraw));
++            if (scissor) gl.Enable(kScissorTest);
++            { const GLenum lay = kLayoutTransferSrc; gl.SignalSemaphoreEXT(g_p.glDoneGl, 0, nullptr, 1, &g_p.glTex, &lay); }
++            gl.Flush();
++
++            // Vulkan: the shared image into the swapchain image
++            VkCommandBuffer cb = g_p.cb[fi];
++            T().vkResetCommandBuffer(cb, 0);
++            VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO }; bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++            T().vkBeginCommandBuffer(cb, &bi);
++            const VkImage src = g_p.shared->get_image(), dst = g_p.images[idx];
++            barrier(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_QUEUE_FAMILY_EXTERNAL, g_p.family,
++                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);   // acquire from GL
++            barrier(cb, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
++                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
++            VkImageBlit bl = {};
++            bl.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }; bl.dstSubresource = bl.srcSubresource;
++            bl.srcOffsets[1] = { int32_t(g_p.w), int32_t(g_p.h), 1 }; bl.dstOffsets[1] = bl.srcOffsets[1];
++            T().vkCmdBlitImage(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_NEAREST);   // (the formats may differ in channel order)
++            barrier(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
++                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0);
++            barrier(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_p.family, VK_QUEUE_FAMILY_EXTERNAL,
++                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0);   // release to GL
++            T().vkEndCommandBuffer(cb);
++
++            const VkSemaphore waits[2] = { g_p.acquired[fi], g_p.glDone };
++            const VkPipelineStageFlags stages[2] = { VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT };
++            const VkSemaphore signals[2] = { g_p.renderDone[idx], g_p.vkDone };
++            VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
++            si.waitSemaphoreCount = 2; si.pWaitSemaphores = waits; si.pWaitDstStageMask = stages;
++            si.commandBufferCount = 1; si.pCommandBuffers = &cb; si.signalSemaphoreCount = 2; si.pSignalSemaphores = signals;
++            T().vkResetFences(g_p.vk, 1, &g_p.fence[fi]);
++            VkPresentInfoKHR pi = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
++            pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = &g_p.renderDone[idx]; pi.swapchainCount = 1; pi.pSwapchains = &g_p.swapchain; pi.pImageIndices = &idx;
++            g_p.dev->external_queue_lock();   // the render thread submits on the same queue through Granite
++            const VkResult sr = T().vkQueueSubmit(g_p.queue, 1, &si, g_p.fence[fi]);
++            const VkResult pr = sr == VK_SUCCESS ? T().vkQueuePresentKHR(g_p.queue, &pi) : sr;
++            g_p.dev->external_queue_unlock();
++            if (sr != VK_SUCCESS) return fail("vkQueueSubmit failed");
++            g_p.vkDonePending = true;
++            ++g_p.frame;
++            if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) g_p.w = 0;   // recreated at the next swap
++            return true;
++        }
++
++        bool swapHook(void *window)
++        {
++            if (!vkpresent::wanted() || !on()) return false;
++            return present(window);
++        }
++        struct Install { Install() { bt3SwapHook = swapHook; } } g_install;
++    }
++}
++#elif defined(PS2X_HAVE_SEAMVK)
++namespace seamvk { namespace vkpresent { bool wanted() { return false; } } }
++#endif
+diff --git a/ps2xRuntime/include/runtime/ps2_seamvk.h b/ps2xRuntime/include/runtime/ps2_seamvk.h
+index edb907e..145369e 100644
+--- a/ps2xRuntime/include/runtime/ps2_seamvk.h
++++ b/ps2xRuntime/include/runtime/ps2_seamvk.h
+@@ -80,6 +80,10 @@ namespace seamvk
+         bool take(Frame &out);   // the newest frame ready for GL
+         void release(int slot);  // GL no longer reads that slot
+     }
++    // [vkpresent] The window presented through a Vulkan swapchain (ps2_seamvk_present.cpp): GL draws as before, the back
++    // buffer goes to Vulkan at the swap. PS2X_SEAMVK_VKPRESENT=1; the device then also enables the surface / swapchain
++    // extensions. PS2X_SEAMVK_VKPRESENT_MODE=fifo (vsync, default) | mailbox | immediate.
++    namespace vkpresent { bool wanted(); }
+ #else
+     // [standalone] built without Granite (no Vulkan renderer at all): the runtime's hooks fall through
+     inline bool on() { return false; }
+@@ -141,5 +145,6 @@ namespace seamvk
+     // GS thread, under the paraLLEl-GS state lock, at the frame swap (PS2X_SEAMVK_REF=1: the reference backend runs
+     // beside the native renderer on the backend's device).
+     void renderFrame(Vulkan::Device &device, const PrivRegs &priv);
++    namespace share { Vulkan::Device *device(); }   // [vkpresent] the renderer's own device, null until it exists
+ }
+ #endif
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 72c9dd8..ff4cda2 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-﻿cmake_minimum_required(VERSION 3.20)
++cmake_minimum_required(VERSION 3.20)
+ 
+ project(PS2Runtime VERSION 0.1.0 LANGUAGES CXX)
+ 
+@@ -1174,7 +1174,7 @@ if (_seamvk)
+         add_subdirectory("${PS2X_GRANITE_DIR}" "${CMAKE_BINARY_DIR}/Granite" EXCLUDE_FROM_ALL)
+         message(STATUS "[seamvk] Granite from ${PS2X_GRANITE_DIR} (no paraLLEl-GS backend)")
+     endif()
+-    target_sources(ps2_runtime PRIVATE src/lib/ps2_seamvk.cpp src/lib/ps2_seamvk_gl.cpp src/lib/ps2_seamgs.cpp src/lib/ps2_wshud.cpp src/lib/ps2_bcdecode.cpp)   # [seamvk] native Vulkan renderer at the engine seam ([glshare] _gl: its zero-copy present)
++    target_sources(ps2_runtime PRIVATE src/lib/ps2_seamvk.cpp src/lib/ps2_seamvk_gl.cpp src/lib/ps2_seamvk_present.cpp src/lib/ps2_seamgs.cpp src/lib/ps2_wshud.cpp src/lib/ps2_bcdecode.cpp)   # [seamvk] native Vulkan renderer at the engine seam ([glshare] _gl: its zero-copy present; [vkpresent] _present: the window through a Vulkan swapchain)
+     target_link_libraries(ps2_runtime PUBLIC granite-vulkan granite-math)
+     target_compile_definitions(ps2_runtime PUBLIC PS2X_HAVE_SEAMVK=1)
+     target_compile_definitions(ps2x_settings PRIVATE PS2X_HAVE_SEAMVK=1)   # [fesettings] same: without it the front end showed (and would save) OpenGL for a saved "native"
+diff --git a/ps2xRuntime/third_party/bt3gl/src/platforms/rcore_desktop_sdl.c b/ps2xRuntime/third_party/bt3gl/src/platforms/rcore_desktop_sdl.c
+index 280e162..6a9ea55 100644
+--- a/ps2xRuntime/third_party/bt3gl/src/platforms/rcore_desktop_sdl.c
++++ b/ps2xRuntime/third_party/bt3gl/src/platforms/rcore_desktop_sdl.c
+@@ -1209,9 +1209,13 @@ void DisableCursor(void)
+     CORE.Input.Mouse.cursorHidden = true;
+ }
+ 
++// [vkpresent] the runtime's presenter: true = it showed the back buffer itself (a Vulkan swapchain), so GL does not swap
++bool (*bt3SwapHook)(void *window) = NULL;
++
+ // Swap back buffer with front buffer (screen drawing)
+ void SwapScreenBuffer(void)
+ {
++    if (bt3SwapHook && bt3SwapHook((void *)platform.window)) return;
+     SDL_GL_SwapWindow(platform.window);
+ }
+ 

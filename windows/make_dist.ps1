@@ -3,19 +3,23 @@
 #   runtime\   ps2EntryRunner.exe (el juego recompilado) + DLLs (FFmpeg, VC++), assets\ y savedata\settings.toml de BT3-Recomp
 #   runtime\data\   lo llena el launcher (ELF del disco); runtime\savedata\ = memory card
 #   gshost\    pcsx2-gsrunner (GS de PCSX2 con DLSS/FSR) + resources + presets dbz*.ini
-param([switch]$NoZip, [string]$Server = "https://nbas3.xellrecomp.party")
+# -Runtime: the runner build to pack (the native renderer + PGO build: bt3mod\build-pgo\ps2xRuntime, see build_pgo.cmd)
+param([switch]$NoZip, [string]$Server = "https://nbas3.xellrecomp.party", [string]$Runtime = "C:\DBZBT4Recomp\bt3mod\build\ps2xRuntime", [string]$Go = "C:\DBZBT4Recomp\tools\go\bin\go.exe")
 $ErrorActionPreference = 'Stop'
 $R = "C:\DBZBT4Recomp"
 $dist = "$R\dist\DBZ_BT4_Windows"
 if (Test-Path $dist) { Remove-Item -Recurse -Force $dist }
 New-Item -ItemType Directory -Force "$dist\runtime\data", "$dist\runtime\savedata", "$dist\gshost" | Out-Null
 
-$rt = "$R\bt3mod\build\ps2xRuntime"
+$rt = $Runtime
 Copy-Item "$rt\ps2EntryRunner.exe", "$rt\fps60_sites.txt" "$dist\runtime"
 # FFmpeg for the FMVs: the runner imports avcodec/avformat/avutil/swscale (+ swresample); avdevice/avfilter are unused
-Get-ChildItem "$rt\*.dll" | Where-Object { $_.Name -notmatch '^(avdevice|avfilter)-' } | Copy-Item -Destination "$dist\runtime"
+Get-ChildItem "$rt\*.dll" | Where-Object { $_.Name -notmatch '^(avdevice|avfilter)-|^nvngx' } | Copy-Item -Destination "$dist\runtime"   # (DLSS: the launcher puts it there from gshost\presets or DLSS\)
 Copy-Item -Recurse "$rt\assets" "$dist\runtime\assets"
-Copy-Item "$rt\savedata\settings.toml" "$dist\runtime\savedata"
+# the default settings (the release build's first-run file), with the HUD pinned to the window's edges as the PCSX2 host
+# draws it ([parity]: an explicit layout = 0 in the shipped file overrode that default)
+$st = if (Test-Path "$rt\savedata\settings.toml") { "$rt\savedata\settings.toml" } else { "$R\bt3mod\build\ps2xRuntime\savedata\settings.toml" }
+[IO.File]::WriteAllText("$dist\runtime\savedata\settings.toml", ((Get-Content $st) -replace '^layout = 0', 'layout = 1') -join "`n", (New-Object Text.UTF8Encoding($false)))   # (no BOM)
 $crt = Get-ChildItem "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Redist\MSVC\*\x64\Microsoft.VC143.CRT" | Select-Object -Last 1
 foreach ($d in 'msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll') {
     Copy-Item "$($crt.FullName)\$d" "$dist\runtime"; Copy-Item "$($crt.FullName)\$d" "$dist\gshost"
@@ -60,7 +64,7 @@ Get-Content "$R\gshost_hooktest\ReShade.ini" | Where-Object { $_ -notmatch '^Int
 # launcher: the Recomp launcher (Go + Wails, C:\RecompOnline\launcher), online server built in
 Push-Location "C:\RecompOnline\launcher"
 $env:GOTOOLCHAIN = 'local'
-& "$R\tools\go\bin\go.exe" build -tags desktop,production -trimpath `
+& $Go build -tags desktop,production -trimpath `
     -ldflags "-H windowsgui -s -w -X main.defaultServer=$Server" -o "$dist\DBZ_BT4.exe" .
 $ok = $?
 Pop-Location

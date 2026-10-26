@@ -9,7 +9,8 @@
 | ![Fight start](docs/screenshots/fight_start.jpg) | ![Ki blast](docs/screenshots/ki_blast.jpg) |
 | ![Special](docs/screenshots/special.jpg) | ![Combo](docs/screenshots/combo.jpg) |
 
-*Native Windows build, PCSX2's GS on Vulkan at 6x, 1920x1080 window (RTX 4090).*
+*Screenshots from an earlier Windows build (PCSX2's GS renderer at 6x, RTX 4090). Both systems now draw the game with
+its own native renderer (see Features).*
 
 https://github.com/user-attachments/assets/f0d626ea-ad75-40a9-a4c0-8109d5d1ce4c
 
@@ -20,8 +21,11 @@ Zamas, Jiren, Hit, Caulifla, Kale...) and stages (Tournament of Power, Champa's 
 ## Features
 
 - **Native on Windows and Mac (Apple Silicon)**: ready-to-play zips with a launcher. No emulator to set up.
-- **Sharp graphics**: PCSX2's GS renderer up to 6x internal resolution, NVIDIA DLSS or AMD FSR on Windows (and an
-  experimental DLSS 5 neural pass), Apple MetalFX on Mac.
+- **Sharp graphics**: the game's own native renderer (Vulkan), with the game's real depth and motion fed
+  to the upscaler: NVIDIA DLSS or AMD FSR 2 on Windows, Apple MetalFX on Mac at the screen's full (Retina) resolution.
+  On Mac the shaders are prepared while the game starts, so effects don't stutter the first time they appear.
+- **More frames on screen (Windows)**: **Más fps en pantalla** generates an in-between frame from the game's real
+  motion, up to 120 on screen on monitors of 90 Hz or more, without speeding the game up.
 - **60 fps fights**, switchable at any time, even mid-fight.
 - **Online play**: accounts, friends, invitations, rooms of 2 to 4 players taking turns, with chat. Windows and Mac play
   together. No ports to open. Both games run the same frames (lockstep) and check each other as they go.
@@ -43,8 +47,8 @@ Zamas, Jiren, Hit, Caulifla, Kale...) and stages (Tournament of Power, Champa's 
 2. **Open the launcher** (`DBZ_BT4.exe` / `DBZ_BT4.app`), press **Seleccionar ISO** and pick your own image of the mod
    (`SLUS-219.78`, Beta 14 Rev2). Only the first time. Other versions of the mod don't work: the game was recompiled
    for this one.
-3. **Press JUGAR.** It starts with 60 fps fights, fullscreen and a quality picked for your GPU. Change any of them in
-   the launcher; it remembers them.
+3. **Press JUGAR.** It starts with 60 fps fights and fullscreen. Change them in the launcher; it remembers them. The
+   launcher updates itself and the game when a new version comes out.
 
 | | |
 | --- | --- |
@@ -85,7 +89,7 @@ apart, raise **Retraso de controles** in AJUSTES.
   - Z / X / C / V = Square / Cross / Circle / Triangle;
   - Q / E = L1 / R1, 1 / 3 = L2 / R2;
   - Enter = START, Backspace = SELECT.
-- **F1** or **hold START 1.5 s**: options (internal resolution, DLSS / FSR / MetalFX, 60 fps, FPS counter...).
+- **F1** or **hold START 1.5 s**: options (60 fps fights, FPS counter...).
 - **Fullscreen**: Alt+Enter (Windows) or Option+Return / Ctrl+Cmd+F (Mac).
 - The mod's unlock code also works on the main menu: hold L1+R1 and press Down, Right, Triangle, Down, Left, Triangle, Up.
 
@@ -98,7 +102,7 @@ patches on top of [z3xox/BT3-Recomp](https://github.com/z3xox/BT3-Recomp) and th
 
 ## Credits
 
-- [Team BT4](https://teambt4.wixsite.com/teambt4projects) for the mod and its PCSX2 settings and extras.
+- [Team BT4](https://teambt4.wixsite.com/teambt4projects) for the mod and its extras.
 - [z3xox/BT3-Recomp](https://github.com/z3xox/BT3-Recomp), [PS2Recomp](https://github.com/ran-j/PS2Recomp),
   [PCSX2](https://github.com/PCSX2/pcsx2), [Play!](https://github.com/jpd002/Play-).
 

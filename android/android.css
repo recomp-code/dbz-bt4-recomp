@@ -1,33 +1,43 @@
 /* [android] The launcher on a phone in landscape (~915 x 412 dp, 1 CSS px = 1 dp), touch first. Loaded after style.css
-   by the Android app only (make_apk.sh); android_bridge.js puts the "android" class on <html> and moves a few elements
-   (the game's name into the play panel, the sign-in's intro into a card). Everything here is under html.android, so
-   the desktop launcher (Windows, macOS) never sees it.
+   by the Android app only (make_apk.sh); android_bridge.js puts the "android" class on <html> and rearranges a few of
+   the page's own elements (the Biblioteca sheet, the sign-in card). Everything here is under html.android, so the
+   desktop launcher (Windows, macOS) never sees it.
 
-   The layout: a navigation rail on the left (a landscape phone has width to spare and no height), the page to its
-   right. Biblioteca puts the art and the play panel side by side so JUGAR is on the first screen at any phone height;
-   En línea fits its two lists to the screen; Ajustes is a single column of cards. Targets are 44 dp or more. */
+   The look: dark charcoal, flat solid colours, one green accent, big uppercase titles in Russo One (titles and tabs
+   only), rounded shapes, no pictograms. A bar of big text tabs on top; Biblioteca is the game's art on the left and a
+   sheet on the right (edition, name, ISO, chips, the options) with JUGAR in its foot, always on screen. Targets are
+   44 dp or more; the layout holds with Android's larger font sizes (text zoom up to ~1.15). */
 
 html.android {
-  --rail: 84px;
+  --bar: 56px;
   --gut: 16px;
-  --card: #1c2a3a;
-  --card-2: #213246;
-  --line: rgba(255, 255, 255, .06);
-  --field: #111a25;
-  --field-line: #2b3b4f;
-  --r-lg: 14px;
-  --r-md: 10px;
-  /* flat: solid colours, one accent for actions, green only for JUGAR */
-  --accent: #1f7ae0;
-  --accent-hi: #2b88f0;
-  --tonal: rgba(64, 150, 255, .14);
-  --tonal-hi: rgba(64, 150, 255, .24);
-  --tonal-ink: #9ccbff;
-  --go: #7ac143;
-  --go-hi: #88cd52;
-  --go-ink: #0f1d07;
-  --neutral: #2a3747;
-  --neutral-hi: #34445a;
+  --sheet: clamp(360px, 44vw, 520px);
+  --r-sheet: 28px;
+  /* palette (the desktop's variables too, so its rules follow) */
+  --base: #121214;
+  --deep: #0e0e10;
+  --panel: #17171a;
+  --row: #1c1c20;
+  --hover: #26262b;
+  --ink: #e4e4e8;
+  --dim: #9a9aa0;
+  --faint: #6b6b73;
+  --blue: #8fc1ff;
+  --bg: #121214;
+  --sheet-bg: #151517;
+  --card: #1c1c20;
+  --chip: #26262b;
+  --chip-hi: #303036;
+  --line: rgba(255, 255, 255, .07);
+  --field: #0e0e11;
+  --field-line: #2c2c32;
+  --accent-text: #6fcf73;
+  --go: #4fa35b;
+  --go-hi: #5bb168;
+  --neutral: #26262b;
+  --neutral-hi: #303036;
+  --r-lg: 16px;
+  --r-md: 12px;
   --sl: env(safe-area-inset-left, 0px);
   --sr: env(safe-area-inset-right, 0px);
   --st: env(safe-area-inset-top, 0px);
@@ -37,177 +47,158 @@ html.android {
   -webkit-text-size-adjust: 100%;
   text-size-adjust: 100%;
 }
-html.android body { font-size: 15px; line-height: 1.4; background: var(--base); }
-html.android small { font-size: 13px; line-height: 1.45; }
+html.android, html.android body { background: var(--bg); }
+html.android body { font-size: 15px; line-height: 1.4; color: var(--ink); }
+html.android small { font-size: 13px; line-height: 1.45; color: #8a8a92; }
 html.android ::-webkit-scrollbar { width: 4px; height: 4px; }
-html.android ::-webkit-scrollbar-thumb { background: #3d4a5a; border-radius: 2px; }
+html.android ::-webkit-scrollbar-thumb { background: #3a3a41; border-radius: 2px; }
 
 /* what Android has no use for: window buttons, fullscreen and DLSS rows, the sidebar (one game; friends are in En
    línea), the desktop's on-top overlay (the game has its own menu), voice chat (not built for Android yet) */
 html.android .win, html.android .side, html.android #opt-full, html.android #dlss-card, html.android #btn-add-game,
-html.android #overlay-banner, html.android #voice-bar, html.android #voice-opts,
+html.android #overlay-banner, html.android #voice-bar, html.android #voice-opts, html.android .logo,
 html.android #v-settings .sect:has(+ #voice-opts) { display: none !important; }
 
-/* ---------------- the navigation rail ---------------- */
+/* ---------------- the top bar: big text tabs, the account on the right ---------------- */
 html.android .titlebar {
-  position: fixed; z-index: 30; top: 0; bottom: 0; left: 0; height: auto;
-  width: calc(var(--rail) + var(--sl));
-  flex-direction: column; align-items: stretch; gap: 6px;
-  padding: calc(12px + var(--st)) 0 calc(10px + var(--sb)) var(--sl);
-  background: #131a23;
-  border-right: 1px solid var(--line);
+  height: calc(var(--bar) + var(--st)); padding: var(--st) calc(var(--gut) + var(--sr)) 0 calc(var(--gut) + 4px + var(--sl));
+  align-items: stretch; background: var(--bg); border-bottom: 1px solid var(--line);
 }
-html.android .logo {
-  justify-content: center; padding: 2px 0 8px; font-size: 12.5px; letter-spacing: .1em;
-  color: #e6edf3;
-}
-html.android .tabs { flex-direction: column; align-items: stretch; gap: 4px; padding: 0 6px; }
+html.android .tabs { gap: 26px; }
 html.android .tab {
-  isolation: isolate; height: 62px; padding: 6px 0 0; display: flex; flex-direction: column; align-items: center;
-  justify-content: flex-start; gap: 5px; border-radius: 12px;
-  font-family: inherit; font-size: 12px; font-weight: 600; text-transform: none; letter-spacing: .01em; color: #9aa6b2;
+  padding: 0 2px; display: flex; align-items: center; white-space: nowrap;
+  font-family: "Russo One", system-ui, sans-serif; font-size: 18px; letter-spacing: .01em; text-transform: uppercase; color: #5c5c64;
 }
-html.android .tab::before {
-  content: ""; width: 24px; height: 24px; margin-top: 3px; flex: none; background: currentColor;
-  -webkit-mask: var(--icon) center / 22px 22px no-repeat; mask: var(--icon) center / 22px 22px no-repeat;
-}
-html.android .tab.active { color: #e9f4ff; }
-html.android .tab.active::before { color: var(--blue); }
-html.android .tab::after { content: none; }
-html.android .tab.active::after {
-  content: ""; position: absolute; z-index: -1; top: 3px; left: 50%; right: auto; bottom: auto;
-  width: 56px; height: 32px; margin-left: -28px; border-radius: 16px;
-  background: var(--tonal-hi);
-}
-html.android .tab:active::after { content: ""; position: absolute; z-index: -1; top: 3px; left: 50%; width: 56px; height: 32px;
-  margin-left: -28px; border-radius: 16px; background: rgba(255, 255, 255, .08); }
-html.android .tab[data-view="play"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 11h4M8 9v4M15 12h.01M18 10h.01'/%3E%3Cpath d='M17.3 5H6.7a4 4 0 0 0-4 3.6C2.6 9.4 2 14.5 2 16a3 3 0 0 0 3 3c1 0 1.5-.5 2-1l1.4-1.4a2 2 0 0 1 1.4-.6h4.4a2 2 0 0 1 1.4.6L17 18c.5.5 1 1 2 1a3 3 0 0 0 3-3c0-1.5-.6-6.6-.7-7.3a4 4 0 0 0-4-3.7z'/%3E%3C/svg%3E"); }
-html.android .tab[data-view="online"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2'/%3E%3Ccircle cx='9' cy='7' r='4'/%3E%3Cpath d='M22 21v-2a4 4 0 0 0-3-3.9M16 3.1a4 4 0 0 1 0 7.8'/%3E%3C/svg%3E"); }
-html.android .tab[data-view="settings"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M21 4h-7M10 4H3M21 12h-9M8 12H3M21 20h-5M12 20H3M14 2v4M8 10v4M16 18v4'/%3E%3C/svg%3E"); }
+html.android .tab:hover { color: #5c5c64; }
+html.android .tab.active, html.android .tab.active:hover { color: #fff; }
+html.android .tab::after, html.android .tab.active::after { content: none; }
+html.android .tab:active { color: #a0a0a8; }
 html.android .dotcount {
-  position: absolute; top: 0; left: calc(50% + 6px); min-width: 18px; height: 18px; margin: 0; padding: 0 5px;
-  border-radius: 9px; font: 700 11px/18px system-ui, sans-serif; text-align: center; box-shadow: 0 0 0 2px #131a23;
+  align-self: center; margin: -14px 0 0 4px; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px;
+  font: 700 11px/18px system-ui, sans-serif; text-align: center; background: #e5484d;
 }
-
-/* the account, at the bottom of the rail */
-html.android .tb-right { margin: auto 0 0; padding: 0 6px; flex-direction: column; }
-html.android .me { width: 100%; margin: 0; padding: 8px 2px 6px; flex-direction: column; gap: 5px; border-radius: 12px; }
-html.android .me:active { background: rgba(255, 255, 255, .06); }
-html.android .me .pic { width: 38px; height: 38px; font-size: 15px; border-radius: 12px; }
-html.android .me-text { align-items: center; max-width: 100%; }
-html.android .me-name { font-size: 12px; font-weight: 600; max-width: 76px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-html.android .me-status { font-size: 11px; max-width: 76px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+html.android .tb-right { margin-left: auto; padding-left: 12px; }
+html.android .me { gap: 10px; margin: 0; padding: 6px 10px 6px 6px; border-radius: 14px; max-width: 220px; }
+html.android .me:hover { background: none; }
+html.android .me:active { background: var(--chip); }
+html.android .me .pic { width: 36px; height: 36px; font-size: 15px; border-radius: 12px; }
+html.android .me-text { min-width: 0; }
+html.android .me-name { max-width: 150px; font-size: 14px; font-weight: 600; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+html.android .me-status { font-size: 12px; color: var(--dim); white-space: nowrap; }
+html.android .me-status.on { color: var(--accent-text); }
 
 /* ---------------- the page ---------------- */
-html.android .app { height: 100%; margin-left: calc(var(--rail) + var(--sl)); }
-html.android main {
-  overflow-x: hidden; overscroll-behavior: contain; scroll-behavior: smooth; -webkit-overflow-scrolling: touch;
-  padding-right: var(--sr);
+html.android .app { height: calc(100% - var(--bar) - var(--st)); }
+html.android main { overflow-x: hidden; overscroll-behavior: contain; overflow-anchor: none; background: var(--bg); }
+html.android #v-online, html.android #v-settings {
+  max-width: 1240px; margin: 0 auto;
+  padding: var(--gut) calc(var(--gut) + var(--sr)) calc(24px + var(--sb)) calc(var(--gut) + var(--sl));
 }
-html.android #v-play, html.android #v-online, html.android #v-settings {
-  max-width: 1240px; margin: 0 auto; padding: calc(var(--gut) + var(--st)) var(--gut) calc(28px + var(--sb));
-}
-html.android .pic { border-radius: 10px; }
+html.android .pic { border-radius: 12px; }
+html.android .view.enter { animation-name: android-fade; }
+@keyframes android-fade { from { opacity: 0; } }
 
-/* ---------------- Biblioteca: the art and the play panel side by side ---------------- */
-html.android #v-play { display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(236px, 1fr); gap: 0 14px; align-items: start; }
-html.android #v-play > :not(.banner):not(.playline) { grid-column: 1 / -1; }
-html.android .banner.dbz {
-  grid-column: 1; align-self: stretch; width: 100%; min-width: 0; height: auto; aspect-ratio: 16 / 9; min-height: 0;
-  border-radius: var(--r-lg); background-position: center 30%;
+/* ---------------- Biblioteca: the art, and the game's sheet beside it ---------------- */
+html.android #v-play {
+  display: grid; grid-template-columns: minmax(0, 1fr) var(--sheet); grid-template-rows: minmax(0, 1fr);
+  height: calc(100vh - var(--bar) - var(--st)); padding: 0; margin: 0; max-width: none;
 }
-html.android .banner.dbz::after { background: none; }
-html.android .banner-txt { display: none; }
+html.android #v-play > .banner.dbz {
+  grid-row: 1; grid-column: 1; margin-right: calc(-1 * var(--r-sheet)); height: auto; min-height: 0; border-radius: 0;
+  background: #0b0b0d url("img/dbz-bt4-header.jpg") 50% 30% / cover no-repeat;
+}
+html.android .banner.dbz::after {
+  background: linear-gradient(90deg, rgba(21, 21, 23, 0) 55%, rgba(21, 21, 23, .55) 100%),
+    linear-gradient(0deg, rgba(21, 21, 23, .45) 0%, rgba(21, 21, 23, 0) 30%);
+}
+html.android .banner-lines, html.android .banner-txt { display: none; }
 
-html.android .playline {
-  grid-column: 2; align-self: stretch; display: flex; flex-direction: column; align-items: stretch; gap: 10px;
-  padding: 16px; border-radius: var(--r-lg);
-  background: var(--card); box-shadow: inset 0 0 0 1px var(--line);
+html.android .a-sheet {
+  grid-row: 1; grid-column: 2; position: relative; z-index: 1; min-height: 0; display: flex; flex-direction: column; padding-top: 20px;
+  background: var(--sheet-bg); border-radius: var(--r-sheet) 0 0 0; box-shadow: -14px 0 36px rgba(0, 0, 0, .4);
 }
-html.android .pl-head { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+html.android .a-sheet::before {   /* the sheet's handle */
+  content: ""; position: absolute; z-index: 2; top: 9px; left: 50%; width: 38px; height: 4px; margin-left: -19px;
+  border-radius: 2px; background: #3a3a41;
+}
+html.android .a-sheet-body {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; overflow-anchor: none;
+  padding: 8px calc(22px + var(--sr)) 18px 24px;
+}
+html.android .pl-head { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; min-width: 0; }
+html.android .pl-head p {   /* the edition, in the accent */
+  margin: 0; font-size: 14px; font-weight: 600; color: var(--accent-text); text-shadow: none; animation: none;
+}
 html.android .pl-head h1, html.android .pl-head h1.logo-in-art {
-  position: static; width: auto; height: auto; overflow: hidden; clip: auto; white-space: normal;
-  margin: 0; font-family: inherit; font-weight: 700; font-size: 19px; line-height: 1.2; letter-spacing: -.01em; color: #fff;
-  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; animation: none;
+  position: static; width: auto; height: auto; overflow: visible; clip: auto; white-space: normal;
+  margin: 0; font-family: "Russo One", system-ui, sans-serif; font-weight: 400; font-size: 27px; line-height: 1.08;
+  letter-spacing: .005em; text-transform: uppercase; color: #fff; text-shadow: none; animation: none; text-wrap: balance;
 }
-html.android .pl-head p { margin: 0; font-size: 13px; color: var(--dim); animation: none; }
+html.android #iso-line {   /* the ISO, as the description */
+  display: block; margin-top: 2px; font-size: 14px; line-height: 1.45; color: var(--dim);
+  white-space: normal; overflow-wrap: anywhere;
+}
+html.android #iso-line::before { content: "Tu ISO: "; color: #c4c4ca; font-weight: 600; }
+html.android .need-iso #iso-line { color: #e3b06a; }
+html.android .need-iso #iso-line::before { content: none; }
+html.android .a-chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+html.android .a-chip {
+  padding: 7px 12px; border-radius: 999px; background: var(--chip); color: #c8c8ce;
+  font-size: 11px; font-weight: 700; line-height: 1.2; letter-spacing: .07em; text-transform: uppercase; white-space: nowrap;
+}
 
-/* the ISO: a file row (a disc tile, what it is, the file's name; the whole row changes it), then JUGAR at the
-   bottom, under the right thumb. Without an ISO the row says so and "Seleccionar ISO" is the filled button. */
-html.android .iso {
-  order: 1; position: relative; display: grid; grid-template-columns: 40px minmax(0, 1fr) auto; align-items: center;
-  gap: 4px 12px; padding: 10px 12px 10px 10px; border-radius: 12px; font-size: 14px; color: var(--ink);
-  background: rgba(255, 255, 255, .035); box-shadow: inset 0 0 0 1px var(--line);
+/* the sheet's foot: JUGAR (a small label on the left, the word on the right) and the ISO button */
+html.android .playline {
+  flex: none; display: flex; align-items: stretch; gap: 10px;
+  padding: 12px calc(22px + var(--sr)) calc(12px + var(--sb)) 24px; background: var(--sheet-bg); border-top: 1px solid var(--line);
 }
-html.android .iso::before {
-  content: ""; grid-column: 1; width: 40px; height: 40px; border-radius: 10px;
-  background: rgba(122, 193, 67, .14) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%237ac143' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='9.5'/%3E%3Ccircle cx='12' cy='12' r='2.5'/%3E%3Cpath d='M7 12a5 5 0 0 1 5-5'/%3E%3C/svg%3E") center / 22px 22px no-repeat;
-}
-html.android #iso-line {
-  grid-column: 2; min-width: 0; font-size: 14px; font-weight: 600; line-height: 1.3; color: #e8eef3;
-  white-space: normal; overflow: hidden; overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3;
-}
-html.android #iso-line::before { content: "ISO del juego"; display: block; margin-bottom: 1px; font-size: 12px; font-weight: 500; color: var(--dim); }
-html.android .iso::after {
-  content: ""; grid-column: 3; width: 34px; height: 34px; border-radius: 17px;
-  background: var(--tonal) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%239ccbff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M16 3l4 4-4 4M20 7H8M8 21l-4-4 4-4M4 17h12'/%3E%3C/svg%3E") center / 18px 18px no-repeat;
-}
-html.android .iso:has(#btn-iso.hidden)::after { content: none; }
-/* the button covers the whole row: a tap anywhere on it changes the ISO (its text stays for screen readers) */
-html.android #btn-iso {
-  position: absolute; inset: 0; z-index: 1; width: 100%; min-height: 0; padding: 0; border-radius: 12px;
-  color: transparent; font-size: 0; background: transparent;
-}
-html.android #btn-iso:active { background: rgba(255, 255, 255, .05); text-decoration: none; }
-html.android .need-iso .iso { grid-template-columns: 40px minmax(0, 1fr); padding: 12px; gap: 12px; }
-html.android .need-iso .iso::before { background-color: rgba(232, 150, 47, .14); background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23e8962f' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='9.5'/%3E%3Ccircle cx='12' cy='12' r='2.5'/%3E%3Cpath d='M7 12a5 5 0 0 1 5-5'/%3E%3C/svg%3E"); }
-html.android .need-iso .iso::after { content: none; }
-html.android .need-iso #iso-line { display: block; -webkit-line-clamp: none; white-space: normal; font-weight: 500; font-size: 13px; line-height: 1.35; color: #e9d3b4; }
-html.android .need-iso #iso-line::before { content: "Falta la ISO"; font-size: 14px; font-weight: 600; color: #f3b768; margin-bottom: 1px; }
-html.android .need-iso #btn-iso {
-  position: static; grid-column: 1 / -1; display: flex; align-items: center; justify-content: center; gap: 10px;
-  min-height: 48px; border-radius: 10px; font-size: 15px; font-weight: 600; color: #fff; background: var(--accent);
-}
-html.android .need-iso #btn-iso::before {
-  content: ""; width: 20px; height: 20px; flex: none;
-  background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 7.5A2.5 2.5 0 0 1 5.5 5H9l2 2.5h7.5A2.5 2.5 0 0 1 21 10v6.5a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 16.5z'/%3E%3C/svg%3E") center / contain no-repeat;
-}
-html.android .need-iso #btn-iso:active { background: var(--accent-hi); }
-
-html.android .playline > .play { order: 3; margin-top: auto; }
+html.android .playline .iso { display: none; }
 html.android .play {
-  display: flex; align-items: center; justify-content: center; gap: 10px;
-  width: 100%; min-height: 56px; padding: 0 20px; border-radius: 12px;
-  font-family: inherit; font-size: 19px; font-weight: 700; letter-spacing: .04em;
-  color: var(--go-ink); background: var(--go); box-shadow: none; text-shadow: none;
+  flex: 1 1 auto; min-width: 0; min-height: 56px; margin: 0; padding: 0 18px; border-radius: 14px;
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  font-family: "Russo One", system-ui, sans-serif; font-size: 21px; letter-spacing: .03em; text-transform: uppercase;
+  color: #fff; background: var(--go); box-shadow: none; text-shadow: none;
 }
 html.android .play::before {
-  content: ""; width: 18px; height: 18px; flex: none; background: currentColor;
-  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M7 4.5v15l12.5-7.5z' fill='black'/%3E%3C/svg%3E") center / contain no-repeat;
-  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M7 4.5v15l12.5-7.5z' fill='black'/%3E%3C/svg%3E") center / contain no-repeat;
+  content: "Listo para jugar"; font-family: system-ui, sans-serif; font-size: 11px; font-weight: 700; letter-spacing: .07em;
+  line-height: 1.2; text-align: left; opacity: .85;
 }
-html.android #btn-install::before { content: none; }
+html.android .play:disabled::before { content: "Abierto"; }
+html.android #btn-install::before { content: "PS2 Recomp"; }
 html.android .play::after { content: none; }
-html.android .play:not(:disabled):hover { background: var(--go-hi); color: var(--go-ink); box-shadow: none; }
-html.android .play:not(:disabled):active { transform: scale(.98); background: var(--go-hi); }
-html.android .play:disabled { color: #7d8894; background: var(--neutral); box-shadow: none; }
-html.android .need-iso > .play { margin-top: 0; min-height: 48px; }
-
-/* ---------------- option cards ---------------- */
-html.android .sect { margin: 24px 4px 10px; font-size: 12px; font-weight: 700; letter-spacing: .09em; color: #8b98a6; }
-html.android .sect.first { margin-top: 2px; }
-html.android #v-online .sect, html.android #v-settings .sect { margin-left: 4px; }
-html.android .opts, html.android #v-settings .opts {
-  margin: 0; border-radius: var(--r-lg); overflow: hidden; background: var(--card); box-shadow: inset 0 0 0 1px var(--line);
+html.android .play:not(:disabled):hover { background: var(--go); color: #fff; box-shadow: none; }
+html.android .play:not(:disabled):active { background: var(--go-hi); transform: scale(.98); }
+html.android .play:disabled { color: #7c7c84; background: var(--chip); }
+html.android .playline #btn-iso {
+  flex: none; width: 84px; min-height: 56px; padding: 0 8px; border-radius: 14px; white-space: normal;
+  font-size: 11px; font-weight: 700; line-height: 1.2; letter-spacing: .06em; text-transform: uppercase; text-align: center;
+  color: #e4e4e8; background: var(--chip);
 }
+html.android .playline #btn-iso:hover { color: #e4e4e8; text-decoration: none; }
+html.android .playline #btn-iso:active { background: var(--chip-hi); }
+/* no ISO yet: there is nothing to play, so choosing it takes JUGAR's place */
+html.android .need-iso #btn-play { display: none; }
+html.android .need-iso .playline #btn-iso {
+  flex: 1 1 auto; width: auto; font-family: "Russo One", system-ui, sans-serif; font-size: 18px; font-weight: 400;
+  letter-spacing: .03em; color: #121214; background: #fff;
+}
+html.android .need-iso .playline #btn-iso:active { background: #dcdce0; }
+
+/* the options, inside the sheet */
+html.android .sect {
+  margin: 26px 2px 10px; font-size: 12px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; color: var(--faint);
+}
+html.android .sect.first { margin-top: 2px; }
+html.android #v-online .sect, html.android #v-settings .sect { margin-left: 2px; }
+html.android .opts, html.android #v-settings .opts { margin: 0; border-radius: var(--r-lg); overflow: hidden; background: var(--card); }
 html.android .opt {
   grid-template-columns: minmax(150px, 32%) minmax(0, 1fr); gap: 4px 20px; align-items: center;
   min-height: 64px; padding: 14px 18px; border-top: 1px solid var(--line);
 }
 html.android .opt:first-child { border-top: 0; }
-html.android .opt > label { padding: 0; font-size: 15px; font-weight: 600; color: #e3e9ee; }
+html.android .opt > label { padding: 0; font-size: 15px; font-weight: 600; color: #f0f0f3; }
 html.android .ctl { gap: 6px 14px; min-width: 0; }
-html.android .ctl small { margin: 0; color: #8f9aa6; }
+html.android .ctl small { margin: 0; }
 /* a switch or a list: the name and its explanation on the left, the control on the right */
 html.android .opt:has(> .ctl > input.sw), html.android .opt:has(> .ctl > select) {
   grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "lab ctl" "hint ctl";
@@ -219,118 +210,125 @@ html.android .opt:has(> .ctl > input.sw) > .ctl > small, html.android .opt:has(>
   grid-area: hint; align-self: start; max-width: 68ch; margin-top: 2px;
 }
 html.android .opt:has(> .ctl > input.sw) > label { cursor: pointer; }
+/* in the sheet a list takes the whole width, under its name */
+html.android .a-sheet .opt { padding: 14px 16px; }
+html.android .a-sheet .opt:has(> .ctl > select) { grid-template-columns: minmax(0, 1fr); grid-template-areas: "lab" "hint" "ctl"; }
+html.android .a-sheet .opt:has(> .ctl > select) > label { align-self: start; }
+html.android .a-sheet .opt .ctl > select { width: 100%; margin-top: 8px; }
+html.android #controls {
+  margin: 0; padding: 14px 16px; border-radius: var(--r-lg); background: var(--card);
+  font-size: 14px; line-height: 1.55; color: var(--dim); max-width: none;
+}
+html.android #controls b { color: #fff; }
 
 /* fields */
 html.android select, html.android input:not([type=checkbox]):not([type=range]) {
   min-height: 48px; min-width: 0; padding: 0 14px; font-size: 16px; border-radius: var(--r-md);
-  background-color: var(--field); border: 1px solid var(--field-line); color: #e8edf2;
+  background-color: var(--field); border: 1px solid var(--field-line); color: #f0f0f3;
 }
-html.android select:focus, html.android input:not([type=checkbox]):not([type=range]):focus {
-  border-color: var(--blue); box-shadow: 0 0 0 3px rgba(102, 192, 244, .18);
-}
-html.android input::placeholder { color: #6f7b88; }
+html.android select:focus, html.android input:not([type=checkbox]):not([type=range]):focus { border-color: #6b6b73; box-shadow: none; }
+html.android input::placeholder { color: #6b6b73; }
 html.android select {
   -webkit-appearance: none; appearance: none; width: 240px; padding-right: 40px; cursor: pointer;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%2366c0f4' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%239a9aa0' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
   background-repeat: no-repeat; background-position: right 14px center;
 }
-html.android input.sw {
-  width: 52px; height: 30px; margin: 0; border-radius: 15px; background: #3a4552;
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .05);
-}
-html.android input.sw::after { top: 3px; left: 3px; width: 24px; height: 24px; background: #dfe7ee; box-shadow: 0 1px 3px rgba(0, 0, 0, .4); }
-html.android input.sw:checked { background: #1a9fff; }
+html.android input.sw { width: 52px; height: 30px; margin: 0; border-radius: 15px; background: #3a3a41; }
+html.android input.sw::after { top: 3px; left: 3px; width: 24px; height: 24px; background: #e4e4e8; box-shadow: none; }
+html.android input.sw:checked { background: var(--go); }
 html.android input.sw:checked::after { left: 25px; background: #fff; }
 
-/* buttons */
+/* buttons: solid, rounded; green for the main action, charcoal for the rest */
 html.android .btn {
   min-height: 48px; padding: 0 20px; border-radius: var(--r-md); font-size: 15px; font-weight: 600;
-  color: #e3eaf1; background: var(--neutral); box-shadow: none;
+  color: #f0f0f3; background: var(--neutral); box-shadow: none;
 }
-html.android .btn:hover { background: var(--neutral-hi); color: #fff; }
-html.android .btn.blue, html.android .btn.blue:hover { background: var(--accent); color: #fff; }
-html.android .btn.green, html.android .btn.green:hover { background: var(--go); color: var(--go-ink); }
-html.android .btn:not(:disabled):active { transform: scale(.98); filter: brightness(1.1); }
+html.android .btn:hover { background: var(--neutral); color: #f0f0f3; }
+html.android .btn.blue, html.android .btn.blue:hover, html.android .btn.green, html.android .btn.green:hover { background: var(--go); color: #fff; }
+html.android .btn:not(:disabled):active { transform: scale(.98); filter: brightness(1.12); }
 html.android .btnrow { gap: 10px; }
 html.android .btnrow .btn { flex: 1; }
-html.android .txtbtn { min-height: 40px; font-size: 15px; font-weight: 600; }
-html.android .txtbtn:active { color: #fff; }
-/* a text button that does something (not just a link): a quiet pill, easy to hit */
+html.android .txtbtn { min-height: 40px; font-size: 15px; font-weight: 600; color: #f0f0f3; }
+html.android .txtbtn:hover { color: #f0f0f3; text-decoration: none; }
 html.android .ctl .txtbtn, html.android .box-h .txtbtn, html.android .r .txtbtn, html.android .q .txtbtn,
 html.android #btn-stats, html.android .blocked .txtbtn {
-  min-height: 40px; padding: 0 16px; border-radius: 10px; text-align: center; font-size: 14px;
-  color: var(--tonal-ink); background: var(--tonal);
+  min-height: 40px; padding: 0 16px; border-radius: 999px; text-align: center; font-size: 13px; font-weight: 700;
+  letter-spacing: .04em; text-transform: uppercase; color: #f0f0f3; background: var(--chip);
 }
 html.android .ctl .txtbtn:active, html.android .box-h .txtbtn:active, html.android .r .txtbtn:active,
-html.android .q .txtbtn:active, html.android #btn-stats:active { background: var(--tonal-hi); }
-html.android #btn-logout { color: #ffa59b; background: rgba(217, 74, 61, .14); }
+html.android .q .txtbtn:active, html.android #btn-stats:active { background: var(--chip-hi); }
+html.android #btn-logout { color: #ff8f86; }
 
-/* the controls' text */
-html.android .plain, html.android #v-settings .plain { margin: 0; max-width: none; font-size: 15px; line-height: 1.6; color: #aab6c1; }
-html.android #controls { padding: 16px 18px; border-radius: var(--r-lg); background: var(--card); box-shadow: inset 0 0 0 1px var(--line); }
-html.android #controls b { color: #fff; }
-html.android #build-line { margin: 18px 4px 0; font-size: 13px; color: var(--faint); }
+html.android .plain, html.android #v-settings .plain { margin: 0; max-width: none; font-size: 15px; line-height: 1.6; color: var(--dim); }
+html.android #build-line { margin: 18px 2px 0; font-size: 13px; color: var(--faint); }
 
 /* ---------------- En línea: sign in ---------------- */
 html.android .signin {
-  max-width: 900px; min-height: calc(100vh - 2 * var(--gut) - var(--st) - var(--sb)); margin: 0 auto;
+  max-width: 900px; min-height: calc(100vh - var(--bar) - var(--st) - 2 * var(--gut) - var(--sb)); margin: 0 auto;
   display: grid; grid-template-columns: minmax(0, 1fr) minmax(280px, 360px); grid-auto-rows: min-content;
   align-content: center; gap: 12px 24px;
 }
 html.android .signin > :not(.a-intro) { grid-column: 2; }
 html.android .a-intro {
-  grid-column: 1; grid-row: 1 / span 6; align-self: stretch; min-height: 240px;
-  display: flex; flex-direction: column; justify-content: flex-end; gap: 6px; padding: 10px 10px 18px; border-radius: 16px;
-  background: var(--card); box-shadow: inset 0 0 0 1px var(--line);
+  grid-column: 1; grid-row: 1 / span 6; align-self: stretch; min-height: 220px;
+  display: flex; flex-direction: column; justify-content: flex-end; gap: 6px; padding: 0 0 18px; border-radius: 20px;
+  overflow: hidden; background: var(--card);
 }
 html.android .a-intro::before {
-  content: ""; flex: 1 1 auto; min-height: 110px; margin-bottom: 10px; border-radius: 10px;
-  background: #0e121a url("img/dbz-bt4-header.jpg") center 22% / cover no-repeat;
+  content: ""; flex: 1 1 auto; min-height: 100px; margin-bottom: 12px;
+  background: #0b0b0d url("img/dbz-bt4-header.jpg") center 22% / cover no-repeat;
 }
-html.android .a-intro h2, html.android .a-intro p { padding: 0 10px; }
-html.android .signin h2 { font-family: inherit; font-weight: 700; font-size: 24px; line-height: 1.15; letter-spacing: -.01em; }
-html.android .signin p { margin: 0; font-size: 15px; color: #c3ccd5; }
+html.android .a-intro h2, html.android .a-intro p { padding: 0 20px; }
+html.android .signin h2 {
+  font-family: "Russo One", system-ui, sans-serif; font-weight: 400; font-size: 26px; line-height: 1.1; text-transform: uppercase; color: #fff;
+}
+html.android .signin p { margin: 0; font-size: 14px; color: var(--dim); }
 html.android .signin .err { min-height: 0; }
 html.android .signin .err:empty { display: none; }
-html.android .signin small { margin: 0; color: #7f8b97; }
+html.android .signin small { margin: 0; color: var(--faint); }
 
 /* ---------------- En línea: the lobby ---------------- */
 html.android #v-online:has(#lobby:not(.hidden)) { padding-bottom: calc(var(--gut) + var(--sb)); }
 html.android .lobby-top { gap: 10px 12px; margin-bottom: 12px; flex-wrap: wrap; min-height: 44px; }
 html.android .conn {
-  min-height: 36px; padding: 0 14px 0 12px; border-radius: 18px; font-size: 14px; color: #b9c4ce;
-  background: var(--card); box-shadow: inset 0 0 0 1px var(--line); min-width: 0;
+  min-height: 36px; padding: 0 14px 0 12px; border-radius: 999px; font-size: 14px; color: #c4c4ca; background: var(--card); min-width: 0;
 }
 html.android .conn > span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+html.android .conn.on i { background: var(--accent-text); }
 html.android .top-act { gap: 10px; }
-html.android #btn-stats { min-height: 44px; padding: 0 18px; border-radius: 12px; }
+html.android #btn-stats { min-height: 44px; padding: 0 18px; }
 html.android .seek span {
-  display: flex; align-items: center; min-height: 44px; padding: 0 18px; border-radius: 12px; font-size: 15px; font-weight: 600;
-  color: #e3eaf1; background: var(--neutral);
+  display: flex; align-items: center; min-height: 44px; padding: 0 18px; border-radius: 999px;
+  font-size: 13px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: #f0f0f3; background: var(--chip);
 }
-html.android .seek input:checked + span { color: var(--go-ink); background: var(--go); }
-html.android .seek input:checked + span::before { background: var(--go-ink); box-shadow: none; animation: none; }
+html.android .seek input:checked + span { color: #fff; background: var(--go); }
+html.android .seek input:checked + span::before { background: #fff; box-shadow: none; animation: none; }
 
 html.android .split {
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; min-height: 220px;
-  height: calc(100vh - 2 * var(--gut) - 56px - var(--st) - var(--sb));
+  height: calc(100vh - var(--bar) - var(--st) - 2 * var(--gut) - 56px - var(--sb));
 }
-html.android .box { border-radius: var(--r-lg); background: var(--card); box-shadow: inset 0 0 0 1px var(--line); overflow: hidden; }
-html.android .box-h { min-height: 52px; padding: 6px 10px 6px 16px; font-size: 14px; font-weight: 600; border-bottom: 1px solid var(--line); }
+html.android .box { border-radius: var(--r-lg); background: var(--card); overflow: hidden; }
+html.android .box-h {
+  min-height: 52px; padding: 6px 10px 6px 16px; font-size: 12px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+  color: #c4c4ca; border-bottom: 1px solid var(--line);
+}
 html.android .box-h > span:first-child:not(.n) { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-html.android #p-game { color: var(--blue); }
+html.android #p-game { color: var(--accent-text); }
 html.android .find { padding: 10px 12px 6px; }
-html.android .find input#find { min-height: 44px; padding-left: 34px; background-position: 12px center; background-color: var(--field); }
+html.android .find input#find { min-height: 44px; padding-left: 36px; border-radius: 999px; background-position: 14px center; background-color: var(--field); }
 html.android .rows { overscroll-behavior: contain; padding: 4px 0 8px; }
-html.android .r { min-height: 58px; gap: 12px; padding: 7px 10px 7px 14px; }
+html.android .r { min-height: 58px; gap: 10px; padding: 7px 8px 7px 12px; }
+html.android .r:hover { background: none; }
 html.android .r .pic { width: 38px; height: 38px; font-size: 15px; }
-html.android .r-name { font-size: 15px; font-weight: 600; }
+html.android .r-name { font-size: 15px; font-weight: 600; color: #f0f0f3; }
 html.android .r-sub { font-size: 13px; }
-html.android .r .act, html.android .r .act.keep { visibility: visible; gap: 4px; flex: none; }   /* no hover on a touch screen */
-html.android .star, html.android .blockbtn { width: 40px; height: 40px; padding: 0; border-radius: 20px; font-size: 18px; }
-html.android .star:active, html.android .blockbtn:active { background: rgba(255, 255, 255, .08); }
+html.android .r .r-sub.waiting, html.android .r .r-sub.playing { color: var(--accent-text); }
+html.android .r .act, html.android .r .act.keep { visibility: visible; gap: 2px; flex: none; }   /* no hover on a touch screen */
+html.android .star, html.android .blockbtn { width: 38px; height: 40px; padding: 0; border-radius: 20px; font-size: 18px; }
+html.android .star:active, html.android .blockbtn:active { background: var(--chip); }
 html.android .r .you { font-size: 13px; padding: 0 8px; }
-html.android .lockmark { font-size: 11px; border-radius: 6px; vertical-align: 1px; }
+html.android .lockmark { font-size: 10px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; border: 0; border-radius: 999px; background: var(--chip); padding: 2px 8px; }
 html.android .none { padding: 22px 16px; font-size: 14px; }
 html.android .sub-h { padding: 14px 16px 6px; font-size: 12px; }
 
@@ -338,70 +336,74 @@ html.android .sub-h { padding: 14px 16px 6px; font-size: 12px; }
 html.android #room-panel { overflow-y: auto; overscroll-behavior: contain; }
 html.android .q { min-height: 52px; gap: 12px; padding: 6px 10px 6px 14px; }
 html.android .q .pic { width: 34px; height: 34px; }
+html.android .q.next .num { color: var(--accent-text); }
 html.android #btn-start { margin: 6px 12px 12px; min-height: 48px; }
 html.android .chat { min-height: 170px; flex: 1 0 170px; }
 html.android .chat-log { font-size: 14px; padding: 10px 16px; }
+html.android .chat-log b { color: var(--accent-text); }
 html.android .chat input { min-height: 48px; border-radius: 0; border: 0; border-top: 1px solid var(--line); background: var(--field); }
 
 /* ---------------- Ajustes ---------------- */
 html.android #v-settings { max-width: 900px; }
 html.android #s-server { flex: 1 1 220px; }
 html.android .ctl .err:empty { display: none; }
-html.android #acc-line { font-size: 15px; color: #c9d3dc; }
+html.android #acc-line { font-size: 15px; color: #c4c4ca; }
 html.android .blocked { gap: 6px; }
 html.android .blocked .brow { min-height: 44px; }
 
 /* ---------------- notices and dialogs ---------------- */
 html.android .notes { right: calc(12px + var(--sr)); bottom: calc(12px + var(--sb)); gap: 10px; }
 html.android .note {
-  width: min(380px, calc(100vw - var(--rail) - var(--sl) - var(--sr) - 32px)); padding: 14px; border-radius: 12px;
-  background: #233142; box-shadow: 0 8px 24px rgba(0, 0, 0, .4), inset 0 0 0 1px var(--line);
+  width: min(380px, calc(100vw - var(--sl) - var(--sr) - 32px)); padding: 14px; border-radius: 16px; border-left: 0;
+  background: #222226; box-shadow: 0 10px 28px rgba(0, 0, 0, .5);
 }
-html.android .note .n-title { font-size: 15px; font-weight: 600; }
-html.android .note .n-text { font-size: 13px; }
+html.android .note.good .n-title { color: var(--accent-text); }
+html.android .note.bad .n-title { color: #ff8f86; }
+html.android .note .n-title { font-size: 15px; font-weight: 700; }
+html.android .note .n-text { font-size: 13px; color: var(--dim); }
 html.android .note .btnrow { margin-top: 8px; }
 html.android .note .btn { min-height: 42px; padding: 0 16px; font-size: 14px; }
 
-html.android .modal { padding: calc(12px + var(--st)) calc(12px + var(--sr)) calc(12px + var(--sb)) calc(12px + var(--sl)); background: rgba(5, 8, 12, .7); }
+html.android .modal { padding: calc(12px + var(--st)) calc(12px + var(--sr)) calc(12px + var(--sb)) calc(12px + var(--sl)); background: rgba(0, 0, 0, .7); }
 html.android .dlg {
   width: min(440px, 100%); max-width: none; max-height: 100%; overflow-y: auto; overscroll-behavior: contain;
-  padding: 22px; gap: 12px; border-radius: 16px; background: #1e2b3a; box-shadow: 0 16px 40px rgba(0, 0, 0, .45), inset 0 0 0 1px var(--line);
+  padding: 22px; gap: 12px; border-radius: 24px; background: var(--sheet-bg); box-shadow: 0 16px 40px rgba(0, 0, 0, .5);
 }
 html.android .dlg .err:empty { display: none; }
-html.android .dlg h3 { font-family: inherit; font-weight: 700; font-size: 20px; letter-spacing: -.01em; }
-html.android .st-me .tile b { font-family: inherit; font-weight: 700; }
-html.android .vs-names { font-family: inherit; font-weight: 700; }
+html.android .dlg h3 { font-family: "Russo One", system-ui, sans-serif; font-weight: 400; font-size: 21px; text-transform: uppercase; color: #fff; }
+html.android .st-me .tile { padding: 10px 12px; border-radius: var(--r-md); background: var(--card); }
+html.android .st-me .tile b { font-family: "Russo One", system-ui, sans-serif; font-weight: 400; }
+html.android .st-me .tile.t-win b { color: var(--accent-text); }
+html.android .st-me .tile span { font-size: 12px; }
+html.android .vs-names { font-family: "Russo One", system-ui, sans-serif; text-transform: uppercase; }
 html.android .sizes { gap: 8px; font-size: 14px; flex-wrap: wrap; }
-html.android .sizes button { width: 48px; height: 44px; padding: 0; border: 0; border-radius: var(--r-md); font-size: 16px; font-weight: 600; background: var(--neutral); }
-html.android .sizes button.on { background: var(--accent); }
+html.android .sizes button { width: 48px; height: 44px; padding: 0; border: 0; border-radius: var(--r-md); font-size: 16px; font-weight: 700; background: var(--chip); }
+html.android .sizes button.on { color: #121214; background: #fff; }
 html.android .dlg.stats { width: min(760px, 100%); }
 html.android .st-me { grid-template-columns: repeat(6, minmax(0, 1fr)); }
-html.android .st-me .tile { padding: 10px 12px; border-radius: var(--r-md); }
-html.android .st-me .tile span { font-size: 12px; }
-html.android .st-top { max-height: none; min-height: 120px; flex: none; border-radius: var(--r-md); }
+html.android .st-top { max-height: none; min-height: 120px; flex: none; border-radius: var(--r-md); background: var(--card); }
 html.android .st-top .r { min-height: 52px; }
+html.android .st-top .r.mine .r-name { color: var(--accent-text); }
 html.android .dlg.versus { width: min(480px, 100%); }
 
 /* touch: a hover state would stay stuck after a tap */
 @media (hover: none) {
-  html.android .r:hover, html.android .friend:hover, html.android .st-top .r:hover { background: none; }
-  html.android .txtbtn:hover { text-decoration: none; }
-  html.android .play:not(:disabled):hover { background: var(--go); }
-  html.android .btn:hover { background: var(--neutral); }
-  html.android .btn.blue:hover { background: var(--accent); }
-  html.android .btn.green:hover { background: var(--go); }
+  html.android .friend:hover, html.android .st-top .r:hover { background: none; }
 }
 
 /* ---------------- sizes ---------------- */
-/* short phones (360 dp and less): a tighter rail and panel */
+/* short phones (360 dp and less) */
 @media (max-height: 380px) {
-  html.android { --gut: 12px; }
-  html.android .logo { display: none; }
-  html.android .tab { height: 58px; }
-  html.android .playline { padding: 14px; gap: 8px; }
-  html.android .pl-head h1, html.android .pl-head h1.logo-in-art { font-size: 17px; }
-  html.android .play { min-height: 52px; font-size: 18px; }
-  html.android .need-iso .pl-head p { display: none; }
+  html.android { --bar: 48px; --gut: 12px; --r-sheet: 24px; }
+  html.android .tab { font-size: 16px; }
+  html.android .tabs { gap: 22px; }
+  html.android .me .pic { width: 32px; height: 32px; }
+  html.android .a-sheet { padding-top: 18px; }
+  html.android .a-sheet-body { padding: 6px calc(18px + var(--sr)) 14px 20px; }
+  html.android .playline { padding: 10px calc(18px + var(--sr)) calc(10px + var(--sb)) 20px; }
+  html.android .pl-head h1, html.android .pl-head h1.logo-in-art { font-size: 23px; }
+  html.android .play, html.android .playline #btn-iso { min-height: 52px; }
+  html.android .play { font-size: 19px; }
   html.android .dlg { padding: 16px 18px; gap: 8px; }
   html.android .dlg h3 { font-size: 18px; margin-bottom: 2px; }
   html.android .dlg input:not([type=checkbox]):not([type=range]) { min-height: 44px; }
@@ -416,20 +418,23 @@ html.android .dlg.versus { width: min(480px, 100%); }
   html.android .a-intro { grid-row: auto; min-height: 150px; }
   html.android .opt:not(:has(> .ctl > input.sw)):not(:has(> .ctl > select)) { grid-template-columns: minmax(0, 1fr); }
   html.android .st-me { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  html.android .tabs { gap: 18px; }
+  html.android .me-text { display: none; }
 }
 @media (max-width: 600px) {
-  html.android #v-play { grid-template-columns: minmax(0, 1fr); }
-  html.android .banner.dbz, html.android .playline { grid-column: 1; }
-  html.android .playline { margin-top: 12px; }
   html.android .opt:has(> .ctl > select) select { width: 180px; }
 }
-/* tablets: more air */
+/* tablets: more air, bigger titles */
 @media (min-width: 1100px) and (min-height: 600px) {
-  html.android { --gut: 28px; --rail: 96px; }
-  html.android .tab { height: 68px; font-size: 13px; }
-  html.android .playline { padding: 24px; gap: 14px; }
-  html.android .pl-head h1, html.android .pl-head h1.logo-in-art { font-size: 26px; }
+  html.android { --bar: 68px; --gut: 28px; --r-sheet: 32px; }
+  html.android .tab { font-size: 24px; }
+  html.android .tabs { gap: 34px; }
+  html.android .a-sheet { padding-top: 26px; }
+  html.android .a-sheet-body { padding: 10px calc(32px + var(--sr)) 24px 34px; }
+  html.android .playline { padding: 16px calc(32px + var(--sr)) calc(16px + var(--sb)) 34px; }
+  html.android .pl-head h1, html.android .pl-head h1.logo-in-art { font-size: 38px; }
   html.android .pl-head p { font-size: 15px; }
-  html.android .play { min-height: 64px; font-size: 22px; }
-  html.android .split { height: calc(100vh - 2 * var(--gut) - 56px - var(--st) - var(--sb)); }
+  html.android .play, html.android .playline #btn-iso { min-height: 64px; }
+  html.android .play { font-size: 24px; }
+  html.android .split { height: calc(100vh - var(--bar) - var(--st) - 2 * var(--gut) - 56px - var(--sb)); }
 }

@@ -48,18 +48,43 @@
     const vp = document.querySelector('meta[name="viewport"]');
     if (vp && !/viewport-fit/.test(vp.content)) vp.content += ", viewport-fit=cover";
 
-    // Biblioteca: the game's name and edition go to the play panel next to the art
-    const pl = document.querySelector(".playline"), title = $("banner-title"), sub = $("banner-sub");
-    if (pl && title && sub) {
-      const head = document.createElement("div");
-      head.className = "pl-head";
-      head.append(title, sub);
-      pl.prepend(head);
-    }
-    // no ISO chosen yet: "Seleccionar ISO" is the next step, so the panel shows it first (class need-iso)
+    // Biblioteca: the art on the left; on the right a sheet with the game (edition, name, ISO, a few chips), the options
+    // under it, and at its foot the action bar (JUGAR and the ISO button). Built from the page's own elements.
+    const vplay = $("v-play"), pl = document.querySelector(".playline"), title = $("banner-title"), sub = $("banner-sub");
     const play = $("btn-play"), iso = $("btn-iso"), line = $("iso-line");
-    if (pl && play && iso) {
-      const mark = () => pl.classList.toggle("need-iso",
+    let sheetBody = null;
+    if (vplay && pl && title && sub && line && iso) {
+      const div = (cls) => { const d = document.createElement("div"); d.className = cls; return d; };
+      const sheet = div("a-sheet"), head = div("pl-head"), chips = div("a-chips");
+      sheetBody = div("a-sheet-body");
+      head.append(sub, title, line, chips);
+      sheetBody.append(head);
+      // the options (sections, rows, controls' text) follow the action bar in the page: they go into the sheet
+      for (let n = pl.nextElementSibling; n; ) { const next = n.nextElementSibling; sheetBody.append(n); n = next; }
+      pl.append(iso);
+      sheet.append(sheetBody, pl);
+      vplay.append(sheet);
+
+      // the chips: the chosen quality and frame rate, and what the game is; text only, redrawn when it changes
+      let shown = "";
+      const drawChips = () => {
+        const q = $("s-quality"), fps = $("go-fps60");
+        const list = [];
+        if (q && q.selectedOptions.length) list.push(q.selectedOptions[0].textContent);
+        if (fps) list.push(fps.checked ? "60 fps" : "30 fps");
+        list.push("En línea", "PS2 Recomp");
+        const key = list.join("|");
+        if (key === shown) return;
+        shown = key;
+        chips.replaceChildren(...list.map((t) => { const c = document.createElement("span"); c.className = "a-chip"; c.textContent = t; return c; }));
+      };
+      document.addEventListener("change", drawChips);
+      setInterval(drawChips, 1000);   // app.js sets the values on every refresh without an event
+      drawChips();
+    }
+    // no ISO chosen yet: "Seleccionar ISO" takes JUGAR's place (class need-iso on the view)
+    if (vplay && play && iso) {
+      const mark = () => vplay.classList.toggle("need-iso",
         !iso.classList.contains("hidden") && play.disabled && play.textContent !== "Jugando");
       const watch = { attributes: true, attributeFilter: ["class", "disabled"], childList: true, characterData: true, subtree: true };
       for (const e of [play, iso]) new MutationObserver(mark).observe(e, watch);
@@ -78,6 +103,24 @@
       };
       new MutationObserver(tidy).observe(line, { childList: true, characterData: true, subtree: true });
       tidy();
+    }
+
+    // the launcher opens at the top: while the first state arrives and the page grows (and the system bars hide),
+    // nothing may leave it scrolled down; the first touch hands the scroll to the player
+    const main = document.querySelector("main");
+    if (main) {
+      if ("scrollRestoration" in history) history.scrollRestoration = "manual";
+      let settle = true;
+      const top = () => {
+        for (const e of [main, sheetBody, document.scrollingElement]) if (e) e.scrollTop = 0;
+      };
+      const stop = () => { settle = false; };
+      for (const ev of ["touchstart", "wheel", "keydown", "mousedown"]) window.addEventListener(ev, stop, { capture: true, passive: true, once: true });
+      const until = Date.now() + 1500;
+      const loop = () => { if (!settle || Date.now() > until) return; top(); requestAnimationFrame(loop); };
+      top();
+      requestAnimationFrame(loop);
+      window.addEventListener("load", () => { if (settle) top(); });
     }
 
     // En línea, signed out: the title and the pitch go into a card beside the form

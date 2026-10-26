@@ -7,7 +7,8 @@
 #                                external files dir as pgo-<pid>.profraw), adb pull it into $WORK/pgo/
 #   use   -> build-android-pgo   with $WORK/pgo/runner.profdata (merged from the .profraw files). Train on a phone: the
 #                                profile follows the code, which comes from your ELF -- it stays on your disk.
-# ARMv8.2-A (+fp16, dotprod): every phone that can run the game (2018 and later).
+# ARMv8.2-A (+fp16, dotprod): every phone that can run the game (2018 and later). The generated code at -O2 (the
+# desktop builds keep -O1, measured best on x86): with the PGO profile, 7.6 -> 7.1 ms of guest CPU per frame (-7%).
 set -e
 WORK="${ANDROID_WORK:-$HOME/NBAStreetRecomp/android}"
 NDK="${ANDROID_NDK:-$HOME/Library/Android/sdk/ndk/28.2.13676358}"
@@ -28,5 +29,6 @@ PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR="$WORK/ffmpeg/lib/pkgconfig" cmake -S . -B $B
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DPS2X_ENABLE_SCCACHE=OFF -DPS2X_FORCE_PGS=ON \
     -DENABLE_LZ4=OFF -DENABLE_ZSTD=OFF -DENABLE_LIBB2=OFF -DENABLE_OPENSSL=OFF -DENABLE_EXPAT=OFF -DENABLE_LIBXML2=OFF \
     -DENABLE_ICONV=OFF -DENABLE_BZip2=OFF -DPKG_CONFIG_EXECUTABLE="$(which pkg-config)" \
-    "-DCMAKE_C_FLAGS=$F" "-DCMAKE_CXX_FLAGS=$F" "-DCMAKE_EXE_LINKER_FLAGS=$L" "-DCMAKE_SHARED_LINKER_FLAGS=$L" > "$WORK/configure-$MODE.log"
+    "-DCMAKE_C_FLAGS=$F" "-DCMAKE_CXX_FLAGS=$F" "-DCMAKE_EXE_LINKER_FLAGS=$L" "-DCMAKE_SHARED_LINKER_FLAGS=$L" \
+    -DPS2X_RUNNER_OPT=-O2 > "$WORK/configure-$MODE.log"
 nice -n 19 cmake --build $B --target ps2EntryRunner -j10

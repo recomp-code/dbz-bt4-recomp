@@ -1,6 +1,7 @@
 # DBZ BT4 for Android
 
-The recompiled game on Android (arm64, Android 12+, Vulkan 1.1): the same runtime and native renderer as the Mac build,
+The recompiled game on Android (arm64, Android 12+, a Vulkan driver with VK_KHR_synchronization2 -- 2022 or later; older
+drivers get a message instead of a black screen): the same runtime and native renderer as the Mac build,
 and the same Recomp launcher (recomp-online's Go code and frontend) in a WebView. No game data in the app: the player
 picks their ISO with the system's document picker; it is read in place (a file descriptor), never copied.
 
@@ -34,8 +35,28 @@ files dir into `$ANDROID_WORK/pgo/`, then `build_runner.sh use`.
 Debug builds start the game directly too (`adb shell am start -n io.github.recompcode.dbzbt4/.GameActivity`), with
 `env.txt` (KEY=VALUE lines) and the disc files in `/sdcard/Android/data/io.github.recompcode.dbzbt4/files`.
 
-## Measured (POCO F8 Ultra, Snapdragon 8 Elite Gen 5, 2608x1200, "Alta": 2x render + FSR 2 to 2187x1006)
+## Measured
+
+### POCO F8 Ultra (Snapdragon 8 Elite Gen 5, Adreno 840, 2608x1200, "Alta": 2x render + FSR 2 to 2187x1006)
 
 60 fps fight: game 59-60 fps, window 60, p95 17.7 ms, 6.8 ms of guest CPU per frame. Without the game category the
 system kept the cores at ~1 GHz (25 ms per frame); without ADPF the same; without the AHardwareBuffer path the CPU
 copy of the frame took the window down to ~30 fps at that resolution.
+
+### Pixel 7a (Tensor G2, Mali-G710, 1080x2400, "Equilibrada")
+
+Mali has no shaderClipDistance: its shader compiler faulted on the seam's gl_ClipDistance writes -> [noclip] variants
+(seam_noclip / seam_mv_noclip, glslc -DSEAM_NO_CLIPDIST). CPU-bound and quick to heat: skin throttling starts at 39 C,
+and after a few minutes of fights while charging it reaches the severe state (cores at 0.5-1.6 GHz), 23-28 fps in the
+60 fps mode. Dynamic resolution steps the FSR 2 output down there and back up when that does not help (CPU-bound).
+
+### Mi Note 10 Lite (Snapdragon 730G, Adreno 618, driver from 2021, Vulkan 1.1)
+
+Not supported: no VK_KHR_synchronization2, timeline semaphores or descriptor indexing (Granite's core); the GL renderer
+runs but falls under 1 fps in a fight. The game says so and exits.
+
+## Other knobs
+
+- generated code at -O2 on Android (build_runner.sh): with PGO, 7.6 -> 7.1 ms of guest CPU per frame (A/B, emulator)
+- ADPF holds every GameThread / GsThread / PS2Thread and the SDL main thread; PS2X_ADPF=0 turns it off
+- [dynres] PS2X_DYNRES=0 turns the dynamic upscaler output off; PS2X_UPSCALE_MPX=<n> fixes the budget

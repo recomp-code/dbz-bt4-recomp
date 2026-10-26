@@ -1,0 +1,60 @@
+/* [android] The launcher on a phone in landscape (~950 x 440 dp, 1 CSS px = 1 dp): one column, the window chrome and
+   the desktop-only settings gone, everything sized for a thumb (targets of 44 px or more). Loaded after style.css by the
+   Android app only (make_apk.sh); android_bridge.js puts the "android" class on <html>. */
+
+html.android { -webkit-tap-highlight-color: transparent; }
+html.android body { font-size: 15px; }
+html.android ::-webkit-scrollbar { width: 4px; height: 4px; }
+html.android ::-webkit-scrollbar-thumb { background: #3d4450; border-radius: 2px; }
+
+/* the title bar: no window to minimise or close, bigger tabs */
+html.android .titlebar { height: 50px; }
+html.android .logo { font-size: 16px; padding: 0 14px 0 calc(14px + env(safe-area-inset-left)); }
+html.android .tab { font-size: 15px; padding: 0 16px; }
+html.android .tab.active::after { left: 16px; right: 16px; bottom: 7px; height: 3px; }
+html.android .win { display: none; }
+html.android .tb-right { padding-right: env(safe-area-inset-right); }
+html.android .me { padding: 6px 14px 6px 6px; margin-right: 8px; }
+html.android .me-name { font-size: 14px; }
+html.android .me-status { font-size: 12px; }
+html.android #overlay-banner { display: none !important; }   /* the desktop's on-top overlay: the game has its own menu here */
+
+/* one column: the only game is DBZ BT4, and the friends are in the En línea tab */
+html.android .app { height: calc(100% - 50px); }
+html.android .side { display: none; }
+html.android main { overscroll-behavior: contain; padding: 0 env(safe-area-inset-right) 0 env(safe-area-inset-left); }
+
+/* Biblioteca: a shorter banner so JUGAR is on the first screen, and a big JUGAR */
+html.android .banner.dbz { height: 46vh; min-height: 150px; background-position: center 4%; }
+html.android .banner-txt { padding: 0 20px 10px; }
+html.android .banner p { font-size: 14px; }
+html.android .playline { gap: 18px; padding: 12px 20px; }
+html.android .play { font-size: 22px; padding: 14px 52px; min-height: 56px; border-radius: 4px; }
+html.android .iso { font-size: 14px; gap: 6px; }
+html.android .iso .txtbtn { font-size: 16px; padding: 8px 0; }
+html.android #opt-full, html.android #dlss-card, html.android #btn-add-game { display: none !important; }
+
+/* option rows: readable labels, controls a thumb can hit */
+html.android .sect { margin: 20px 20px 8px; font-size: 13px; }
+html.android .opts { margin: 0 20px; border-radius: 6px; }
+html.android .opt { grid-template-columns: 180px 1fr; gap: 14px; padding: 14px 16px; }
+html.android .opt > label { font-size: 15px; padding-top: 10px; }
+html.android .ctl { gap: 6px 14px; }
+html.android .ctl small { font-size: 13px; line-height: 1.4; }
+html.android select, html.android input:not([type=checkbox]) { font-size: 16px; min-height: 44px; padding: 8px 12px; min-width: 260px; border-radius: 4px; }
+html.android input.sw { width: 52px; height: 28px; border-radius: 14px; margin: 8px 0 0; }
+html.android input.sw::after { top: 3px; left: 3px; width: 22px; height: 22px; }
+html.android input.sw:checked::after { left: 27px; }
+html.android .plain { margin: 0 20px; font-size: 15px; }
+html.android .txtbtn { font-size: 15px; min-height: 36px; }
+html.android .btn { font-size: 15px; min-height: 44px; padding: 10px 20px; border-radius: 4px; }
+
+/* En línea / Ajustes */
+html.android #v-online, html.android #v-settings { padding: 14px 20px 30px; }
+html.android .signin { margin: 20px auto; max-width: 420px; gap: 12px; }
+html.android .signin h2 { font-size: 24px; }
+html.android .seek span { padding: 10px 16px; font-size: 15px; }
+html.android .conn { font-size: 14px; }
+html.android .split { height: auto; min-height: 0; grid-template-columns: 1fr; }
+html.android .modal .dlg { max-width: calc(100vw - 40px); max-height: calc(100vh - 40px); overflow-y: auto; }
+html.android #voice-bar, html.android #voice-opts { display: none !important; }   /* no voice chat on Android yet */

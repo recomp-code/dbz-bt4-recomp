@@ -1,0 +1,1535 @@
+diff -ruN a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+--- a/ps2xRuntime/CMakeLists.txt	2026-10-26 16:12:55
++++ b/ps2xRuntime/CMakeLists.txt	2026-10-26 16:12:55
+@@ -124,7 +124,14 @@
+     if(WIN32)
+         target_link_libraries(bt3gl PUBLIC opengl32 winmm)
+     else()
+-        find_package(OpenGL REQUIRED)
++        if(ANDROID)
++            if(NOT TARGET OpenGL::GL)
++                add_library(OpenGL::GL INTERFACE IMPORTED)
++                set_target_properties(OpenGL::GL PROPERTIES INTERFACE_LINK_LIBRARIES "GLESv3;EGL;log;android")
++            endif()
++        else()
++            find_package(OpenGL REQUIRED)
++        endif()
+         target_link_libraries(bt3gl PUBLIC OpenGL::GL ${CMAKE_DL_LIBS} pthread m)
+     endif()
+ 
+@@ -275,7 +282,14 @@
+     if(WIN32)
+         target_link_libraries(ps2xGlProbe PRIVATE bt3gl opengl32)
+     else()
+-        find_package(OpenGL REQUIRED)
++        if(ANDROID)
++            if(NOT TARGET OpenGL::GL)
++                add_library(OpenGL::GL INTERFACE IMPORTED)
++                set_target_properties(OpenGL::GL PROPERTIES INTERFACE_LINK_LIBRARIES "GLESv3;EGL;log;android")
++            endif()
++        else()
++            find_package(OpenGL REQUIRED)
++        endif()
+         target_link_libraries(ps2xGlProbe PRIVATE bt3gl OpenGL::GL ${CMAKE_DL_LIBS})
+     endif()
+     if(MSVC)
+@@ -776,6 +790,14 @@
+     src/lib/games_database.cpp
+ )
+ 
++if(ANDROID)
++    # [android] bionic gaps (backtrace, shm_open, affinity) stood in by one force-included header
++    target_compile_options(ps2_runtime PRIVATE "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/android/android_compat.h" -Wno-error=format-security)
++    target_sources(ps2_runtime PRIVATE android/gl_desktop_stubs.c android/gl_es_shim.cpp android/touch_pad.cpp android/perf_hint.cpp)
++    set_source_files_properties(android/gl_es_shim.cpp android/touch_pad.cpp android/perf_hint.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
++    set_source_files_properties(android/gl_desktop_stubs.c PROPERTIES LANGUAGE C COMPILE_OPTIONS "-xc")
++endif()
++
+ # Native Linux evdev reader for unmapped gamepads (xone driver).
+ if(UNIX AND NOT APPLE)
+     target_sources(ps2_runtime PRIVATE src/lib/pad_evdev_linux.cpp)
+@@ -848,10 +870,21 @@
+ if(WIN32)
+     set(RUNNER_RESOURCES "${CMAKE_CURRENT_SOURCE_DIR}/bt3.rc")
+ endif()
++if(ANDROID)
++    # [android] The runner is libmain.so, loaded by SDLActivity (Java), which calls SDL_main (android/android_main.cpp).
++    add_library(ps2EntryRunner SHARED
++        ${RUNNER_SRC_FILES}
++        android/android_main.cpp
++    )
++    set_target_properties(ps2EntryRunner PROPERTIES OUTPUT_NAME main)
++    target_link_options(ps2EntryRunner PRIVATE "-Wl,--wrap=SDL_GL_GetProcAddress" "-Wl,--wrap=glShaderSource" "-Wl,-u,JNI_OnLoad" "-Wl,-Bsymbolic")
++    set_source_files_properties(android/android_main.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
++else()
+ add_executable(ps2EntryRunner
+     ${RUNNER_SRC_FILES}
+     ${RUNNER_RESOURCES}
+ )
++endif()
+ 
+ # [r3000] Recompiled IOP modules are compiled straight into the runner (not a static lib) so
+ # their function-table registration objects are never dropped by the linker.
+@@ -930,7 +963,7 @@
+ endif()
+ 
+ # ARM can fuse multiply/add by default; guest VU math requires two roundings.
+-if(APPLE)
++if(APPLE OR ANDROID)
+     target_compile_options(ps2_runtime PRIVATE -ffp-contract=off)
+     target_compile_options(ps2EntryRunner PRIVATE -ffp-contract=off -fno-strict-aliasing -fwrapv)
+ endif()
+@@ -994,7 +1027,14 @@
+ if(WIN32)
+     target_link_libraries(ps2_runtime PUBLIC opengl32)
+ else()
+-    find_package(OpenGL REQUIRED)
++    if(ANDROID)
++            if(NOT TARGET OpenGL::GL)
++                add_library(OpenGL::GL INTERFACE IMPORTED)
++                set_target_properties(OpenGL::GL PROPERTIES INTERFACE_LINK_LIBRARIES "GLESv3;EGL;log;android")
++            endif()
++        else()
++            find_package(OpenGL REQUIRED)
++        endif()
+     target_link_libraries(ps2_runtime PUBLIC OpenGL::GL ${CMAKE_DL_LIBS})
+ endif()
+ 
+diff -ruN a/ps2xRuntime/android/android_compat.h b/ps2xRuntime/android/android_compat.h
+--- a/ps2xRuntime/android/android_compat.h	1969-12-31 18:00:00
++++ b/ps2xRuntime/android/android_compat.h	2026-10-26 16:12:55
+@@ -0,0 +1,24 @@
++// [android] Force-included on Android (-include): POSIX/glibc calls bionic lacks at the API level the runner targets.
++// Each one is a diagnostic or PCSX2-host-only path, so a harmless stand-in is enough.
++#pragma once
++#if defined(__ANDROID__)
++#include <errno.h>
++#include <sched.h>
++#include <pthread.h>
++#include <sys/types.h>
++#include <spawn.h>
++#if __ANDROID_API__ < 33
++static inline int backtrace(void **b, int n) { (void)b; (void)n; return 0; }
++static inline char **backtrace_symbols(void *const *b, int n) { (void)b; (void)n; return 0; }
++static inline void backtrace_symbols_fd(void *const *b, int n, int fd) { (void)b; (void)n; (void)fd; }
++#endif
++#if __ANDROID_API__ < 34
++static inline int posix_spawn_file_actions_addchdir_np(posix_spawn_file_actions_t *a, const char *p) { (void)a; (void)p; return 0; }
++#endif
++static inline int shm_open(const char *n, int f, mode_t m) { (void)n; (void)f; (void)m; errno = ENOSYS; return -1; }
++static inline int shm_unlink(const char *n) { (void)n; errno = ENOSYS; return -1; }
++#if defined(__cplusplus)   // cpu_set_t needs _GNU_SOURCE, which only C++ has by default
++static inline int pthread_setaffinity_np(pthread_t t, size_t n, const cpu_set_t *s) { return sched_setaffinity(pthread_gettid_np(t), n, s) == 0 ? 0 : errno; }
++static inline int pthread_getaffinity_np(pthread_t t, size_t n, cpu_set_t *s) { return sched_getaffinity(pthread_gettid_np(t), n, s) == 0 ? 0 : errno; }
++#endif
++#endif
+diff -ruN a/ps2xRuntime/android/android_main.cpp b/ps2xRuntime/android/android_main.cpp
+--- a/ps2xRuntime/android/android_main.cpp	1969-12-31 18:00:00
++++ b/ps2xRuntime/android/android_main.cpp	2026-10-26 16:12:55
+@@ -0,0 +1,107 @@
++// [android] Entry point: GameActivity (SDLActivity, Java) loads libmain.so and calls SDL_main. The runner's own main()
++// is reused. The launcher hands the game its environment through the activity (before SDL_main
++// runs: SDLActivity.nativeSetenv), including where to work and log:
++//   PS2X_ANDROID_CWD       the working folder (the runtime folder: assets/, savedata/, data/)
++//   PS2X_ANDROID_ELF       the boot ELF
++//   PS2X_ANDROID_LOG       stdout + stderr (the launcher's logs/juego.log)
++//   PS2X_ANDROID_PIDFILE   this process's id, written at start (the launcher follows it)
++//   PS2X_ANDROID_EXITFILE  the exit code, written when the game ends; then the process exits, as on the desktop
++// Without a launcher (development) the app's external files dir is used: env.txt there holds KEY=VALUE lines, log.txt
++// gets stderr, and the ELF is SLUS_216.78 there.
++#include <SDL.h>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <unistd.h>
++#include <android/log.h>
++
++extern "C" int ps2x_runner_main(int argc, char **argv) __asm__("main");
++#if defined(PS2X_PGO_GEN)
++extern "C" void __llvm_profile_set_filename(const char *);   // [pgo] the instrumented build's profile goes to the files dir
++#endif
++
++extern "C" { pid_t g_ps2xSdlMainTid = 0; }   // [adpf] the thread that runs the game's window, GL and present
++
++static bool envSet(const char *k)
++{
++    const char *v = getenv(k);
++    return v && v[0];
++}
++
++static void writeFile(const char *path, const std::string &text)
++{
++    if (!path || !path[0]) return;
++    if (FILE *f = std::fopen(path, "w")) { std::fputs(text.c_str(), f); std::fclose(f); }
++}
++
++extern "C" int SDL_main(int argc, char **argv)
++{
++    (void)argc; (void)argv;
++    g_ps2xSdlMainTid = gettid();
++    std::string dir, elf, log;
++    if (envSet("PS2X_ANDROID_CWD"))
++    {   // started by the launcher
++        dir = getenv("PS2X_ANDROID_CWD");
++        elf = envSet("PS2X_ANDROID_ELF") ? getenv("PS2X_ANDROID_ELF") : dir + "/data/SLUS_216.78";
++        log = envSet("PS2X_ANDROID_LOG") ? getenv("PS2X_ANDROID_LOG") : dir + "/juego.log";
++    }
++    else
++    {   // development: everything in the external files dir (adb push)
++        const char *x = SDL_AndroidGetExternalStoragePath();
++        if (!x) { __android_log_print(ANDROID_LOG_ERROR, "dbz", "no external storage: %s", SDL_GetError()); return 1; }
++        dir = x;
++        elf = dir + "/SLUS_216.78";
++        log = dir + "/log.txt";
++        if (FILE *f = std::fopen((dir + "/env.txt").c_str(), "r"))
++        {
++            char line[4096];
++            while (std::fgets(line, sizeof line, f))
++            {
++                size_t n = std::strlen(line);
++                while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
++                if (!n || line[0] == '#') continue;
++                char *eq = std::strchr(line, '=');
++                if (!eq) continue;
++                *eq = 0;
++                if (!std::strcmp(line, "ELF")) elf = eq + 1; else setenv(line, eq + 1, 1);
++            }
++            std::fclose(f);
++        }
++        std::freopen((dir + "/stdout.txt").c_str(), "w", stdout);
++    }
++    chdir(dir.c_str());
++    std::freopen(log.c_str(), "w", stderr);
++    if (envSet("PS2X_ANDROID_CWD")) std::freopen(log.c_str(), "a", stdout);
++    setvbuf(stderr, nullptr, _IONBF, 0);
++    setvbuf(stdout, nullptr, _IOLBF, 0);
++#if defined(PS2X_PGO_GEN)
++    static std::string s_prof = dir + "/pgo-%p.profraw";
++    __llvm_profile_set_filename(s_prof.c_str());
++#endif
++    if (!envSet("PS2X_EXEDIR")) setenv("PS2X_EXEDIR", dir.c_str(), 1);
++    // The window is the whole screen, in landscape, without system bars: the display's own size, unless set.
++    if (SDL_InitSubSystem(SDL_INIT_VIDEO) == 0)
++    {
++        SDL_DisplayMode dm;
++        if (SDL_GetDesktopDisplayMode(0, &dm) == 0 && dm.w > 0 && dm.h > 0)
++        {
++            const int w = dm.w > dm.h ? dm.w : dm.h, h = dm.w > dm.h ? dm.h : dm.w;
++            if (!envSet("PS2X_WINDOW_W")) setenv("PS2X_WINDOW_W", std::to_string(w).c_str(), 1);
++            if (!envSet("PS2X_WINDOW_H")) setenv("PS2X_WINDOW_H", std::to_string(h).c_str(), 1);
++        }
++    }
++    if (!envSet("PS2X_WINDOW_MODE")) setenv("PS2X_WINDOW_MODE", "2", 1);
++    // Lower audio latency: AAudio where the system has it (SDL falls back to OpenSL ES).
++    if (!envSet("SDL_AUDIODRIVER")) setenv("SDL_AUDIODRIVER", "aaudio,openslES", 1);
++    writeFile(getenv("PS2X_ANDROID_PIDFILE"), std::to_string(getpid()));
++    std::fprintf(stderr, "[android] dir=%s elf=%s\n", dir.c_str(), elf.c_str());
++    char arg0[] = "ps2EntryRunner";
++    char *args[] = { arg0, elf.data(), nullptr };
++    const int code = ps2x_runner_main(2, args);
++    // As on the desktop the game's end is its process's end: the launcher (another process) sees it go, and the next game
++    // starts from a clean process (the runtime keeps state in globals).
++    writeFile(getenv("PS2X_ANDROID_EXITFILE"), std::to_string(code));
++    std::fflush(nullptr);
++    _exit(code);
++}
+diff -ruN a/ps2xRuntime/android/gl_desktop_stubs.c b/ps2xRuntime/android/gl_desktop_stubs.c
+--- a/ps2xRuntime/android/gl_desktop_stubs.c	1969-12-31 18:00:00
++++ b/ps2xRuntime/android/gl_desktop_stubs.c	2026-10-26 16:12:55
+@@ -0,0 +1,12 @@
++// [android] Desktop-GL entry points the GL GS renderer (ps2_gs_gpu_renderer.cpp) calls directly. GLES 3 has none of
++// them; the native renderer never takes that path, so these only keep the link whole (and do the closest GLES thing).
++#include <GLES3/gl3.h>
++#include <string.h>
++void glClearDepth(double d) { glClearDepthf((float)d); }
++void glDrawBuffer(GLenum b) { glDrawBuffers(1, &b); }
++void glGetBufferSubData(GLenum t, GLintptr off, GLsizeiptr n, void *dst)
++{
++    void *p = glMapBufferRange(t, off, n, GL_MAP_READ_BIT);
++    if (p) { memcpy(dst, p, (size_t)n); glUnmapBuffer(t); }
++}
++void glGetTexImage(GLenum t, GLint lvl, GLenum fmt, GLenum type, void *px) { (void)t; (void)lvl; (void)fmt; (void)type; (void)px; }
+diff -ruN a/ps2xRuntime/android/gl_es_shim.cpp b/ps2xRuntime/android/gl_es_shim.cpp
+--- a/ps2xRuntime/android/gl_es_shim.cpp	1969-12-31 18:00:00
++++ b/ps2xRuntime/android/gl_es_shim.cpp	2026-10-26 16:12:55
+@@ -0,0 +1,112 @@
++// [android] Desktop GL 3.3 code on a GLES 3.2 context. Every GL loader in the runner (raylib's glad, gsrl's glad, gfx/gl)
++// asks SDL_GL_GetProcAddress, wrapped here at link time (-Wl,--wrap): glShaderSource rewrites the "#version" line to
++// GLSL ES with default precisions, and the few desktop-only entry points get the closest GLES equivalent.
++#include <SDL.h>
++#include <GLES3/gl32.h>
++#include <cstdio>
++#include <cstring>
++#include <regex>
++#include <string>
++#include <vector>
++
++extern "C" void *__real_SDL_GL_GetProcAddress(const char *name);
++extern "C" void __real_glShaderSource(GLuint, GLsizei, const GLchar *const *, const GLint *);
++
++namespace
++{
++    using ShaderSourceFn = void (*)(GLuint, GLsizei, const GLchar *const *, const GLint *);
++    ShaderSourceFn s_realShaderSource = nullptr;
++
++    std::string toEs(std::string src)
++    {
++        const size_t v = src.find("#version");
++        std::string ver;
++        size_t end = 0;
++        if (v != std::string::npos) { end = src.find('\n', v); if (end == std::string::npos) end = src.size(); ver = src.substr(v, end - v); }
++        const bool legacy = ver.find("100") != std::string::npos || ver.find("110") != std::string::npos || ver.find("120") != std::string::npos;
++        if (ver.find(" es") != std::string::npos) return src;   // already GLSL ES
++        static std::string esVer;   // the newest GLSL ES the context takes: "320 es" / "310 es" / "300 es"
++        if (esVer.empty())
++        {
++            const char *sl = reinterpret_cast<const char *>(glGetString(GL_SHADING_LANGUAGE_VERSION));
++            esVer = sl && std::strstr(sl, "3.20") ? "320 es" : sl && std::strstr(sl, "3.10") ? "310 es" : "300 es";
++            std::fprintf(stderr, "[android] GL %s, GLSL %s -> #version %s\n", glGetString(GL_VERSION), sl ? sl : "?", esVer.c_str());
++        }
++        std::string head = legacy ? "#version 100\n" : "#version " + esVer + "\n";
++        std::string prec = "precision highp float;\nprecision highp int;\nprecision highp sampler2D;\n";
++        if (!legacy) prec += "precision highp usampler2D;\nprecision highp isampler2D;\nprecision highp sampler2DArray;\nprecision highp sampler3D;\n";
++        // Dual-source blending (the GS shader's "index = 1" output): GL_EXT_blend_func_extended where the GPU has it
++        // (most Adreno), otherwise the second output becomes a plain variable and SRC1 blends read garbage (degraded).
++        if (src.find("index") != std::string::npos && std::regex_search(src, std::regex("index\\s*=\\s*[01]")))
++        {
++            static int dual = -1;
++            if (dual < 0)
++            {
++                const char *ex = reinterpret_cast<const char *>(glGetString(GL_EXTENSIONS));
++                dual = ex && std::strstr(ex, "GL_EXT_blend_func_extended") ? 1 : 0;
++                std::fprintf(stderr, "[android] dual-source blend: %s\n", dual ? "GL_EXT_blend_func_extended" : "NOT supported (degraded)");
++            }
++            if (dual) head += "#extension GL_EXT_blend_func_extended : require\n";
++            else
++            {
++                src = std::regex_replace(src, std::regex("layout\\s*\\(\\s*location\\s*=\\s*0\\s*,\\s*index\\s*=\\s*1\\s*\\)\\s*out\\s+"), "");
++                src = std::regex_replace(src, std::regex(",\\s*index\\s*=\\s*0\\s*"), "");
++            }
++        }
++        // "#version" first, then every #extension (the shader's own move up; desktop GL_ARB_* ones are dropped), and only
++        // then the precisions: GLSL ES takes no #extension after a declaration
++        for (size_t p = src.find("#extension"); p != std::string::npos; p = src.find("#extension", p))
++        {
++            size_t e = src.find('\n', p);
++            if (e == std::string::npos) e = src.size();
++            const std::string line = src.substr(p, e - p);
++            if (line.find("GL_ARB_") == std::string::npos) head += line + "\n";
++            src.erase(p, e - p);
++        }
++        head += prec;
++        if (v == std::string::npos) return head + src;
++        return head + src.substr(0, v) + src.substr(end);
++    }
++
++    void shaderSource(GLuint sh, GLsizei count, const GLchar *const *str, const GLint *len)
++    {
++        std::string all;
++        for (GLsizei i = 0; i < count; ++i) all.append(str[i], len && len[i] >= 0 ? size_t(len[i]) : std::strlen(str[i]));
++        std::string es = toEs(all);
++        const GLchar *p = es.c_str();
++        s_realShaderSource(sh, 1, &p, nullptr);
++    }
++
++    void clearDepth(double d) { glClearDepthf(float(d)); }
++    void drawBuffer(GLenum b) { glDrawBuffers(1, &b); }
++    void polygonMode(GLenum, GLenum) {}
++    void getTexImage(GLenum, GLint, GLenum, GLenum, void *) {}
++    void getBufferSubData(GLenum t, GLintptr off, GLsizeiptr n, void *dst)
++    {
++        if (void *p = glMapBufferRange(t, off, n, GL_MAP_READ_BIT)) { std::memcpy(dst, p, size_t(n)); glUnmapBuffer(t); }
++    }
++}
++
++extern "C" void *__wrap_SDL_GL_GetProcAddress(const char *name)
++{
++    if (!name) return nullptr;
++    if (!std::strcmp(name, "glShaderSource"))
++    {
++        if (!s_realShaderSource) s_realShaderSource = reinterpret_cast<ShaderSourceFn>(__real_SDL_GL_GetProcAddress(name));
++        return reinterpret_cast<void *>(&shaderSource);
++    }
++    if (!std::strcmp(name, "glClearDepth")) return reinterpret_cast<void *>(&clearDepth);
++    if (!std::strcmp(name, "glDrawBuffer")) return reinterpret_cast<void *>(&drawBuffer);
++    if (!std::strcmp(name, "glPolygonMode")) return reinterpret_cast<void *>(&polygonMode);
++    if (!std::strcmp(name, "glGetTexImage")) return reinterpret_cast<void *>(&getTexImage);
++    if (!std::strcmp(name, "glGetBufferSubData")) return reinterpret_cast<void *>(&getBufferSubData);
++    return __real_SDL_GL_GetProcAddress(name);
++}
++
++// ImGui's GLES3 backend (and anything else linked straight to libGLESv3) calls glShaderSource directly: -Wl,--wrap sends
++// those calls through the same rewrite.
++extern "C" void __wrap_glShaderSource(GLuint sh, GLsizei count, const GLchar *const *str, const GLint *len)
++{
++    if (!s_realShaderSource) s_realShaderSource = &__real_glShaderSource;
++    shaderSource(sh, count, str, len);
++}
+diff -ruN a/ps2xRuntime/android/perf_hint.cpp b/ps2xRuntime/android/perf_hint.cpp
+--- a/ps2xRuntime/android/perf_hint.cpp	1969-12-31 18:00:00
++++ b/ps2xRuntime/android/perf_hint.cpp	2026-10-26 16:12:55
+@@ -0,0 +1,84 @@
++// [android] ADPF (Android Dynamic Performance Framework, API 33+): once per game frame the guest thread reports how long
++// the frame took against its budget (16.7 ms at 60 fps, 33.3 at 30), so the system raises clocks / moves the game's
++// threads to the big cores BEFORE frames are missed. The duration is the wall time from one frame to the next minus the
++// deliberate pacing wait: it includes the stalls on the other guest threads and the GS, which a thread's CPU time does
++// not -- reporting CPU time read "under budget" while the frame took 20 ms, and the governor kept the cores at ~1 GHz.
++// The session holds the guest thread and the SDL main thread (GL + present). Loaded by name: Android 12 lacks it.
++// PS2X_ADPF=0 turns it off.
++#include <android/log.h>
++#include <dlfcn.h>
++#include <time.h>
++#include <unistd.h>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++
++struct APerformanceHintManager;
++struct APerformanceHintSession;
++
++extern "C" pid_t g_ps2xSdlMainTid;   // android_main.cpp
++
++namespace
++{
++    using GetManagerFn = APerformanceHintManager *(*)();
++    using CreateSessionFn = APerformanceHintSession *(*)(APerformanceHintManager *, const int32_t *, size_t, int64_t);
++    using UpdateTargetFn = int (*)(APerformanceHintSession *, int64_t);
++    using ReportFn = int (*)(APerformanceHintSession *, int64_t);
++
++    struct Hint
++    {
++        bool tried = false;
++        APerformanceHintSession *session = nullptr;
++        UpdateTargetFn update = nullptr;
++        ReportFn report = nullptr;
++        int64_t target = 0, lastCpu = 0, lastWall = 0;
++        double period = 0.0;   // smoothed wall time between kicks, ns
++    };
++    thread_local Hint t_hint;   // only the guest thread reports
++
++    int64_t nowNs(clockid_t c)
++    {
++        timespec t;
++        clock_gettime(c, &t);
++        return int64_t(t.tv_sec) * 1000000000LL + t.tv_nsec;
++    }
++}
++
++extern "C" void ps2xAndroidFrameHint(uint64_t pacingWaitNs)
++{
++    Hint &h = t_hint;
++    const int64_t cpu = nowNs(CLOCK_THREAD_CPUTIME_ID), wall = nowNs(CLOCK_MONOTONIC);
++    if (!h.tried)
++    {
++        h.tried = true;
++        h.lastCpu = cpu; h.lastWall = wall;
++        const char *v = std::getenv("PS2X_ADPF");
++        if (v && v[0] == '0') return;
++        void *lib = dlopen("libandroid.so", RTLD_NOW);
++        auto getManager = lib ? reinterpret_cast<GetManagerFn>(dlsym(lib, "APerformanceHint_getManager")) : nullptr;
++        auto create = lib ? reinterpret_cast<CreateSessionFn>(dlsym(lib, "APerformanceHint_createSession")) : nullptr;
++        h.update = lib ? reinterpret_cast<UpdateTargetFn>(dlsym(lib, "APerformanceHint_updateTargetWorkDuration")) : nullptr;
++        h.report = lib ? reinterpret_cast<ReportFn>(dlsym(lib, "APerformanceHint_reportActualWorkDuration")) : nullptr;
++        APerformanceHintManager *m = getManager ? getManager() : nullptr;
++        if (!m || !create || !h.update || !h.report)
++        {
++            std::fprintf(stderr, "[adpf] not available on this system\n");
++            return;
++        }
++        int32_t tids[2] = { gettid(), g_ps2xSdlMainTid };
++        const size_t n = (tids[1] > 0 && tids[1] != tids[0]) ? 2 : 1;
++        h.target = 16666667;
++        h.session = create(m, tids, n, h.target);
++        std::fprintf(stderr, "[adpf] session %s (%zu threads)\n", h.session ? "on" : "refused", n);
++        return;
++    }
++    if (!h.session) return;
++    const int64_t dt = wall - h.lastWall;
++    h.lastCpu = cpu; h.lastWall = wall;
++    if (dt <= 0 || dt > 200000000LL) return;   // a pause (loading, the app in the background): not a frame
++    h.period = h.period > 0.0 ? h.period * 0.9 + double(dt) * 0.1 : double(dt);
++    const int64_t want = h.period < 25000000.0 ? 16666667 : 33333333;   // the game runs at 60 or at 30
++    if (want != h.target) { h.target = want; h.update(h.session, want); }
++    const int64_t work = dt - int64_t(pacingWaitNs);
++    if (work > 0) h.report(h.session, work);
++}
+diff -ruN a/ps2xRuntime/android/touch_pad.cpp b/ps2xRuntime/android/touch_pad.cpp
+--- a/ps2xRuntime/android/touch_pad.cpp	1969-12-31 18:00:00
++++ b/ps2xRuntime/android/touch_pad.cpp	2026-10-26 16:12:55
+@@ -0,0 +1,238 @@
++// [android] On-screen touch controls: a floating left stick, the D-pad, the four face buttons, L1/L2/R1/R2, L3/R3,
++// Select/Start and a menu button (the settings overlay). Fingers arrive as SDL touch events (an event watch, so nothing
++// is consumed); pad_config's poll() ORs the result into player 1's packet; the settings overlay draws the layout with
++// ImGui. The controls hide while a game controller is connected and come back at the next touch.
++#include <SDL.h>
++#include "imgui.h"
++#include <algorithm>
++#include <atomic>
++#include <cmath>
++#include <cstdint>
++#include <mutex>
++
++namespace
++{
++    // PadAction order (= the PS2 button bit order): bit i of the mask is PadAction i.
++    enum Btn : int { Select = 0, L3, R3, Start, Up, Right, Down, Left, L2, R2, L1, R1, Triangle, Circle, Cross, Square, Menu = 16 };
++
++    struct Shape { int btn; float x, y, r; bool rect; float w, h; const char *label; };
++
++    struct Finger { SDL_FingerID id = 0; bool used = false; bool stick = false; int btn = -1; float ox = 0, oy = 0; uint32_t t0 = 0; };
++    uint32_t g_hold[16] = {};   // [minpress] a button stays down until this SDL tick: a tap shorter than a frame still registers
++
++    std::mutex g_m;
++    Finger g_f[10];
++    float g_lx = 0.0f, g_ly = 0.0f;
++    float g_stickX = -1.0f, g_stickY = -1.0f;   // the floating stick's origin while held (pixels), -1 = at rest
++    uint32_t g_mask = 0;
++    std::atomic<bool> g_menuEdge{false};
++    std::atomic<bool> g_visible{true};
++    std::atomic<int> g_w{0}, g_h{0};
++    bool g_watching = false;
++
++    // Layout in pixels for a W x H landscape screen; sizes scale with H. The top band (~14% of the height) is the game's
++    // HUD (health, ki, the timer): nothing goes there. Shoulders under it at the sides, Select / menu / Start and L3 / R3
++    // along the bottom edge, the D-pad and the stick on the left, the face buttons on the right.
++    int layout(Shape *s, float W, float H)
++    {
++        int n = 0;
++        const float r = 0.075f * H, d = 0.145f * H;
++        const float fx = W - 0.30f * H, fy = H - 0.30f * H;   // face buttons
++        s[n++] = {Triangle, fx, fy - d, r, false, 0, 0, ""};
++        s[n++] = {Cross, fx, fy + d, r, false, 0, 0, ""};
++        s[n++] = {Square, fx - d, fy, r, false, 0, 0, ""};
++        s[n++] = {Circle, fx + d, fy, r, false, 0, 0, ""};
++        const float px = 0.26f * H, py = 0.47f * H, pd = 0.09f * H, pr = 0.058f * H;   // D-pad
++        s[n++] = {Up, px, py - pd, pr, false, 0, 0, ""};
++        s[n++] = {Down, px, py + pd, pr, false, 0, 0, ""};
++        s[n++] = {Left, px - pd, py, pr, false, 0, 0, ""};
++        s[n++] = {Right, px + pd, py, pr, false, 0, 0, ""};
++        const float sw = 0.20f * H, sh = 0.075f * H, m = 0.03f * H, top = 0.16f * H;   // shoulders, under the HUD
++        s[n++] = {L2, m + sw * 0.5f, top + sh * 0.5f, 0, true, sw, sh, "L2"};
++        s[n++] = {L1, m + sw * 0.5f, top + m + sh * 1.5f, 0, true, sw, sh, "L1"};
++        s[n++] = {R2, W - m - sw * 0.5f, top + sh * 0.5f, 0, true, sw, sh, "R2"};
++        s[n++] = {R1, W - m - sw * 0.5f, top + m + sh * 1.5f, 0, true, sw, sh, "R1"};
++        const float tw = 0.15f * H, th = 0.065f * H, by = H - m - th * 0.5f;   // the bottom row
++        s[n++] = {Select, W * 0.5f - 0.20f * H, by, 0, true, tw, th, "SELECT"};
++        s[n++] = {Menu, W * 0.5f, by, 0, true, tw * 0.7f, th, ""};
++        s[n++] = {Start, W * 0.5f + 0.20f * H, by, 0, true, tw, th, "START"};
++        s[n++] = {L3, W * 0.5f - 0.40f * H, by, 0, true, tw * 0.8f, th, "L3"};
++        s[n++] = {R3, W * 0.5f + 0.40f * H, by, 0, true, tw * 0.8f, th, "R3"};
++        return n;
++    }
++
++    bool inStickZone(float x, float y, float W, float H) { return x < W * 0.40f && y > H * 0.58f; }
++
++    int hit(float x, float y, float W, float H)
++    {
++        Shape s[24];
++        const int n = layout(s, W, H);
++        int best = -1; float bestD = 1e9f;
++        for (int i = 0; i < n; ++i)
++        {
++            if (s[i].rect)
++            {
++                if (std::fabs(x - s[i].x) <= s[i].w * 0.5f + 0.02f * H && std::fabs(y - s[i].y) <= s[i].h * 0.5f + 0.02f * H) return s[i].btn;
++                continue;
++            }
++            const float dd = std::hypot(x - s[i].x, y - s[i].y);
++            if (dd <= s[i].r * 1.35f && dd < bestD) { bestD = dd; best = s[i].btn; }   // a generous target: thumbs are wide
++        }
++        return best;
++    }
++
++    void recompute()
++    {
++        const float W = float(g_w.load()), H = float(g_h.load());
++        uint32_t mask = 0;
++        float lx = 0, ly = 0;
++        bool stick = false;
++        for (const Finger &f : g_f)
++        {
++            if (!f.used) continue;
++            if (f.stick)
++            {
++                stick = true;
++                const float R = 0.13f * H;
++                float dx = (f.ox - g_stickX) / R, dy = (f.oy - g_stickY) / R;
++                const float len = std::hypot(dx, dy);
++                if (len > 1.0f) { dx /= len; dy /= len; }
++                if (len < 0.15f) { dx = 0; dy = 0; }
++                lx = dx; ly = dy;
++            }
++            else if (f.btn >= 0 && f.btn < 16) mask |= 1u << f.btn;
++        }
++        if (!stick) { g_stickX = -1.0f; g_stickY = -1.0f; }
++        g_mask = mask; g_lx = lx; g_ly = ly;
++    }
++
++    int watch(void *, SDL_Event *e)
++    {
++        if (e->type == SDL_CONTROLLERDEVICEADDED) { g_visible = false; return 0; }
++        if (e->type != SDL_FINGERDOWN && e->type != SDL_FINGERUP && e->type != SDL_FINGERMOTION) return 0;
++        const float W = float(g_w.load()), H = float(g_h.load());
++        if (W <= 0 || H <= 0) return 0;
++        const float x = e->tfinger.x * W, y = e->tfinger.y * H;
++        std::lock_guard<std::mutex> lk(g_m);
++        if (e->type == SDL_FINGERDOWN)
++        {
++            g_visible = true;
++            Finger *f = nullptr;
++            for (Finger &c : g_f) if (!c.used) { f = &c; break; }
++            if (!f) return 0;
++            *f = Finger{};
++            f->used = true; f->id = e->tfinger.fingerId; f->ox = x; f->oy = y; f->t0 = SDL_GetTicks();
++            f->btn = hit(x, y, W, H);
++            if (f->btn == Menu) { g_menuEdge = true; f->btn = -1; }
++            else if (f->btn < 0 && inStickZone(x, y, W, H) && g_stickX < 0) { f->stick = true; g_stickX = x; g_stickY = y; }
++        }
++        else
++        {
++            for (Finger &f : g_f)
++            {
++                if (!f.used || f.id != e->tfinger.fingerId) continue;
++                if (e->type == SDL_FINGERUP)
++                {
++                    if (f.btn >= 0 && f.btn < 16) g_hold[f.btn] = f.t0 + 70u;
++                    f.used = false;
++                    break;
++                }
++                f.ox = x; f.oy = y;
++                if (!f.stick)
++                {   // sliding between buttons follows the thumb (a roll from Square to Cross, ...)
++                    const int b = hit(x, y, W, H);
++                    if (b >= 0 && b < 16) f.btn = b;
++                }
++                break;
++            }
++        }
++        recompute();
++        return 0;
++    }
++}
++
++// The state for player 1: a mask of PadAction bits 0..15 and the left stick in -1..1. False while hidden.
++extern "C" bool ps2xTouchState(uint32_t *mask, float *lx, float *ly)
++{
++    if (!g_watching || !g_visible.load()) return false;
++    std::lock_guard<std::mutex> lk(g_m);
++    uint32_t m = g_mask;
++    const uint32_t now = SDL_GetTicks();
++    for (int b = 0; b < 16; ++b) if (g_hold[b] && SDL_TICKS_PASSED(g_hold[b], now) == 0) m |= 1u << b; else g_hold[b] = 0;
++    *mask = m; *lx = g_lx; *ly = g_ly;
++    return true;
++}
++
++extern "C" bool ps2xTouchVisible() { return g_visible.load(); }
++
++// One tap of the menu button since the last call (the overlay toggles its panel).
++extern "C" bool ps2xTouchTakeMenu() { return g_menuEdge.exchange(false); }
++
++// Inside an ImGui frame: the layout on the foreground draw list, pressed buttons brighter.
++extern "C" void ps2xTouchDraw()
++{
++    if (!g_watching) { SDL_AddEventWatch(&watch, nullptr); g_watching = true; }
++    const ImVec2 ds = ImGui::GetIO().DisplaySize;
++    const float fbx = ImGui::GetIO().DisplayFramebufferScale.x > 0 ? ImGui::GetIO().DisplayFramebufferScale.x : 1.0f;
++    (void)fbx;
++    // Touch coordinates are normalized to the window: track it in the same logical units ImGui draws in.
++    g_w = int(ds.x); g_h = int(ds.y);
++    if (!g_visible.load() || ds.x <= 0 || ds.y <= 0) return;
++    uint32_t mask; float sx, sy;
++    {
++        std::lock_guard<std::mutex> lk(g_m);
++        mask = g_mask; sx = g_stickX; sy = g_stickY;
++    }
++    ImDrawList *dl = ImGui::GetForegroundDrawList();
++    const float W = ds.x, H = ds.y;
++    const ImU32 fill = IM_COL32(255, 255, 255, 38), fillOn = IM_COL32(255, 200, 60, 110), edge = IM_COL32(255, 255, 255, 90),
++                text = IM_COL32(255, 255, 255, 170);
++    Shape s[24];
++    const int n = layout(s, W, H);
++    for (int i = 0; i < n; ++i)
++    {
++        const bool on = s[i].btn < 16 && (mask >> s[i].btn) & 1u;
++        if (s[i].rect)
++        {
++            const ImVec2 a(s[i].x - s[i].w * 0.5f, s[i].y - s[i].h * 0.5f), b(s[i].x + s[i].w * 0.5f, s[i].y + s[i].h * 0.5f);
++            dl->AddRectFilled(a, b, on ? fillOn : fill, s[i].h * 0.5f);
++            dl->AddRect(a, b, edge, s[i].h * 0.5f, 0, 2.0f);
++        }
++        else
++        {
++            dl->AddCircleFilled(ImVec2(s[i].x, s[i].y), s[i].r, on ? fillOn : fill, 32);
++            dl->AddCircle(ImVec2(s[i].x, s[i].y), s[i].r, edge, 32, 2.0f);
++        }
++        {   // the PlayStation symbols and arrows as shapes (the overlay fonts have no such glyphs)
++            const float cx = s[i].x, cy = s[i].y, g = (s[i].rect ? s[i].h : s[i].r) * 0.42f, t = 2.5f;
++            const ImU32 c = text;
++            switch (s[i].btn)
++            {
++            case Triangle: dl->AddTriangle(ImVec2(cx, cy - g), ImVec2(cx - g * 1.05f, cy + g * 0.75f), ImVec2(cx + g * 1.05f, cy + g * 0.75f), IM_COL32(120, 230, 190, 220), t); break;
++            case Circle: dl->AddCircle(ImVec2(cx, cy), g, IM_COL32(240, 110, 110, 220), 24, t); break;
++            case Square: dl->AddRect(ImVec2(cx - g * 0.8f, cy - g * 0.8f), ImVec2(cx + g * 0.8f, cy + g * 0.8f), IM_COL32(230, 150, 220, 220), 0, 0, t); break;
++            case Cross: dl->AddLine(ImVec2(cx - g, cy - g), ImVec2(cx + g, cy + g), IM_COL32(130, 170, 250, 220), t);
++                        dl->AddLine(ImVec2(cx - g, cy + g), ImVec2(cx + g, cy - g), IM_COL32(130, 170, 250, 220), t); break;
++            case Up: dl->AddTriangleFilled(ImVec2(cx, cy - g), ImVec2(cx - g, cy + g * 0.6f), ImVec2(cx + g, cy + g * 0.6f), c); break;
++            case Down: dl->AddTriangleFilled(ImVec2(cx, cy + g), ImVec2(cx + g, cy - g * 0.6f), ImVec2(cx - g, cy - g * 0.6f), c); break;
++            case Left: dl->AddTriangleFilled(ImVec2(cx - g, cy), ImVec2(cx + g * 0.6f, cy + g), ImVec2(cx + g * 0.6f, cy - g), c); break;
++            case Right: dl->AddTriangleFilled(ImVec2(cx + g, cy), ImVec2(cx - g * 0.6f, cy - g), ImVec2(cx - g * 0.6f, cy + g), c); break;
++            case Menu: for (int k = -1; k <= 1; ++k) dl->AddLine(ImVec2(cx - g, cy + k * g * 0.6f), ImVec2(cx + g, cy + k * g * 0.6f), c, t); break;
++            default: break;
++            }
++        }
++        if (!s[i].label[0]) continue;
++        const float fs = (s[i].rect ? s[i].h * 0.5f : s[i].r * 0.8f);
++        ImFont *font = ImGui::GetFont();
++        const ImVec2 ts = font->CalcTextSizeA(fs, 1e9f, 0.0f, s[i].label);
++        dl->AddText(font, fs, ImVec2(s[i].x - ts.x * 0.5f, s[i].y - ts.y * 0.5f), text, s[i].label);
++    }
++    // The stick: its base where the thumb landed (or at rest), the knob at the deflection.
++    const float R = 0.13f * H;
++    const float bx = sx >= 0 ? sx : 0.40f * H, by = sx >= 0 ? sy : H - 0.25f * H;
++    float lx, ly;
++    { std::lock_guard<std::mutex> lk(g_m); lx = g_lx; ly = g_ly; }
++    dl->AddCircleFilled(ImVec2(bx, by), R, IM_COL32(255, 255, 255, 25), 48);
++    dl->AddCircle(ImVec2(bx, by), R, edge, 48, 2.0f);
++    dl->AddCircleFilled(ImVec2(bx + lx * R, by + ly * R), R * 0.45f, sx >= 0 ? fillOn : IM_COL32(255, 255, 255, 60), 32);
++}
+diff -ruN a/ps2xRuntime/src/lib/game_overrides.cpp b/ps2xRuntime/src/lib/game_overrides.cpp
+--- a/ps2xRuntime/src/lib/game_overrides.cpp	2026-10-26 16:12:55
++++ b/ps2xRuntime/src/lib/game_overrides.cpp	2026-10-26 16:12:55
+@@ -129,6 +129,10 @@
+ #include <vector>
+ #include <unordered_map>
+ #include <cstring>
++#if defined(__ANDROID__)
++extern "C" void ps2xAndroidFrameHint(uint64_t pacingWaitNs);   // [adpf] android/perf_hint.cpp
++static thread_local uint64_t t_ps2xPacingWaitNs = 0;   // [adpf] this frame's deliberate pacing wait (the frame gate)
++#endif
+ #include <cstdlib>   // [skipforce] std::strtoul
+ 
+ // [wlk] overlay-table externs (file scope — block-scope extern inside the anon namespace mislinks)
+@@ -7360,12 +7364,18 @@
+                 // Bounded: never wait more than ~50 ms, so a stalled vblank worker cannot hang
+                 // the guest (the failure mode I wrongly suspected of [asyncpace] earlier tonight).
+                 Ps2xWaitScope wgate(WP_FRAMEGATE);   // [waitprof]
++#if defined(__ANDROID__)
++                const auto gate0 = std::chrono::steady_clock::now();
++#endif
+                 for (int i = 0; i < 50; ++i)
+                 {
+                     const uint64_t now = ps2_syscalls::GetCurrentVSyncTick();
+                     if (now >= want || now < s_lastTick) break;   // reached it, or counter reset
+                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                 }
++#if defined(__ANDROID__)
++                t_ps2xPacingWaitNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - gate0).count();
++#endif
+                 s_lastTick = ps2_syscalls::GetCurrentVSyncTick();
+             }
+         }
+@@ -7379,6 +7389,10 @@
+             struct timespec tg; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &tg);
+             g_guestThreadCpuNs.store((uint64_t)tg.tv_sec * 1000000000ull + (uint64_t)tg.tv_nsec,
+                                      std::memory_order_relaxed);
++#endif
++#if defined(__ANDROID__)
++            ps2xAndroidFrameHint(t_ps2xPacingWaitNs);   // [adpf] this frame's work to the system
++            t_ps2xPacingWaitNs = 0;
+ #endif
+         }
+         {   // [init114] lifecycle: periodic read of the resident texture table rec0/rec14 ptrs
+diff -ruN a/ps2xRuntime/src/lib/pad_config.cpp b/ps2xRuntime/src/lib/pad_config.cpp
+--- a/ps2xRuntime/src/lib/pad_config.cpp	2026-10-26 16:12:55
++++ b/ps2xRuntime/src/lib/pad_config.cpp	2026-10-26 16:12:55
+@@ -26,6 +26,32 @@
+ #include <vector>
+ #include <algorithm>
+ 
++#if defined(__ANDROID__)
++extern "C" bool ps2xTouchState(uint32_t *mask, float *lx, float *ly);   // [android] android/touch_pad.cpp
++#endif
++namespace
++{
++    // [android] The on-screen touch controls drive player 1 on top of whatever else does.
++    inline ps2_stubs::PadPacket touchMerged(ps2_stubs::PadPacket pkt, size_t player)
++    {
++#if defined(__ANDROID__)
++        uint32_t mask = 0; float lx = 0.0f, ly = 0.0f;
++        if (player == 0 && ps2xTouchState(&mask, &lx, &ly))
++        {
++            pkt.buttons = static_cast<uint16_t>(pkt.buttons & ~mask);
++            if (lx != 0.0f || ly != 0.0f)
++            {
++                pkt.lx = static_cast<uint8_t>(std::clamp(128.0f + lx * 127.0f, 0.0f, 255.0f));
++                pkt.ly = static_cast<uint8_t>(std::clamp(128.0f + ly * 127.0f, 0.0f, 255.0f));
++            }
++        }
++#else
++        (void)player;
++#endif
++        return pkt;
++    }
++}
++
+ namespace ps2_stubs
+ {
+     namespace
+@@ -1153,7 +1179,7 @@
+         if (anyPad)
+         {
+             pollLegacyAuto(pkt, player);
+-            return pkt;
++            return touchMerged(pkt, player);
+         }
+ 
+         std::vector<int> pads;
+@@ -1412,7 +1438,7 @@
+             pkt.rx = floatToByte(rx);
+             pkt.ry = floatToByte(ry);
+         }
+-        return pkt;
++        return touchMerged(pkt, player);
+     }
+ }
+ 
+diff -ruN a/ps2xRuntime/src/lib/ps2_fiber.cpp b/ps2xRuntime/src/lib/ps2_fiber.cpp
+--- a/ps2xRuntime/src/lib/ps2_fiber.cpp	2026-10-26 16:12:55
++++ b/ps2xRuntime/src/lib/ps2_fiber.cpp	2026-10-26 16:12:55
+@@ -18,7 +18,14 @@
+ #  define WIN32_LEAN_AND_MEAN
+ #  include <windows.h>
+ #  define PS2X_FIBER_WIN 1
+-#elif (defined(__APPLE__) || defined(__linux__) || defined(__unix__)) && !defined(__EMSCRIPTEN__)   // [web] no ucontext in wasm
++#elif defined(__ANDROID__) && defined(__aarch64__)
++// [android] bionic has no makecontext/swapcontext: a hand-written AArch64 switch (ps2xCtxSwitch below). A parked
++// fiber's whole context -- the AAPCS64 callee-saved registers -- sits on its own stack, so the stack pointer IS the
++// context and a rollback snapshot is just the live stack.
++#  include <sys/mman.h>
++#  include <unistd.h>
++#  define PS2X_FIBER_ASM 1
++#elif (defined(__APPLE__) || defined(__linux__) || defined(__unix__)) && !defined(__EMSCRIPTEN__) && !defined(__ANDROID__)   // [web] no ucontext in wasm; [android] bionic has no makecontext
+ // ucontext is deprecated on macOS but still present and functional; silence the deprecation there
+ // rather than carrying a third backend.
+ #  include <ucontext.h>
+@@ -45,9 +52,65 @@
+     void    *handle = nullptr;      // LPVOID fiber
+ #elif defined(PS2X_FIBER_UCTX)
+     ucontext_t ctx{};
++#elif defined(PS2X_FIBER_ASM)
++    void    *sp = nullptr;          // saved stack pointer while parked (x19..x30 + d8..d15 stored just above it)
+ #endif
+ };
+ 
++#if defined(PS2X_FIBER_ASM)
++// ps2xCtxSwitch(&from->sp, to->sp): push the callee-saved registers, park the stack pointer, adopt the other one, pop.
++// A new fiber's stack is laid out as if it had parked in here, with x30 = ps2xCtxStart and x19 = the fiber.
++extern "C" void ps2xCtxSwitch(void **fromSp, void *toSp);
++extern "C" void ps2xCtxStart();
++static constexpr size_t kCtxFrame = 176;   // 12 GPRs + 8 FP regs, 16-byte aligned
++asm(R"(
++    .text
++    .p2align 4
++    .globl ps2xCtxSwitch
++    .hidden ps2xCtxSwitch
++    .type ps2xCtxSwitch, %function
++ps2xCtxSwitch:
++    sub sp, sp, #176
++    stp x19, x20, [sp, #0]
++    stp x21, x22, [sp, #16]
++    stp x23, x24, [sp, #32]
++    stp x25, x26, [sp, #48]
++    stp x27, x28, [sp, #64]
++    stp x29, x30, [sp, #80]
++    stp d8, d9, [sp, #96]
++    stp d10, d11, [sp, #112]
++    stp d12, d13, [sp, #128]
++    stp d14, d15, [sp, #144]
++    mov x9, sp
++    str x9, [x0]
++    mov sp, x1
++    ldp x19, x20, [sp, #0]
++    ldp x21, x22, [sp, #16]
++    ldp x23, x24, [sp, #32]
++    ldp x25, x26, [sp, #48]
++    ldp x27, x28, [sp, #64]
++    ldp x29, x30, [sp, #80]
++    ldp d8, d9, [sp, #96]
++    ldp d10, d11, [sp, #112]
++    ldp d12, d13, [sp, #128]
++    ldp d14, d15, [sp, #144]
++    add sp, sp, #176
++    ret
++    .size ps2xCtxSwitch, .-ps2xCtxSwitch
++
++    .p2align 4
++    .globl ps2xCtxStart
++    .hidden ps2xCtxStart
++    .type ps2xCtxStart, %function
++ps2xCtxStart:
++    mov x29, #0
++    mov x0, x19
++    bl ps2xFiberAsmEntry
++    brk #0
++    .size ps2xCtxStart, .-ps2xCtxStart
++)");
++#endif
++
+ bool ps2xFiberSupported()
+ {
+ #if defined(PS2X_FIBER_NONE)
+@@ -67,6 +130,13 @@
+     std::fprintf(stderr, "[fibers] FATAL: fiber entry returned\n");
+     std::abort();
+ }
++#elif defined(PS2X_FIBER_ASM)
++extern "C" __attribute__((used)) void ps2xFiberAsmEntry(Ps2xFiber *f)
++{
++    f->fn(f->arg);
++    std::fprintf(stderr, "[fibers] FATAL: fiber entry returned\n");
++    std::abort();
++}
+ #elif defined(PS2X_FIBER_UCTX)
+ // makecontext passes int-sized arguments, so a 64-bit pointer travels as two halves.
+ static void ps2xFiberTrampoline(unsigned lo, unsigned hi)
+@@ -117,7 +187,7 @@
+     // Windows owns the stack for us; we keep stackSize for reporting only.
+     f->handle = CreateFiber(stackSize, &ps2xFiberTrampoline, f);
+     if (!f->handle) { delete f; return nullptr; }
+-#  elif defined(PS2X_FIBER_UCTX)
++#  elif defined(PS2X_FIBER_UCTX) || defined(PS2X_FIBER_ASM)
+     // mmap with a PROT_NONE guard page below the stack. A host thread's stack has one; a malloc'd
+     // fiber stack does not, so an overflow there would silently write into whatever mapping sits
+     // below it (another fiber's stack, guest RAM...) instead of faulting -- the one fiber-specific
+@@ -136,6 +206,16 @@
+     // Poison the stack so the portable ps2xFiberLiveStack fallback can find the high-water mark,
+     // and so an accidental read of untouched stack is obvious rather than plausible zeroes.
+     std::memset(f->stack, 0xA5, stackSize);
++#    if defined(PS2X_FIBER_ASM)
++    {   // the initial frame ps2xCtxSwitch pops: x19 = the fiber, x29 = 0, x30 = ps2xCtxStart, the rest zero
++        uint8_t *top = f->stack + stackSize;   // page-aligned, so 16-byte aligned
++        uint64_t *frame = reinterpret_cast<uint64_t *>(top - kCtxFrame);
++        std::memset(frame, 0, kCtxFrame);
++        frame[0] = reinterpret_cast<uint64_t>(f);                       // x19
++        frame[11] = reinterpret_cast<uint64_t>(&ps2xCtxStart);          // x30
++        f->sp = frame;
++    }
++#    else
+     if (getcontext(&f->ctx) != 0) { munmap(f->mapping, f->mappingSize); delete f; return nullptr; }
+     f->ctx.uc_stack.ss_sp = f->stack;
+     f->ctx.uc_stack.ss_size = stackSize;
+@@ -143,6 +223,7 @@
+     const uintptr_t p = reinterpret_cast<uintptr_t>(f);
+     makecontext(&f->ctx, reinterpret_cast<void (*)()>(&ps2xFiberTrampoline), 2,
+                 static_cast<unsigned>(p & 0xFFFFFFFFu), static_cast<unsigned>(p >> 32));
++#    endif
+ #  endif
+     return f;
+ #endif
+@@ -158,6 +239,8 @@
+     SwitchToFiber(to->handle);
+ #  elif defined(PS2X_FIBER_UCTX)
+     swapcontext(&from->ctx, &to->ctx);
++#  elif defined(PS2X_FIBER_ASM)
++    ps2xCtxSwitch(&from->sp, to->sp);
+ #  endif
+ #endif
+ }
+@@ -168,7 +251,7 @@
+     if (!f) return;
+ #  if defined(PS2X_FIBER_WIN)
+     if (!f->entry && f->handle) DeleteFiber(f->handle);
+-#  elif defined(PS2X_FIBER_UCTX)
++#  elif defined(PS2X_FIBER_UCTX) || defined(PS2X_FIBER_ASM)
+     if (f->mapping) munmap(f->mapping, f->mappingSize);
+ #  endif
+     delete f;
+@@ -180,7 +263,16 @@
+ size_t ps2xFiberLiveStack(const Ps2xFiber *f, const uint8_t **outBase)
+ {
+     if (outBase) *outBase = nullptr;
+-#if defined(PS2X_FIBER_UCTX)
++#if defined(PS2X_FIBER_ASM)
++    if (!f || !f->stack || f->entry || !f->sp) return 0;
++    {   // exact: the parked stack pointer (its saved registers are part of the live region)
++        const uintptr_t sp = reinterpret_cast<uintptr_t>(f->sp);
++        const uintptr_t lo = reinterpret_cast<uintptr_t>(f->stack), hi = lo + f->stackSize;
++        if (sp < lo || sp > hi) return 0;
++        if (outBase) *outBase = reinterpret_cast<const uint8_t *>(sp);
++        return static_cast<size_t>(hi - sp);
++    }
++#elif defined(PS2X_FIBER_UCTX)
+     if (!f || !f->stack || f->entry) return 0;
+     // The EXACT answer is the fiber's stack pointer, which swapcontext stored in its context when
+     // it last switched away. Only valid while the fiber is parked -- which is precisely when a
+@@ -220,12 +312,18 @@
+ #endif
+ }
+ 
++// [android] the AArch64 backend's blob = [uint64_t sp][uint64_t liveSize][live stack bytes]: the registers live on the stack.
+ size_t ps2xFiberSnapshotSize(const Ps2xFiber *f)
+ {
+-#if defined(PS2X_FIBER_UCTX)
++#if defined(PS2X_FIBER_ASM)
+     const uint8_t *base = nullptr;
+     const size_t live = ps2xFiberLiveStack(f, &base);
+     if (!f || f->entry || !base) return 0;
++    return 2 * sizeof(uint64_t) + live;
++#elif defined(PS2X_FIBER_UCTX)
++    const uint8_t *base = nullptr;
++    const size_t live = ps2xFiberLiveStack(f, &base);
++    if (!f || f->entry || !base) return 0;
+     return sizeof(ucontext_t) + sizeof(uint64_t) + live;
+ #else
+     (void)f; return 0;
+@@ -234,9 +332,19 @@
+ 
+ bool ps2xFiberSnapshot(const Ps2xFiber *f, void *buf, size_t size)
+ {
+-#if defined(PS2X_FIBER_UCTX)
++#if defined(PS2X_FIBER_ASM)
+     const uint8_t *base = nullptr;
+     const size_t live = ps2xFiberLiveStack(f, &base);
++    if (!f || f->entry || !base || !buf || size < 2 * sizeof(uint64_t) + live) return false;
++    uint8_t *o = static_cast<uint8_t *>(buf);
++    const uint64_t sp = reinterpret_cast<uint64_t>(f->sp), n = live;
++    std::memcpy(o, &sp, sizeof sp); o += sizeof sp;
++    std::memcpy(o, &n, sizeof n);   o += sizeof n;
++    std::memcpy(o, base, live);
++    return true;
++#elif defined(PS2X_FIBER_UCTX)
++    const uint8_t *base = nullptr;
++    const size_t live = ps2xFiberLiveStack(f, &base);
+     if (!f || f->entry || !base || !buf || size < sizeof(ucontext_t) + sizeof(uint64_t) + live) return false;
+     uint8_t *o = static_cast<uint8_t *>(buf);
+     std::memcpy(o, &f->ctx, sizeof(ucontext_t));            o += sizeof(ucontext_t);
+@@ -250,7 +358,18 @@
+ 
+ bool ps2xFiberRestore(Ps2xFiber *f, const void *buf, size_t size)
+ {
+-#if defined(PS2X_FIBER_UCTX)
++#if defined(PS2X_FIBER_ASM)
++    if (!f || f->entry || !f->stack || !buf || size < 2 * sizeof(uint64_t)) return false;
++    const uint8_t *i = static_cast<const uint8_t *>(buf);
++    uint64_t sp = 0, n = 0;
++    std::memcpy(&sp, i, sizeof sp); i += sizeof sp;
++    std::memcpy(&n, i, sizeof n);   i += sizeof n;
++    if (size < 2 * sizeof(uint64_t) + n || n > f->stackSize) return false;
++    if (sp != reinterpret_cast<uint64_t>(f->stack + f->stackSize - n)) return false;   // same stack, same addresses
++    std::memcpy(f->stack + f->stackSize - n, i, n);
++    f->sp = reinterpret_cast<void *>(sp);
++    return true;
++#elif defined(PS2X_FIBER_UCTX)
+     if (!f || f->entry || !f->stack || !buf || size < sizeof(ucontext_t) + sizeof(uint64_t)) return false;
+     const uint8_t *i = static_cast<const uint8_t *>(buf);
+     ucontext_t ctx; std::memcpy(&ctx, i, sizeof ctx);       i += sizeof ctx;
+@@ -343,6 +462,8 @@
+                  "Windows Fibers"
+ #elif defined(PS2X_FIBER_UCTX)
+                  "ucontext"
++#elif defined(PS2X_FIBER_ASM)
++                 "AArch64 asm"
+ #else
+                  "none"
+ #endif
+diff -ruN a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp	2026-10-26 16:12:55
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp	2026-10-26 16:12:55
+@@ -8463,6 +8463,11 @@
+                     // (offline only: the FOV floats are game state, and two players with different FOVs desync -- measured: 4800
+                     // desyncs in 7800 frames, 21:9 vs 16:9 -- so online every player keeps the shared 16:9)
+                     wsScale = (s_uw && !ps2NetActive() && rel > 1.01f) ? std::min(rel, 1.9f) : 1.0f;
++#if defined(__ANDROID__)
++                    // [android] phones are ~20:9: only a fight (0x8) fills the screen with the wider camera; menus, movies and
++                    // character select keep the mod's 16:9 between side bars (their 2D art would be stretched otherwise)
++                    if (g_bt3StateLive.load(std::memory_order_relaxed) != 0x8u) wsScale = 1.0f;
++#endif
+                     // the mod's HUD is drawn for the 16:9 stretch: on a wider window it is squeezed back by the same factor
+                     // (edge-pinned: the bars stay at the screen's edges, the timer in the middle, nothing stretched)
+                     extern float g_ps2xWsHudRel;
+@@ -9026,6 +9031,13 @@
+         {
+             dstWidth = screenWidth;
+             dstHeight = screenHeight;
++#if defined(__ANDROID__)
++            {   // [android] wider than 16:9 and not a fight with the wider camera: 16:9 between side bars (see [truews])
++                extern float g_ps2xWsHudRel;
++                if (screenWidth > screenHeight * (16.0f / 9.0f) * 1.01f && !(g_ps2xWsHudRel > 0.0f && g_bt3StateLive.load(std::memory_order_relaxed) == 0x8u))
++                    dstWidth = screenHeight * (16.0f / 9.0f);
++            }
++#endif
+             // [wshud] target: HUD elements keep authentic proportions (square-pixel x k)
+             // under the full-window stretch. inv = desired h-scale / actual h-scale.
+             static const float s_pixk2 = [](){ const char *v = std::getenv("PS2X_PIXK"); const float f = v ? (float)std::atof(v) : 1.08f; return (f > 0.5f && f < 2.0f) ? f : 1.08f; }();
+diff -ruN a/ps2xRuntime/src/lib/ps2_seamvk.cpp b/ps2xRuntime/src/lib/ps2_seamvk.cpp
+--- a/ps2xRuntime/src/lib/ps2_seamvk.cpp	2026-10-26 16:12:55
++++ b/ps2xRuntime/src/lib/ps2_seamvk.cpp	2026-10-26 16:12:55
+@@ -23,6 +23,10 @@
+ #include "image.hpp"
+ #include "buffer.hpp"
+ #include "sampler.hpp"
++#if defined(__ANDROID__)   // [ahbshare] the frame shared with GL through an AHardwareBuffer
++#include <android/hardware_buffer.h>
++#include <vulkan/vulkan_android.h>
++#endif
+ #if defined(_WIN32)   // [glshare] closing exported handles
+ #ifndef NOMINMAX
+ #define NOMINMAX
+@@ -336,7 +340,7 @@
+             bool enabled()
+             {
+                 static const bool on = [](){ const char *v = std::getenv("PS2X_PIPEWARM");
+-#if defined(__APPLE__)
++#if defined(__APPLE__) || defined(__ANDROID__)   // [android] phones compile shaders slowly too: on by default there as well
+                     return !(v && v[0] == '0');
+ #else
+                     return v && v[0] == '1';
+@@ -558,7 +562,11 @@
+         // One fresh binary semaphore per frame, as Granite's own GL interop test does: a frame GL skips just closes its handle.
+         // [framegen] seq: publication order; due: not shown before (steady_clock ns; 0 = at once). GL takes the newest due frame
+         // and drops the older ready ones, so a generated frame and the real one behind it wait in order.
+-        struct ShareSlot { Vulkan::ImageHandle img; uint32_t w = 0, h = 0, gen = 0; uint64_t memSize = 0, gframe = 0, seq = 0; int64_t due = 0; intptr_t mem = -1, sem = -1; int st = 0; };   // st: 0 free, 1 ready, 2 taken
++        struct ShareSlot { Vulkan::ImageHandle img; uint32_t w = 0, h = 0, gen = 0; uint64_t memSize = 0, gframe = 0, seq = 0; int64_t due = 0; intptr_t mem = -1, sem = -1; int st = 0;   // st: 0 free, 1 ready, 2 taken
++#if defined(__ANDROID__)
++                           AHardwareBuffer *ahb = nullptr; VkImage ahbImg = VK_NULL_HANDLE; VkDeviceMemory ahbMem = VK_NULL_HANDLE;   // [ahbshare]
++#endif
++        };
+         constexpr int kShareSlots = 6;
+         uint64_t g_shareSeq = 0;
+         // [framegen] PS2X_SEAMVK_FRAMEGEN=1: a generated frame between every two (glshare only), the window loop at
+@@ -576,6 +584,74 @@
+ #endif
+             h = -1;
+         }
++        // [ahbshare] a slot's memory handle: an AHardwareBuffer reference on Android (GL's, taken with the frame), a file
++        // descriptor / NT handle elsewhere
++        void closeMem(intptr_t &h)
++        {
++#if defined(__ANDROID__)
++            if (h != -1) AHardwareBuffer_release(reinterpret_cast<AHardwareBuffer *>(h));
++            h = -1;
++#else
++            closeExternal(h);
++#endif
++        }
++#if defined(__ANDROID__)
++        // [ahbshare] Android: the shared image is an AHardwareBuffer the renderer's Vulkan imports (raw Vulkan: Granite has no
++        // AHB import) and GL samples through an EGLImage -- no copy through the CPU. Adreno's GL has no GL_EXT_memory_object,
++        // which left the CPU readback: at 2.2 Mpx of FSR 2 output it took the window down to ~30 fps on a POCO F8 Ultra.
++        template <typename F> F devProc(Vulkan::Device &dev, const char *name) { return reinterpret_cast<F>(vkGetDeviceProcAddr(dev.get_device(), name)); }
++        void ahbDestroy(Vulkan::Device &dev, ShareSlot &s)
++        {
++            if (s.ahbImg) devProc<PFN_vkDestroyImage>(dev, "vkDestroyImage")(dev.get_device(), s.ahbImg, nullptr);
++            if (s.ahbMem) devProc<PFN_vkFreeMemory>(dev, "vkFreeMemory")(dev.get_device(), s.ahbMem, nullptr);
++            if (s.ahb) AHardwareBuffer_release(s.ahb);
++            s.ahbImg = VK_NULL_HANDLE; s.ahbMem = VK_NULL_HANDLE; s.ahb = nullptr;
++        }
++        // A slot that changes size (the first FSR 2 frame) leaves its old image here for a few frames instead of a
++        // dev.wait_idle(): that waits for every requested command buffer to be submitted, the one being recorded included,
++        // and hung the GS thread (and so the game) at the first resize.
++        struct AhbRetired { ShareSlot res; uint32_t frames; };
++        std::vector<AhbRetired> g_ahbRetired;
++        void ahbRetireTick(Vulkan::Device &dev)
++        {
++            for (size_t k = 0; k < g_ahbRetired.size();)
++            {
++                if (--g_ahbRetired[k].frames == 0) { ahbDestroy(dev, g_ahbRetired[k].res); g_ahbRetired[k] = g_ahbRetired.back(); g_ahbRetired.pop_back(); }
++                else ++k;
++            }
++        }
++        bool ahbCreate(Vulkan::Device &dev, ShareSlot &s, uint32_t w, uint32_t h)
++        {
++            AHardwareBuffer_Desc d = {};
++            d.width = w; d.height = h; d.layers = 1; d.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
++            d.usage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT;
++            if (AHardwareBuffer_allocate(&d, &s.ahb) != 0) { s.ahb = nullptr; return false; }
++            const VkDevice vd = dev.get_device();
++            auto getProps = devProc<PFN_vkGetAndroidHardwareBufferPropertiesANDROID>(dev, "vkGetAndroidHardwareBufferPropertiesANDROID");
++            VkAndroidHardwareBufferFormatPropertiesANDROID fmt = { VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID };
++            VkAndroidHardwareBufferPropertiesANDROID props = { VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID };
++            props.pNext = &fmt;
++            if (!getProps || getProps(vd, s.ahb, &props) != VK_SUCCESS || !props.memoryTypeBits) { ahbDestroy(dev, s); return false; }
++            VkExternalMemoryImageCreateInfo emi = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };
++            emi.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
++            VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
++            ici.pNext = &emi; ici.imageType = VK_IMAGE_TYPE_2D; ici.format = VK_FORMAT_R8G8B8A8_UNORM; ici.extent = { w, h, 1 };
++            ici.mipLevels = 1; ici.arrayLayers = 1; ici.samples = VK_SAMPLE_COUNT_1_BIT; ici.tiling = VK_IMAGE_TILING_OPTIMAL;
++            ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
++            ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++            if (devProc<PFN_vkCreateImage>(dev, "vkCreateImage")(vd, &ici, nullptr, &s.ahbImg) != VK_SUCCESS) { s.ahbImg = VK_NULL_HANDLE; ahbDestroy(dev, s); return false; }
++            VkImportAndroidHardwareBufferInfoANDROID imp = { VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID };
++            imp.buffer = s.ahb;
++            VkMemoryDedicatedAllocateInfo ded = { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO };
++            ded.pNext = &imp; ded.image = s.ahbImg;
++            VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
++            mai.pNext = &ded; mai.allocationSize = props.allocationSize;
++            mai.memoryTypeIndex = uint32_t(__builtin_ctz(props.memoryTypeBits));
++            if (devProc<PFN_vkAllocateMemory>(dev, "vkAllocateMemory")(vd, &mai, nullptr, &s.ahbMem) != VK_SUCCESS) { s.ahbMem = VK_NULL_HANDLE; ahbDestroy(dev, s); return false; }
++            if (devProc<PFN_vkBindImageMemory>(dev, "vkBindImageMemory")(vd, s.ahbImg, s.ahbMem, 0) != VK_SUCCESS) { ahbDestroy(dev, s); return false; }
++            return true;
++        }
++#endif
+         void rbWorker()
+         {
+             for (;;)
+@@ -2526,7 +2602,13 @@
+                 }
+             }
+ #endif
++#if defined(__ANDROID__)
++            // [android] classic descriptor sets: Adreno 840's VK_EXT_descriptor_buffer path faults in the driver
++            // (vkUpdateDescriptorSetWithTemplate, null at +0xf0) at the first native draw
++            Vulkan::ContextCreationFlags descFlags = 0;
++#else
+             Vulkan::ContextCreationFlags descFlags = Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_HEAP_BIT | Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_BUFFER_BIT;
++#endif
+             if (const char *v = std::getenv("PS2X_SEAMVK_DESCMODEL"))   // diagnostics: legacy | buffer | heap (default: heap, else buffer)
+                 descFlags = !std::strcmp(v, "legacy") ? 0 : !std::strcmp(v, "buffer") ? Vulkan::ContextCreationFlags(Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_BUFFER_BIT) : descFlags;
+ #if defined(PS2X_SEAMVK_METALFX)
+@@ -2535,6 +2617,10 @@
+             setenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS", "1", 0);
+             static const char *const devExts[] = { "VK_EXT_metal_objects" };
+             const uint32_t numDevExts = 1;
++#elif defined(__ANDROID__)
++            // [ahbshare] AHardwareBuffer import (the frame shared with GL): part of every Android 10+ Vulkan driver
++            static const char *const devExts[] = { "VK_ANDROID_external_memory_android_hardware_buffer", "VK_EXT_queue_family_foreign" };
++            const uint32_t numDevExts = 2;
+ #else
+             // [vkpresent] the window's swapchain (ps2_seamvk_present.cpp): only when asked for (a device without it would fail)
+             static const char *const kSwapExt[] = { "VK_KHR_swapchain" };
+@@ -3386,6 +3472,20 @@
+                 if (out < 1.0f) { pw = std::max(g_gpu.w, uint32_t(float(pw) * out + 0.5f)); ph = std::max(g_gpu.h, uint32_t(float(ph) * out + 0.5f)); }
+             }
+ #endif
++#if defined(__ANDROID__)
++            {   // [android] a phone's screen is often more than 3x the render (2608x1200 against 640x448): the upscaler fills at most
++                // 3x per axis and a pixel budget, and the window's bilinear present stretches the rest. The budget is set by how
++                // the frame reaches GL: shared (zero copy) 2.2 Mpx at 60 fps / 3.5 at 30; through the CPU readback (no
++                // GL_EXT_memory_object, e.g. Adreno) 1.1 / 2.0 -- measured on a POCO F8 Ultra (Adreno 840) in a 60 fps fight:
++                // 2.2 Mpx = window at 27..32 fps (the readback + upload took the frame), 1.3 Mpx = 60.0. PS2X_UPSCALE_MPX=<n> sets it.
++                static const double s_mpx = [](){ const char *v = std::getenv("PS2X_UPSCALE_MPX"); return v && v[0] ? std::atof(v) : 0.0; }();
++                const bool fps60 = g_ps2VStepMode.load(std::memory_order_relaxed) != 0, shared = g_shareOn.load(std::memory_order_acquire);
++                const double budget = (s_mpx > 0.1 ? s_mpx : shared ? (fps60 ? 2.2 : 3.5) : (fps60 ? 1.1 : 2.0)) * 1e6;
++                double f = std::min({ 1.0, 3.0 * double(g_gpu.w) / double(std::max(1u, pw)), 3.0 * double(g_gpu.h) / double(std::max(1u, ph)) });
++                if (double(pw) * double(ph) * f * f > budget) f = std::sqrt(budget / (double(pw) * double(ph)));
++                if (f < 1.0) { pw = std::max(g_gpu.w, uint32_t(double(pw) * f + 0.5)); ph = std::max(g_gpu.h, uint32_t(double(ph) * f + 0.5)); }
++            }
++#endif
+             if (pw >= g_gpu.w && ph >= g_gpu.h && pw <= g_gpu.w * 3u && ph <= g_gpu.h * 3u)
+             {
+                 if (!g_gpu.up || g_gpu.up->get_width() != pw || g_gpu.up->get_height() != ph)
+@@ -3732,6 +3832,46 @@
+             { std::lock_guard<std::mutex> lk(g_shareMtx); for (int k = 0; k < kShareSlots; ++k) if (g_share[k].st == 0) { i = k; g_share[k].st = 3; break; } }
+             if (i < 0) return -1;
+             ShareSlot &s = g_share[i];   // free: no other thread reads it until it is published
++#if defined(__ANDROID__)
++            {   // [ahbshare] the AHardwareBuffer slot: a raw copy into it, then released to the foreign (GL) queue family
++                ahbRetireTick(dev);
++                if (!s.ahbImg || s.w != w || s.h != h)
++                {
++                    if (s.ahbImg)
++                    {   // a new size (rare): the old image goes when no frame in flight can still touch it
++                        AhbRetired r; r.res.ahb = s.ahb; r.res.ahbImg = s.ahbImg; r.res.ahbMem = s.ahbMem; r.frames = 8;
++                        g_ahbRetired.push_back(r);
++                        s.ahb = nullptr; s.ahbImg = VK_NULL_HANDLE; s.ahbMem = VK_NULL_HANDLE;
++                    }
++                    const bool ok = ahbCreate(dev, s, w, h);
++                    std::lock_guard<std::mutex> lk(g_shareMtx);
++                    closeMem(s.mem);
++                    if (!ok) { std::fprintf(stderr, "[ahbshare] %ux%u AHardwareBuffer image failed: back to the readback path\n", w, h); g_shareOn.store(false); s.st = 0; return -2; }
++                    AHardwareBuffer_acquire(s.ahb);   // GL's reference, handed over with the next frame of this slot
++                    s.mem = intptr_t(s.ahb); s.memSize = 0; s.w = w; s.h = h; ++s.gen;
++                }
++                VkImageMemoryBarrier2 b0 = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
++                b0.srcStageMask = VK_PIPELINE_STAGE_2_NONE; b0.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT; b0.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
++                b0.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; b0.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++                b0.srcQueueFamilyIndex = b0.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++                b0.image = s.ahbImg; b0.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
++                VkDependencyInfo d0 = { VK_STRUCTURE_TYPE_DEPENDENCY_INFO }; d0.imageMemoryBarrierCount = 1; d0.pImageMemoryBarriers = &b0;
++                cmd->barrier(d0);
++                VkImageCopy rg = {};
++                rg.srcSubresource = rg.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
++                rg.extent = { w, h, 1 };
++                dev.get_device_table().vkCmdCopyImage(cmd->get_command_buffer(), src.get_image(), src.get_layout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
++                                                      s.ahbImg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rg);
++                VkImageMemoryBarrier2 b1 = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
++                b1.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT; b1.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
++                b1.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b1.newLayout = VK_IMAGE_LAYOUT_GENERAL;
++                b1.srcQueueFamilyIndex = dev.get_queue_info().family_indices[Vulkan::QUEUE_INDEX_GRAPHICS]; b1.dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
++                b1.image = s.ahbImg; b1.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
++                VkDependencyInfo d1 = { VK_STRUCTURE_TYPE_DEPENDENCY_INFO }; d1.imageMemoryBarrierCount = 1; d1.pImageMemoryBarriers = &b1;
++                cmd->barrier(d1);
++                return i;
++            }
++#endif
+             if (!s.img || s.w != w || s.h != h)
+             {
+                 auto ci = Vulkan::ImageCreateInfo::render_target(w, h, VK_FORMAT_R8G8B8A8_UNORM);
+@@ -3742,7 +3882,7 @@
+                 Vulkan::ExternalHandle eh; if (img) eh = img->export_handle();
+                 const bool ok = img && eh.handle != Vulkan::ExternalHandle().handle;
+                 std::lock_guard<std::mutex> lk(g_shareMtx);
+-                closeExternal(s.mem);
++                closeMem(s.mem);
+                 if (ok) { s.img = img; s.mem = intptr_t(eh.handle); s.memSize = img->get_allocation().get_size(); s.w = w; s.h = h; ++s.gen; }
+                 else { std::fprintf(stderr, "[glshare] exportable %ux%u image failed: back to the readback path\n", w, h); g_shareOn.store(false); s.st = 0; return -2; }
+             }
+@@ -3797,9 +3937,19 @@
+         {   // [glshare] a fresh semaphore per slot, signalled after the copies; GL imports and waits it before sampling
+             auto signal = [&]() -> intptr_t
+             {
++#if defined(__ANDROID__)
++                // [ahbshare] a sync fd: GL waits it as an EGL native fence (EGL_ANDROID_native_fence_sync)
++                Vulkan::Semaphore sem = dev.request_semaphore_external(VK_SEMAPHORE_TYPE_BINARY, VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT);
++#else
+                 Vulkan::Semaphore sem = dev.request_semaphore_external(VK_SEMAPHORE_TYPE_BINARY, Vulkan::ExternalHandle::get_opaque_semaphore_handle_type());
++#endif
+                 dev.submit_empty(Vulkan::CommandBuffer::Type::Generic, nullptr, sem.get());
++#if defined(__ANDROID__)
++                dev.flush_frame();   // [ahbshare] a sync fd exists only once its signal is on the queue (Granite batches submits)
+                 return intptr_t(sem->export_to_handle().handle);
++#else
++                return intptr_t(sem->export_to_handle().handle);
++#endif
+             };
+             const intptr_t semMid = midSlot >= 0 ? signal() : -1, semCur = shareSlot >= 0 ? signal() : -1;
+             const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+diff -ruN a/ps2xRuntime/src/lib/ps2_seamvk_gl.cpp b/ps2xRuntime/src/lib/ps2_seamvk_gl.cpp
+--- a/ps2xRuntime/src/lib/ps2_seamvk_gl.cpp	2026-10-26 16:12:55
++++ b/ps2xRuntime/src/lib/ps2_seamvk_gl.cpp	2026-10-26 16:12:55
+@@ -24,6 +24,12 @@
+ #include <unistd.h>
+ #define PS2X_GLAPI
+ #endif
++#if defined(__ANDROID__)   // [ahbshare] the frame is an AHardwareBuffer: an EGLImage for GL, an EGL native fence to wait
++#include <android/hardware_buffer.h>
++#define EGL_EGLEXT_PROTOTYPES
++#include <EGL/egl.h>
++#include <EGL/eglext.h>
++#endif
+ 
+ #if defined(PS2X_SEAMVK_METALFX)
+ namespace ps2_seamvk_metalfx { uint32_t glPresent(uint32_t &w, uint32_t &h); }   // [macshare] ps2_seamvk_metalfx.mm
+@@ -71,7 +77,24 @@
+             void (PS2X_GLAPI *DeleteSync)(GLsync);
+         } gl;
+ 
+-        struct GlSlot { GLuint tex = 0, mem = 0; uint32_t gen = 0, w = 0, h = 0; };
++        struct GlSlot { GLuint tex = 0, mem = 0; uint32_t gen = 0, w = 0, h = 0;
++#if defined(__ANDROID__)
++                        EGLImageKHR img = EGL_NO_IMAGE_KHR;   // [ahbshare]
++#endif
++        };
++#if defined(__ANDROID__)
++        struct Egl
++        {
++            EGLDisplay dpy = EGL_NO_DISPLAY;
++            PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC getClientBuffer = nullptr;
++            PFNEGLCREATEIMAGEKHRPROC createImage = nullptr;
++            PFNEGLDESTROYIMAGEKHRPROC destroyImage = nullptr;
++            PFNEGLCREATESYNCKHRPROC createSync = nullptr;
++            PFNEGLWAITSYNCKHRPROC waitSync = nullptr;
++            PFNEGLDESTROYSYNCKHRPROC destroySync = nullptr;
++            void (PS2X_GLAPI *imageTargetTexture2D)(GLenum, void *) = nullptr;   // glEGLImageTargetTexture2DOES
++        } egl;
++#endif
+         struct Retire { int slot; GLsync fence; };
+         GlSlot g_slots[8];
+         std::vector<Retire> g_retire;
+@@ -87,6 +110,15 @@
+             close(int(h));
+ #endif
+         }
++        // [ahbshare] a frame's memory handle: an AHardwareBuffer reference on Android, a file descriptor / handle elsewhere
++        void closeMem(intptr_t h)
++        {
++#if defined(__ANDROID__)
++            if (h != -1) AHardwareBuffer_release(reinterpret_cast<AHardwareBuffer *>(h));
++#else
++            closeExternal(h);
++#endif
++        }
+         void *clientProc(const char *name)
+         {   // GL 1.1 is not returned by wglGetProcAddress
+ #if defined(_WIN32)
+@@ -107,6 +139,34 @@
+         {
+             static const bool s_off = [](){ const char *v = std::getenv("PS2X_SEAMVK_GLSHARE"); return v && v[0] == '0'; }();
+             if (s_off || !getProc) return -1;
++#if defined(__ANDROID__)
++            {   // [ahbshare] EGLImage from the AHardwareBuffer + the Vulkan semaphore's sync fd as an EGL native fence
++                if (!share::device()) return 0;   // the Vulkan device does not exist yet
++                auto fail = [](const char *why) { std::fprintf(stderr, "[ahbshare] %s: the native frame goes through a CPU readback\n", why); return -1; };
++                egl.dpy = eglGetCurrentDisplay();
++                const char *ex = egl.dpy != EGL_NO_DISPLAY ? eglQueryString(egl.dpy, EGL_EXTENSIONS) : nullptr;
++                auto has = [&](const char *e) { return ex && std::strstr(ex, e) != nullptr; };
++                if (!has("EGL_ANDROID_get_native_client_buffer") || !has("EGL_ANDROID_image_native_buffer") || !has("EGL_ANDROID_native_fence_sync") || !has("EGL_KHR_wait_sync"))
++                    return fail("EGL lacks AHardwareBuffer images or native fences");
++                egl.getClientBuffer = reinterpret_cast<PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC>(eglGetProcAddress("eglGetNativeClientBufferANDROID"));
++                egl.createImage = reinterpret_cast<PFNEGLCREATEIMAGEKHRPROC>(eglGetProcAddress("eglCreateImageKHR"));
++                egl.destroyImage = reinterpret_cast<PFNEGLDESTROYIMAGEKHRPROC>(eglGetProcAddress("eglDestroyImageKHR"));
++                egl.createSync = reinterpret_cast<PFNEGLCREATESYNCKHRPROC>(eglGetProcAddress("eglCreateSyncKHR"));
++                egl.waitSync = reinterpret_cast<PFNEGLWAITSYNCKHRPROC>(eglGetProcAddress("eglWaitSyncKHR"));
++                egl.destroySync = reinterpret_cast<PFNEGLDESTROYSYNCKHRPROC>(eglGetProcAddress("eglDestroySyncKHR"));
++                egl.imageTargetTexture2D = reinterpret_cast<void (PS2X_GLAPI *)(GLenum, void *)>(getProc("glEGLImageTargetTexture2DOES"));
++                int missing = 0;
++                auto load = [&](auto &fn, const char *name) { void *p = getProc(name); if (!p) p = clientProc(name); fn = reinterpret_cast<std::remove_reference_t<decltype(fn)>>(p); if (!p) ++missing; };
++                load(gl.GenTextures, "glGenTextures"); load(gl.DeleteTextures, "glDeleteTextures"); load(gl.BindTexture, "glBindTexture");
++                load(gl.TexParameteri, "glTexParameteri"); load(gl.GetIntegerv, "glGetIntegerv"); load(gl.GetError, "glGetError");
++                load(gl.FenceSync, "glFenceSync"); load(gl.ClientWaitSync, "glClientWaitSync"); load(gl.DeleteSync, "glDeleteSync");
++                if (missing || !egl.getClientBuffer || !egl.createImage || !egl.destroyImage || !egl.createSync || !egl.waitSync || !egl.destroySync || !egl.imageTargetTexture2D)
++                    return fail("EGL / GL entry points missing");
++                share::enable(true);
++                std::fprintf(stderr, "[ahbshare] zero-copy present on: GL samples the native renderer's frames through AHardwareBuffers\n");
++                return 1;
++            }
++#endif
+             uint8_t luid[8], devUuid[16], drvUuid[16]; bool luidValid = false;
+             if (!share::deviceIds(luid, luidValid, devUuid, drvUuid)) return 0;
+             int missing = 0;
+@@ -144,12 +204,38 @@
+         void dropSlot(GlSlot &s)
+         {
+             if (s.tex) gl.DeleteTextures(1, &s.tex);
++#if defined(__ANDROID__)
++            if (s.img != EGL_NO_IMAGE_KHR) egl.destroyImage(egl.dpy, s.img);
++#else
+             if (s.mem) gl.DeleteMemoryObjectsEXT(1, &s.mem);
++#endif
+             s = GlSlot();
+         }
+         bool importSlot(GlSlot &s, const share::Frame &f)
+         {
+             dropSlot(s);
++#if defined(__ANDROID__)
++            {   // [ahbshare] the AHardwareBuffer as an EGLImage, bound to a texture; GL's reference goes once the image holds one
++                AHardwareBuffer *ahb = reinterpret_cast<AHardwareBuffer *>(f.mem);
++                const EGLint attrs[] = { EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE };
++                s.img = egl.createImage(egl.dpy, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, egl.getClientBuffer(ahb), attrs);
++                AHardwareBuffer_release(ahb);
++                if (s.img == EGL_NO_IMAGE_KHR) { std::fprintf(stderr, "[ahbshare] EGLImage for a %ux%u frame failed (0x%x)\n", f.w, f.h, eglGetError()); return false; }
++                while (gl.GetError() != 0) {}   // only this import's errors count (the window's own GL may have left some)
++                GLint prev = 0; gl.GetIntegerv(kTexBinding2D, &prev);
++                gl.GenTextures(1, &s.tex);
++                gl.BindTexture(kTex2D, s.tex);
++                egl.imageTargetTexture2D(kTex2D, s.img);
++                if (const GLenum e = gl.GetError()) std::fprintf(stderr, "[ahbshare] glEGLImageTargetTexture2DOES: GL error 0x%x\n", e);
++                gl.TexParameteri(kTex2D, kMinFilter, GLint(kLinear)); gl.TexParameteri(kTex2D, kMagFilter, GLint(kLinear));
++                gl.TexParameteri(kTex2D, kWrapS, GLint(kClampToEdge)); gl.TexParameteri(kTex2D, kWrapT, GLint(kClampToEdge));
++                gl.BindTexture(kTex2D, GLuint(prev));
++                const GLenum err = gl.GetError();
++                if (err != 0) { std::fprintf(stderr, "[ahbshare] binding a %ux%u frame failed (GL error 0x%x)\n", f.w, f.h, err); dropSlot(s); return false; }
++                s.gen = f.gen; s.w = f.w; s.h = f.h;
++                return true;
++            }
++#endif
+             gl.CreateMemoryObjectsEXT(1, &s.mem);
+             const GLint one = 1; gl.MemoryObjectParameterivEXT(s.mem, kDedicatedMemory, &one);   // Granite gives external images a dedicated allocation
+ #if defined(_WIN32)
+@@ -201,11 +287,23 @@
+         share::Frame f;
+         if (share::take(f))
+         {
+-            if (f.slot < 0 || f.slot >= int(sizeof(g_slots) / sizeof(g_slots[0]))) { closeExternal(f.mem); closeExternal(f.sem); giveUp(); return 0; }
++            if (f.slot < 0 || f.slot >= int(sizeof(g_slots) / sizeof(g_slots[0]))) { closeMem(f.mem); closeExternal(f.sem); giveUp(); return 0; }
+             GlSlot &s = g_slots[f.slot];
+             if (f.mem != -1 && !importSlot(s, f)) { closeExternal(f.sem); share::release(f.slot); giveUp(); return 0; }
+             if (!s.tex || s.gen != f.gen) { closeExternal(f.sem); share::release(f.slot); giveUp(); return 0; }   // (never: a new image always comes with its memory)
++#if defined(__ANDROID__)
+             if (f.sem != -1)
++            {   // [ahbshare] the GPU waits for Vulkan's copy (a server-side wait: the CPU does not block)
++                const EGLint attrs[] = { EGL_SYNC_NATIVE_FENCE_FD_ANDROID, EGLint(f.sem), EGL_NONE };
++                EGLSyncKHR sync = egl.createSync(egl.dpy, EGL_SYNC_NATIVE_FENCE_ANDROID, attrs);   // takes the fd
++                if (sync == EGL_NO_SYNC_KHR) { closeExternal(f.sem); share::release(f.slot); giveUp(); return 0; }
++                egl.waitSync(egl.dpy, sync, 0);
++                egl.destroySync(egl.dpy, sync);
++            }
++            if (false)
++#else
++            if (f.sem != -1)
++#endif
+             {
+                 GLuint sem = 0; gl.GenSemaphoresEXT(1, &sem);
+ #if defined(_WIN32)
+diff -ruN a/ps2xRuntime/src/lib/ps2_settings_overlay.cpp b/ps2xRuntime/src/lib/ps2_settings_overlay.cpp
+--- a/ps2xRuntime/src/lib/ps2_settings_overlay.cpp	2026-10-26 16:12:55
++++ b/ps2xRuntime/src/lib/ps2_settings_overlay.cpp	2026-10-26 16:12:55
+@@ -2001,6 +2001,11 @@
+     ImGui::End();
+ }
+ 
++#if defined(__ANDROID__)
++extern "C" void ps2xTouchDraw();       // [android] android/touch_pad.cpp
++extern "C" bool ps2xTouchVisible();
++extern "C" bool ps2xTouchTakeMenu();
++#endif
+ void PS2SettingsOverlay::draw(PS2Runtime &runtime)
+ {
+     if (!m_initialized)
+@@ -2070,6 +2075,10 @@
+             else if (s_step == 6 && t >= 52.0) { wm(0); s_step = 7; }
+         }
+     }
++#if defined(__ANDROID__)
++    if (ps2xTouchTakeMenu())   // [android] the touch menu button opens / closes the panel
++        toggleVisible();
++#endif
+     // --- F11: toggle fullscreen / windowed ---
+     if (bt3IsKeyPressed(BT3_KEY_F11))
+     {
+@@ -2145,8 +2154,13 @@
+         // does not apply at all, and a session can connect while the player is anywhere.
+         uint32_t ttHud[8 * 10]; const int ttN = ps2xModsHud(ttHud, 10);   // [tagteam] extra fighters' health
+         uint32_t ttFeed[5 * 6]; const int ttF = ps2xModsFeed(ttFeed, 6);   // [tagteam] the kill feed
++#if defined(__ANDROID__)
++        const bool touch = true;   // [android] the touch controls are drawn every frame (they register the touch watch too)
++#else
++        const bool touch = false;
++#endif
+         if (!m_settings.showPerf && !mmPopup && !curtain && m_cards.empty() &&
+-            ps2xNotifyPending() == 0 && ttN == 0 && ttF == 0)
++            ps2xNotifyPending() == 0 && ttN == 0 && ttF == 0 && !touch)
+             return;
+         try
+         {
+@@ -2169,6 +2183,9 @@
+             // in the opposite corner from the netplay label, so nothing of the curtain's own
+             // furniture is uncovered.
+             drawNotifyStack();
++#if defined(__ANDROID__)
++            ps2xTouchDraw();
++#endif
+         }
+         catch (...)
+         {
+diff -ruN a/ps2xRuntime/third_party/bt3gl/src/platforms/rcore_desktop_sdl.c b/ps2xRuntime/third_party/bt3gl/src/platforms/rcore_desktop_sdl.c
+--- a/ps2xRuntime/third_party/bt3gl/src/platforms/rcore_desktop_sdl.c	2026-10-26 16:12:55
++++ b/ps2xRuntime/third_party/bt3gl/src/platforms/rcore_desktop_sdl.c	2026-10-26 16:12:55
+@@ -1854,9 +1854,15 @@
+     }
+     else if (rlGetVersion() == RL_OPENGL_33)
+     {
++#if defined(__ANDROID__)   // [android] GLES 3.x (drivers hand out their newest 3.x): the GL 3.3 core entry points load by name, the shaders go through the GLES shim
++        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
++        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
++#else
++        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+         SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
++#endif
+     }
+     else if (rlGetVersion() == RL_OPENGL_43)
+     {
+diff -ruN a/ps2xRuntime/third_party/parallel-gs/Granite/application/platforms/CMakeLists.txt b/ps2xRuntime/third_party/parallel-gs/Granite/application/platforms/CMakeLists.txt
+--- a/ps2xRuntime/third_party/parallel-gs/Granite/application/platforms/CMakeLists.txt	2026-10-26 16:12:55
++++ b/ps2xRuntime/third_party/parallel-gs/Granite/application/platforms/CMakeLists.txt	2026-10-26 16:12:55
+@@ -1,6 +1,6 @@
+ # Must be static due to Granite::application_create() feedback.
+ 
+-if (ANDROID)
++if (ANDROID AND NOT (${GRANITE_PLATFORM} MATCHES "null"))
+     add_granite_internal_static_lib(granite-platform application_android.cpp)
+     find_package(game-activity REQUIRED CONFIG)
+     find_package(games-controller REQUIRED CONFIG)

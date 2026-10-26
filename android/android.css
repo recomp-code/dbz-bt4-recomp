@@ -63,7 +63,7 @@ html.android #overlay-banner, html.android #voice-bar, html.android #voice-opts,
 html.android #v-settings .sect:has(+ #voice-opts) { display: none !important; }
 
 /* ---------------- the header, as in the reference ----------------
-   Biblioteca: one see-through row over the art, two small dark pills (EN LÍNEA, AJUSTES) on the left and the round
+   Biblioteca: one row over the dark band above the art, two small pills (EN LÍNEA, AJUSTES) on the left and the round
    avatar on the right. En línea and Ajustes: the same row (‹ back to Biblioteca, the avatar) on solid dark, the big
    text tabs under it (the last one may run off the edge, it scrolls) and a hairline. */
 html.android:has(#v-play:not(.hidden)) { --bar: var(--row1); }
@@ -99,9 +99,8 @@ html.android:has(#v-play:not(.hidden)) .tabs {
 }
 html.android:has(#v-play:not(.hidden)) .tab {
   height: 36px; padding: 0 14px; border-radius: 18px; font-size: 13px; letter-spacing: .02em;
-  color: #fff; background: rgba(12, 12, 14, .86);
+  color: #fff; background: var(--chip);
 }
-html.android:has(#v-play:not(.hidden)).a-solid .tab { background: var(--chip); }
 html.android .dotcount {
   align-self: center; margin: -16px 0 0 3px; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px;
   font: 700 11px/18px system-ui, sans-serif; letter-spacing: 0; text-align: center; background: #e5484d;
@@ -133,17 +132,19 @@ html.android .view.enter { animation-name: android-fade; }   /* no transform: it
 @keyframes android-fade { from { opacity: 0; } }
 
 /* ---------------- Biblioteca: the art edge to edge, the sheet over it, the action bar ---------------- */
-html.android #v-play { padding: 0; margin: 0; max-width: none; }
+/* The art is 16:9 (1600 x 900): whole and at its own shape, the full width under the header row. Filling half a
+   portrait screen with it would crop it to its middle and blow it up ~1.5x (it looked stretched). */
+html.android #v-play { padding: 0; margin: 0; max-width: none; --banner: calc(var(--st) + var(--row1) + 100vw * 9 / 16); }
 html.android #v-play > .banner.dbz {
-  height: max(300px, 50vh); min-height: 0; border-radius: 0;
-  background: #0b0b0d url("img/dbz-bt4-header.jpg") 50% 0 / cover no-repeat;
+  height: var(--banner); min-height: 0; border-radius: 0;
+  background: #0b0b0d url("img/dbz-bt4-header.jpg") 50% calc(var(--st) + var(--row1)) / 100% auto no-repeat;
 }
-html.android .banner.dbz::after { background: linear-gradient(0deg, rgba(21, 21, 23, .7) 0%, rgba(21, 21, 23, 0) 40%); }
+html.android .banner.dbz::after { content: none; }
 html.android .banner-lines, html.android .banner-txt { display: none; }
 
 html.android .a-sheet {
-  position: relative; z-index: 1; margin-top: calc(-1 * var(--r-sheet) - 28px);
-  min-height: calc(100vh - max(300px, 50vh) + var(--r-sheet) + 28px);
+  position: relative; z-index: 1; margin-top: calc(-1 * var(--r-sheet));
+  min-height: calc(100vh - var(--banner) + var(--r-sheet));
   padding: 26px calc(var(--gut) + 6px + var(--sr)) calc(var(--act) + var(--sb) + 24px) calc(var(--gut) + 6px + var(--sl));
   background: var(--sheet-bg); border-radius: var(--r-sheet) var(--r-sheet) 0 0;
 }
@@ -430,11 +431,6 @@ html.android .st-top .r.mine .r-name { color: var(--accent-text); }
   html.android .pl-head h1, html.android .pl-head h1.logo-in-art { font-size: 25px; }
   html.android .play { font-size: 20px; padding: 0 16px; }
 }
-/* short ones: less art */
-@media (max-height: 720px) {
-  html.android #v-play > .banner.dbz { height: max(260px, 44vh); }
-  html.android .a-sheet { min-height: calc(100vh - max(260px, 44vh) + var(--r-sheet) + 28px); }
-}
 /* tablets (portrait ~800 x 1280): more air, the name in the header, two lists side by side */
 @media (min-width: 700px) {
   html.android { --row1: 68px; --row2: 76px; --gut: 28px; --r-sheet: 32px; }
@@ -442,8 +438,7 @@ html.android .st-top .r.mine .r-name { color: var(--accent-text); }
   html.android .tab { font-size: 40px; }
   html.android .me { padding: 6px 12px 6px 6px; }
   html.android .me-text { display: flex; }
-  html.android #v-play > .banner.dbz { height: 48vh; background-position: 50% 20%; }
-  html.android .a-sheet { min-height: calc(52vh + var(--r-sheet) + 28px); padding-top: 34px; }
+  html.android .a-sheet { padding-top: 34px; }
   html.android .pl-head h1, html.android .pl-head h1.logo-in-art { font-size: 40px; }
   html.android .pl-head p { font-size: 15px; }
   html.android .playline { padding-left: max(var(--gut), calc(50% - var(--wide) / 2)); padding-right: max(var(--gut), calc(50% - var(--wide) / 2)); }

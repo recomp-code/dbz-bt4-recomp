@@ -30,7 +30,7 @@
 
         <!-- The launcher: recomp-online's frontend in a WebView, the Go launcher behind it (liblauncher.so). -->
         <activity android:name="io.github.recompcode.dbzbt4.LauncherActivity"
-            android:screenOrientation="sensorLandscape"
+            android:screenOrientation="sensorPortrait"
             android:launchMode="singleTask"
             android:configChanges="orientation|screenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|smallestScreenSize"
             android:exported="true">

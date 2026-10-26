@@ -48,7 +48,7 @@
     const vp = document.querySelector('meta[name="viewport"]');
     if (vp && !/viewport-fit/.test(vp.content)) vp.content += ", viewport-fit=cover";
 
-    // Biblioteca: the art on the left; on the right a sheet with the game (edition, name, ISO, a few chips), the options
+    // Biblioteca: the art on top; over it a sheet with the game (edition, name, ISO, a few chips), the options
     // under it, and at its foot the action bar (JUGAR and the ISO button). Built from the page's own elements.
     const vplay = $("v-play"), pl = document.querySelector(".playline"), title = $("banner-title"), sub = $("banner-sub");
     const play = $("btn-play"), iso = $("btn-iso"), line = $("iso-line");
@@ -109,6 +109,10 @@
     // nothing may leave it scrolled down; the first touch hands the scroll to the player
     const main = document.querySelector("main");
     if (main) {
+      // the header is see-through over Biblioteca's art; once the page scrolls under it, it turns solid (a-solid)
+      const html = document.documentElement;
+      const solid = () => html.classList.toggle("a-solid", main.scrollTop > 24);
+      main.addEventListener("scroll", solid, { passive: true });
       if ("scrollRestoration" in history) history.scrollRestoration = "manual";
       let settle = true;
       const top = () => {
@@ -120,10 +124,12 @@
       const loop = () => { if (!settle || Date.now() > until) return; top(); requestAnimationFrame(loop); };
       top();
       requestAnimationFrame(loop);
-      window.addEventListener("load", () => { if (settle) top(); });
+      window.addEventListener("load", () => { if (settle) top(); solid(); });
+      // a tab change starts the new view at the top
+      document.querySelectorAll(".tab").forEach((t) => t.addEventListener("click", () => { main.scrollTop = 0; solid(); }));
     }
 
-    // En línea, signed out: the title and the pitch go into a card beside the form
+    // En línea, signed out: the title and the pitch go into a card above the form
     const login = $("login");
     if (login) {
       const intro = document.createElement("div");

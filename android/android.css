@@ -143,14 +143,10 @@ html.android .banner.dbz::after { content: none; }
 html.android .banner-lines, html.android .banner-txt { display: none; }
 
 html.android .a-sheet {
-  position: relative; z-index: 1; margin-top: calc(-1 * var(--r-sheet));
-  min-height: calc(100vh - var(--banner) + var(--r-sheet));
+  position: relative; z-index: 1; margin-top: 0;
+  min-height: calc(100vh - var(--banner));
   padding: 26px calc(var(--gut) + 6px + var(--sr)) calc(var(--act) + var(--sb) + 24px) calc(var(--gut) + 6px + var(--sl));
-  background: var(--sheet-bg); border-radius: var(--r-sheet) var(--r-sheet) 0 0;
-}
-html.android .a-sheet::before {   /* the sheet's handle */
-  content: ""; position: absolute; top: 10px; left: 50%; width: 38px; height: 4px; margin-left: -19px;
-  border-radius: 2px; background: #3a3a41;
+  background: var(--sheet-bg); border-radius: 0;   /* square, no handle: the art simply ends */
 }
 html.android .a-sheet-body { max-width: var(--wide); margin: 0 auto; }
 html.android .pl-head { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; min-width: 0; }

@@ -4,13 +4,15 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
+import android.system.ErrnoException;
+import android.system.Os;
 import android.view.Display;
 import android.view.WindowManager;
 
 import org.libsdl.app.SDLActivity;
 
 // The game: SDL's activity around libmain.so (the recompiled runner, with SDL linked in), in a process of its own
-// (":game"). The launcher's environment arrives as the "env" extra and is set before SDL_main runs; an ISO the document
+// (":game"). The launcher's environment arrives as the "env" extra and is set before libmain.so loads; an ISO the document
 // picker granted (content://) is opened here and handed to the runtime as /proc/self/fd/<n>.
 public class GameActivity extends SDLActivity {
     @Override
@@ -20,8 +22,8 @@ public class GameActivity extends SDLActivity {
 
     @Override
     protected void onCreate(Bundle state) {
-        super.onCreate(state);   // loads libmain.so
-        if (mBrokenLibraries) return;
+        // The environment goes in BEFORE super.onCreate loads libmain.so: the runtime reads some of it in static
+        // initializers, at load time (PS2X_FIBERS -> frame stepping, which online play needs to stay in sync).
         String[] env = getIntent().getStringArrayExtra("env");
         if (env != null) {
             for (String kv : env) {
@@ -36,9 +38,15 @@ public class GameActivity extends SDLActivity {
                         android.util.Log.e("recomp", "ISO", e);
                     }
                 }
-                nativeSetenv(k, v);
+                try {
+                    Os.setenv(k, v, true);
+                } catch (ErrnoException e) {
+                    android.util.Log.e("recomp", "setenv " + k, e);
+                }
             }
         }
+        super.onCreate(state);   // loads libmain.so
+        if (mBrokenLibraries) return;
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         prefer60Hz();
     }

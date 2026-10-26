@@ -282,22 +282,17 @@ html.android #v-settings #build-line { margin: 18px 2px 0; font-size: 13px; colo
 
 /* ---------------- En línea: sign in ---------------- */
 html.android .signin { max-width: 480px; margin: 0 auto; display: flex; flex-direction: column; gap: 12px; }
-html.android .a-intro {
-  display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; padding: 0 0 20px; border-radius: 22px;
-  overflow: hidden; background: var(--card);
-}
-html.android .a-intro::before {
-  content: ""; height: 190px; margin-bottom: 14px;
-  background: #0b0b0d url("img/dbz-bt4-header.jpg") center 18% / cover no-repeat;
-}
-html.android .a-intro h2, html.android .a-intro p { padding: 0 20px; }
+/* no art here (Biblioteca has it): a big title, one line under it, then the form; the buttons one under the other */
+html.android .a-intro { display: flex; flex-direction: column; gap: 8px; margin: 6px 0 14px; padding: 0; background: none; }
 html.android .signin h2 {
-  font-family: "Russo One", system-ui, sans-serif; font-weight: 400; font-size: 28px; line-height: 1.1; text-transform: uppercase; color: #fff;
+  font-family: "Russo One", system-ui, sans-serif; font-weight: 400; font-size: 30px; line-height: 1.1; text-transform: uppercase; color: #fff;
 }
-html.android .signin p { margin: 0; font-size: 14px; color: var(--dim); }
+html.android .signin p { margin: 0; font-size: 15px; color: var(--dim); }
+html.android .signin input { min-height: 54px; border-radius: 14px; font-size: 16px; }
 html.android .signin .err { min-height: 0; }
 html.android .signin .err:empty { display: none; }
-html.android .signin .btnrow { margin-top: 4px; }
+html.android .signin .btnrow { margin-top: 6px; flex-direction: column; gap: 10px; }
+html.android .signin .btnrow > * { width: 100%; min-height: 54px; border-radius: 14px; font-size: 16px; }
 html.android .signin small { margin: 4px 2px 0; color: var(--faint); }
 
 /* ---------------- En línea: the lobby (one column) ---------------- */

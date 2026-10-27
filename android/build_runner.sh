@@ -27,6 +27,9 @@ lto)   B=build-android-lto; $TC/llvm-profdata merge -o "$WORK/pgo/runner.profdat
        L="$L -flto=thin -Wl,--thinlto-jobs=10 -Wl,--thinlto-cache-dir=$WORK/thinlto-cache" ;;
 *) echo "usage: build_runner.sh plain|gen|use|lto" >&2; exit 9 ;;
 esac
+# A new profile under the same path does not change the flags, so ninja would only relink: put the profile's hash in
+# the flags (a define nothing reads) and every object recompiles when, and only when, the profile changes.
+case $MODE in use|lto) F="$F -DPS2X_PGO_PROFILE=$(shasum "$WORK/pgo/runner.profdata" | cut -c1-12)" ;; esac
 PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR="$WORK/ffmpeg/lib/pkgconfig" cmake -S . -B $B -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=31 \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DPS2X_ENABLE_SCCACHE=OFF -DPS2X_FORCE_PGS=ON \

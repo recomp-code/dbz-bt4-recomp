@@ -821,6 +821,27 @@
      target_link_libraries(ps2_runtime PUBLIC OpenGL::GL ${CMAKE_DL_LIBS})
  endif()
  
+--- a/ps2xRuntime/include/runtime/ps2_audio.h
++++ b/ps2xRuntime/include/runtime/ps2_audio.h
+@@ -56,6 +56,7 @@
+         uint64_t consumedSamples = 0;   // cumulative samples accepted by the device
+         uint64_t gapSamples = 0;        // guest samples that never reached the device
+         size_t pending = 0;             // samples still queued ahead of the device
++        size_t inDevice = 0;            // samples handed to the device and not yet played (SDL backend)
+         uint32_t sampleRate = 0;        // the rate this stream was declared at (what the device consumes per second)
+     };
+     StreamProgress streamProgress(uint32_t streamId);
+--- a/ps2xRuntime/include/runtime/ps2_host_audio.h
++++ b/ps2xRuntime/include/runtime/ps2_host_audio.h
+@@ -35,6 +35,8 @@
+     void playStream(Stream s);
+     void stopStream(Stream s);
+     bool streamProcessed(Stream s);
++    // input frames handed to the device and not yet pulled by it (0 where the backend cannot tell)
++    uint32_t streamQueuedFrames(Stream s);
+     // `frames` interleaved int16 frames of the stream's channel count; frameCount == chunkFrames.
+     void updateStream(Stream s, const int16_t *frames, uint32_t frameCount);
+ 
 --- a/ps2xRuntime/src/lib/game_overrides.cpp
 +++ b/ps2xRuntime/src/lib/game_overrides.cpp
 @@ -129,6 +129,10 @@
@@ -834,7 +855,23 @@
  #include <cstdlib>   // [skipforce] std::strtoul
  
  // [wlk] overlay-table externs (file scope — block-scope extern inside the anon namespace mislinks)
-@@ -7360,12 +7364,18 @@
+@@ -2414,7 +2418,15 @@
+             else
+             {
+                 const auto prog = runtime->audioBackend().streamProgress(kSeStreamId);
++#if defined(__ANDROID__)
++                // [android] count what the device already holds too: everything queued ahead of the ear is the
++                // effects' latency. ~116 ms in all (it was 3072 here PLUS up to the device's whole depth, ~230 ms),
++                // and the device may take all of it (eight buffers deep), so a late frame no longer drains it dry
++                constexpr size_t kSeTargetTotal = 2560;
++                if (prog.pending + prog.inDevice >= kSeTargetTotal)
++#else
+                 if (prog.pending >= kSeTargetPending)
++#endif
+                 {
+                     // The target IS this stream's whole cushion -- nothing more is produced until
+                     // the device drains some -- so tell the backend to start with it. Without this
+@@ -7360,12 +7372,18 @@
                  // Bounded: never wait more than ~50 ms, so a stalled vblank worker cannot hang
                  // the guest (the failure mode I wrongly suspected of [asyncpace] earlier tonight).
                  Ps2xWaitScope wgate(WP_FRAMEGATE);   // [waitprof]
@@ -853,7 +890,7 @@
                  s_lastTick = ps2_syscalls::GetCurrentVSyncTick();
              }
          }
-@@ -7380,6 +7390,10 @@
+@@ -7380,6 +7398,10 @@
              g_guestThreadCpuNs.store((uint64_t)tg.tv_sec * 1000000000ull + (uint64_t)tg.tv_nsec,
                                       std::memory_order_relaxed);
  #endif
@@ -947,7 +984,18 @@
  }
  
  struct PS2AudioBackend::Impl
-@@ -593,10 +612,11 @@
+@@ -388,6 +407,10 @@
+     p.gapSamples = it->second.gap;
+     p.pending = it->second.ring.size();
+     p.sampleRate = it->second.sampleRate;
++    {
++        auto hs = m_impl->streams.find(streamId);
++        if (hs != m_impl->streams.end()) p.inDevice = ps2x_audio::streamQueuedFrames(hs->second);
++    }
+     return p;
+ }
+ 
+@@ -593,10 +616,11 @@
          }
          if (m_impl->streams.find(kPairKey) == m_impl->streams.end())
          {
@@ -1200,15 +1248,14 @@
  #endif
 --- a/ps2xRuntime/src/lib/ps2_host_audio.cpp
 +++ b/ps2xRuntime/src/lib/ps2_host_audio.cpp
-@@ -146,11 +146,16 @@
-                 }
+@@ -147,10 +147,15 @@
                  return n / 2;
              }
-+
+ 
 +            // [devrate] device frames the callback was asked for: reported from the feed side every ~10 s, so a device
 +            // that pulls slower than its rate (the audio thread starved) shows as a number below the rate
 +            std::atomic<uint64_t> s_pulled{0};
- 
++
              void SDLCALL callback(void *, Uint8 *buf, int len)
              {
                  float *out = reinterpret_cast<float *>(buf);
@@ -1217,7 +1264,25 @@
                  std::memset(buf, 0, size_t(len));
                  for (auto &e : s_streams)
                      if (e.second.playing)
-@@ -334,6 +339,25 @@
+@@ -304,6 +309,17 @@
+                     }
+                 }
+                 setPlayingDiag(h, on, queued);
++            }
++
++            // what the converter really holds, as input frames: queuedIn is a running estimate that the resampler's
++            // rounding moves (it is only snapped back when the stream runs dry), the converter's output is exact
++            uint32_t queued(Stream h)
++            {
++                Lock lk;
++                auto it = s_streams.find(h);
++                if (it == s_streams.end() || !it->second.cvt || it->second.rate == 0) return 0u;
++                const double outFrames = double(SDL_AudioStreamAvailable(it->second.cvt)) / double(2 * sizeof(float));
++                return uint32_t(outFrames * double(it->second.rate) / double(s_devRate));
+             }
+ 
+             bool processed(Stream h)
+@@ -334,6 +350,25 @@
  
              void update(Stream h, const int16_t *frames, uint32_t frameCount)
              {
@@ -1243,6 +1308,22 @@
                  uint32_t under = 0, underFrames = 0; double queued = 0.0;
                  {
                      Lock lk;
+@@ -510,6 +545,15 @@
+         return false;
+     }
+ 
++    uint32_t streamQueuedFrames(Stream s)
++    {
++#if defined(PS2X_HAVE_SDL2)
++        if (s_backend == Backend::Sdl2) return sdl::queued(s);
++#endif
++        (void)s;
++        return 0;
++    }
++
+     void updateStream(Stream s, const int16_t *frames, uint32_t frameCount)
+     {
+         if (!frames || frameCount == 0) return;
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -8463,6 +8463,11 @@

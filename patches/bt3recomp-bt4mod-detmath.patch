@@ -1,0 +1,68 @@
+--- a/ps2xRuntime/include/ps2x_detmath.h
++++ b/ps2xRuntime/include/ps2x_detmath.h
+@@ -0,0 +1,44 @@
++#pragma once
++// ps2xDetAcosf: acosf from musl (MIT; derived from FreeBSD msun, Sun Microsystems 1993), float arithmetic and an
++// IEEE sqrtf only, so it is bit-identical on every platform built with -ffp-contract=off (the host libms are not:
++// Apple's, bionic's and MSVC's acosf disagree in the last bit for many inputs).
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++static inline float ps2xDetAcosfR(float z)
++{
++    const float pS0 = 1.6666586697e-01f, pS1 = -4.2743422091e-02f, pS2 = -8.6563630030e-03f, qS1 = -7.0662963390e-01f;
++    const float p = z * (pS0 + z * (pS1 + z * pS2));
++    const float q = 1.0f + z * qS1;
++    return p / q;
++}
++static inline float ps2xDetAcosf(float x)
++{
++    const float pio2_hi = 1.5707962513e+00f, pio2_lo = 7.5497894159e-08f;
++    uint32_t hx; std::memcpy(&hx, &x, 4);
++    const uint32_t ix = hx & 0x7fffffffu;
++    if (ix >= 0x3f800000u)
++    {
++        if (ix == 0x3f800000u) return (hx >> 31) ? 2.0f * pio2_hi + 0x1p-120f : 0.0f;
++        return 0.0f / (x - x);
++    }
++    if (ix < 0x3f000000u)
++    {
++        if (ix <= 0x32800000u) return pio2_hi + 0x1p-120f;
++        return pio2_hi - (x - (pio2_lo - x * ps2xDetAcosfR(x * x)));
++    }
++    if (hx >> 31)
++    {
++        const float z = (1.0f + x) * 0.5f;
++        const float s = std::sqrt(z);
++        const float w = ps2xDetAcosfR(z) * s - pio2_lo;
++        return 2.0f * (pio2_hi - (s + w));
++    }
++    const float z = (1.0f - x) * 0.5f;
++    const float s = std::sqrt(z);
++    uint32_t hs; std::memcpy(&hs, &s, 4); hs &= 0xfffff000u;
++    float df; std::memcpy(&df, &hs, 4);
++    const float c = (z - df * df) / (s + df);
++    const float w = ps2xDetAcosfR(z) * s + c;
++    return 2.0f * (df + w);
++}
+--- a/ps2xRuntime/src/lib/game_overrides.cpp
++++ b/ps2xRuntime/src/lib/game_overrides.cpp
+@@ -109,6 +109,7 @@
+ 
+ #define XXH_INLINE_ALL
+ #include "thirdparty/xxhash.h"   // [dethash]
++#include "ps2x_detmath.h"         // [detmath]
+ #include "runtime/ps2_gs_gpu_renderer.h"
+ #include <algorithm>
+ #include <array>
+@@ -4301,7 +4302,9 @@
+         (void)rdram; (void)runtime;
+         const float in = ctx->f[12];
+         const float c = (in > 1.0f) ? 1.0f : ((in < -1.0f) ? -1.0f : (std::isnan(in) ? 1.0f : in));
+-        ctx->f[0] = std::acos(c);
++        // [detmath] not the host's acosf: Apple's, bionic's and MSVC's differ in the last bit for many inputs, and the
++        // hair physics fed by this drifted two online players apart within a fight (Mac vs Android, measured)
++        ctx->f[0] = ps2xDetAcosf(c);
+         ctx->pc = getRegU32(ctx, 31); // jr $ra
+     }
+ 

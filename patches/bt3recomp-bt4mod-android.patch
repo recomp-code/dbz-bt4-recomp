@@ -844,7 +844,7 @@
  
 --- a/ps2xRuntime/src/lib/game_overrides.cpp
 +++ b/ps2xRuntime/src/lib/game_overrides.cpp
-@@ -129,6 +129,10 @@
+@@ -130,6 +130,10 @@
  #include <vector>
  #include <unordered_map>
  #include <cstring>
@@ -855,7 +855,7 @@
  #include <cstdlib>   // [skipforce] std::strtoul
  
  // [wlk] overlay-table externs (file scope — block-scope extern inside the anon namespace mislinks)
-@@ -2414,7 +2418,15 @@
+@@ -2415,7 +2419,15 @@
              else
              {
                  const auto prog = runtime->audioBackend().streamProgress(kSeStreamId);
@@ -871,7 +871,7 @@
                  {
                      // The target IS this stream's whole cushion -- nothing more is produced until
                      // the device drains some -- so tell the backend to start with it. Without this
-@@ -7360,12 +7372,18 @@
+@@ -7363,12 +7375,18 @@
                  // Bounded: never wait more than ~50 ms, so a stalled vblank worker cannot hang
                  // the guest (the failure mode I wrongly suspected of [asyncpace] earlier tonight).
                  Ps2xWaitScope wgate(WP_FRAMEGATE);   // [waitprof]
@@ -890,7 +890,7 @@
                  s_lastTick = ps2_syscalls::GetCurrentVSyncTick();
              }
          }
-@@ -7380,6 +7398,10 @@
+@@ -7383,6 +7401,10 @@
              g_guestThreadCpuNs.store((uint64_t)tg.tv_sec * 1000000000ull + (uint64_t)tg.tv_nsec,
                                       std::memory_order_relaxed);
  #endif

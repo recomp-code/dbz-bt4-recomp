@@ -267,7 +267,7 @@
 +}
 --- a/ps2xRuntime/android/perf_hint.cpp
 +++ b/ps2xRuntime/android/perf_hint.cpp
-@@ -0,0 +1,197 @@
+@@ -0,0 +1,233 @@
 +// [android] ADPF (Android Dynamic Performance Framework, API 33+): once per game frame the guest thread reports how long
 +// the frame took against its budget (16.7 ms at 60 fps, 33.3 at 30), so the system raises clocks / moves the game's
 +// threads to the big cores BEFORE frames are missed. The duration is the wall time from one frame to the next minus the
@@ -350,6 +350,8 @@
 +        double slowFor = 0.0, fastFor = 0.0, sinceChange = 0.0;   // [dynres] seconds behind / with room / since the last step
 +        double workAvg = 0.0, workBeforeStep = 0.0, holdFor = 0.0; bool checkAfterStep = false;   // [dynres] did the step help?
 +        double behind60 = 0.0; bool auto30 = false;   // [auto30] seconds the 60 fps mode could not keep up with nothing left to give
++        void *thermal = nullptr; float (*headroom)(void *, int) = nullptr; double thermalIn = 0.0;   // [thermal]
++        float cap = 1.0f;   // [thermal] the dynres ceiling the phone's temperature allows
 +    };
 +    thread_local Hint t_hint;   // only the guest thread reports
 +
@@ -408,6 +410,40 @@
 +    if (want != h.target) { h.target = want; if (h.session) h.update(h.session, want); }
 +    const int64_t work = dt - int64_t(pacingWaitNs);
 +    if (work > 0 && h.session) h.report(h.session, work);
++    {   // [thermal] Android's thermal headroom forecast (API 31; 1.0 = the point where the system throttles): as the phone
++        // nears it the upscaler's output is capped -- 85 % from 0.8, 70 % from 0.92 -- so it sheds GPU work (and heat)
++        // before the governor halves the clocks, which costs far more. Given back when it cools (below 0.7). Asked every
++        // 3 s (the API rate-limits). PS2X_THERMAL=0 turns it off.
++        static const bool s_on = [](){ const char *v = std::getenv("PS2X_THERMAL"); return !(v && v[0] == '0'); }();
++        static bool s_init = false;
++        if (s_on && !s_init)
++        {
++            s_init = true;
++            if (void *lib = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL))
++            {
++                auto acquire = reinterpret_cast<void *(*)()>(dlsym(lib, "AThermal_acquireManager"));
++                h.headroom = reinterpret_cast<float (*)(void *, int)>(dlsym(lib, "AThermal_getThermalHeadroom"));
++                if (acquire && h.headroom) h.thermal = acquire();
++            }
++            std::fprintf(stderr, "[thermal] headroom API %s\n", h.thermal ? "on" : "not available");
++        }
++        h.thermalIn -= double(dt) * 1e-9;
++        if (h.thermal && h.thermalIn <= 0.0)
++        {
++            h.thermalIn = 3.0;
++            const float hr = h.headroom(h.thermal, 10);   // forecast 10 s ahead
++            if (hr == hr)   // NaN when asked too often or unsupported
++            {
++                const float cap = hr >= 0.92f ? 0.7f : hr >= 0.8f ? 0.85f : hr < 0.7f ? 1.0f : h.cap;
++                if (cap != h.cap)
++                {
++                    h.cap = cap;
++                    std::fprintf(stderr, "[thermal] headroom %.2f: upscaler output capped at %.0f%%\n", hr, cap * 100.0f);
++                    if (g_dynRes.load(std::memory_order_relaxed) > cap) g_dynRes.store(cap, std::memory_order_relaxed);
++                }
++            }
++        }
++    }
 +    {   // [dynres] behind for ~1 s: one step down; with room for 5 s: one step up; at most one step every 2 s
 +        static const bool s_on = [](){ const char *v = std::getenv("PS2X_DYNRES"); return !(v && v[0] == '0'); }();
 +        if (s_on)
@@ -437,7 +473,7 @@
 +                h.workBeforeStep = h.workAvg; h.checkAfterStep = true;
 +                r = std::max(0.6f, r - 0.1f); h.sinceChange = h.slowFor = 0.0;
 +            }
-+            else if (h.sinceChange > 2.0 && h.fastFor > 5.0 && r < 1.0f) { r = std::min(1.0f, r + 0.1f); h.sinceChange = h.fastFor = 0.0; }
++            else if (h.sinceChange > 2.0 && h.fastFor > 5.0 && r < h.cap - 0.01f) { r = std::min(h.cap, r + 0.1f); h.sinceChange = h.fastFor = 0.0; }
 +            else r = -1.0f;
 +            if (r > 0.0f) { g_dynRes.store(r, std::memory_order_relaxed); std::fprintf(stderr, "[dynres] upscaler output %.0f%%\n", r * 100.0f); }
 +        }
@@ -1326,7 +1362,58 @@
          if (!frames || frameCount == 0) return;
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
-@@ -8463,6 +8463,11 @@
+@@ -116,6 +116,7 @@
+ #include <pthread.h>
+ #include <sched.h>
+ #include <unistd.h>
++#include <map>
+ #include <set>
+ #endif
+ #include "ThreadNaming.h"
+@@ -745,6 +746,34 @@
+         }
+         else
+         {
++#if defined(__ANDROID__)
++            {   // [android] phones mix fast and slow cores (Pixel 7a: 2 x X1 2.85 GHz, 2 x A78 2.35, 4 x A55 1.8): the
++                // game thread on the fastest cluster (a guest frame that lands on a little core runs ~2.5x slower;
++                // unpinned on a POCO F8 Ultra the guest took 10.5-13 ms a frame, pinned 5.5-7.5). Clusters by
++                // cpuinfo_max_freq; a phone whose cores are all alike gets no pin.
++                std::map<long, std::vector<int>, std::greater<long>> byFreq;
++                for (int c : ps2xOnlineCpus(&allowed))
++                {
++                    std::ifstream f("/sys/devices/system/cpu/cpu" + std::to_string(c) + "/cpufreq/cpuinfo_max_freq");
++                    long khz = 0;
++                    if (f && (f >> khz) && khz > 0) byFreq[khz].push_back(c);
++                }
++                if (byFreq.size() < 2)
++                {
++                    std::fprintf(stderr, "[pinthreads] android: %zu core cluster(s), no pin\n", byFreq.size());
++                    return false;
++                }
++                // the GL/present thread anywhere but the slowest cluster (a phone with two clusters: anywhere at all --
++                // kept off the prime cores it waited behind the game's frame, p95 17.7 -> 19.1 ms on a POCO F8 Ultra)
++                g = byFreq.begin()->second;
++                for (auto it = byFreq.begin(); it != byFreq.end(); ++it)
++                    if (byFreq.size() < 3 || std::next(it) != byFreq.end()) m.insert(m.end(), it->second.begin(), it->second.end());
++                std::sort(m.begin(), m.end());
++                std::fprintf(stderr, "[pinthreads] android clusters: %zu (fastest %ld kHz)\n", byFreq.size(), byFreq.begin()->first);
++            }
++            if (false)
++#endif
++            {
+             // Auto counts physical cores only within the affinity WE are allowed (so a
+             // taskset -c 0,1 or a 2-core container engages exactly like a real 2-core box).
+             const std::vector<int> cores = ps2xCoreFirstCpus(&allowed);
+@@ -756,6 +785,7 @@
+             }
+             g = ps2xCoreCpus(cores[0]);            // whole core A (both SMT threads)
+             m = ps2xCoreCpus(cores[1]);            // whole core B
++            }
+         }
+         auto prune = [&](std::vector<int> &sel)
+         {
+@@ -8463,6 +8493,11 @@
                      // (offline only: the FOV floats are game state, and two players with different FOVs desync -- measured: 4800
                      // desyncs in 7800 frames, 21:9 vs 16:9 -- so online every player keeps the shared 16:9)
                      wsScale = (s_uw && !ps2NetActive() && rel > 1.01f) ? std::min(rel, 1.9f) : 1.0f;
@@ -1338,7 +1425,7 @@
                      // the mod's HUD is drawn for the 16:9 stretch: on a wider window it is squeezed back by the same factor
                      // (edge-pinned: the bars stay at the screen's edges, the timer in the middle, nothing stretched)
                      extern float g_ps2xWsHudRel;
-@@ -9026,6 +9031,13 @@
+@@ -9026,6 +9061,13 @@
          {
              dstWidth = screenWidth;
              dstHeight = screenHeight;

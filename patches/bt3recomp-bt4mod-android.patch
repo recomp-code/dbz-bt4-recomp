@@ -907,7 +907,35 @@
                  {
                      // The target IS this stream's whole cushion -- nothing more is produced until
                      // the device drains some -- so tell the backend to start with it. Without this
-@@ -7386,12 +7398,18 @@
+@@ -2485,7 +2497,27 @@
+                     if (!prog.started)
+                         runtime->audioBackend().requestStreamStart(kSeStreamId);   // same as the wall-clock path
+                     continue;
++                }
++#if defined(__ANDROID__)
++                // [android] stepped mode mixes exactly what each tick is due, so nothing ever builds a lead over the
++                // device: any late frame left it dry (online on a POCO: 228 underruns in 2 min, crackly effects).
++                // When less than ~46 ms is queued ahead of the ear, a chunk of silence goes in first: the lead comes
++                // back and stays (production = consumption). Device-side only: what the voices mix, and when, still
++                // follows the ticks.
++                if (prog.known && prog.started && prog.pending + prog.inDevice < 2u * kSeChunk)
++                {
++                    static const int16_t s_zero[kSeChunk] = {};
++                    runtime->audioBackend().onStreamPcm(kSeStreamId, s_zero, static_cast<uint32_t>(kSeChunk), kSeMixRate);
+                 }
++                // ...and the lead must not keep growing (each top-up stays in the queue): above ~140 ms a near-silent
++                // chunk is skipped -- the latency comes back down without cutting into any sound
++                else if (prog.known && prog.started && prog.pending + prog.inDevice > 6u * kSeChunk)
++                {
++                    int peak = 0;
++                    for (size_t i = 0; i < used; ++i) peak = std::max(peak, std::abs(int(out[i])));
++                    if (peak < 64) continue;
++                }
++#endif
+             }
+             runtime->audioBackend().onStreamPcm(kSeStreamId, out,
+                                                 static_cast<uint32_t>(used), kSeMixRate);
+@@ -7386,12 +7418,18 @@
                  // Bounded: never wait more than ~50 ms, so a stalled vblank worker cannot hang
                  // the guest (the failure mode I wrongly suspected of [asyncpace] earlier tonight).
                  Ps2xWaitScope wgate(WP_FRAMEGATE);   // [waitprof]
@@ -926,17 +954,17 @@
                  s_lastTick = ps2_syscalls::GetCurrentVSyncTick();
              }
          }
-@@ -7406,6 +7424,10 @@
+@@ -7405,6 +7443,10 @@
+             struct timespec tg; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &tg);
              g_guestThreadCpuNs.store((uint64_t)tg.tv_sec * 1000000000ull + (uint64_t)tg.tv_nsec,
                                       std::memory_order_relaxed);
- #endif
++#endif
 +#if defined(__ANDROID__)
 +            ps2xAndroidFrameHint(t_ps2xPacingWaitNs, ps2VStepActive());   // [adpf] this frame's work to the system
 +            t_ps2xPacingWaitNs = 0;
-+#endif
+ #endif
          }
          {   // [init114] lifecycle: periodic read of the resident texture table rec0/rec14 ptrs
-             static const bool s_i14 = [](){ const char *v = std::getenv("PS2X_INIT114"); return v && v[0] && v[0] != '0'; }();
 --- a/ps2xRuntime/src/lib/pad_config.cpp
 +++ b/ps2xRuntime/src/lib/pad_config.cpp
 @@ -25,6 +25,32 @@

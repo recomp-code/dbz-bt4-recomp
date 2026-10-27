@@ -503,7 +503,7 @@
 +}
 --- a/ps2xRuntime/android/touch_pad.cpp
 +++ b/ps2xRuntime/android/touch_pad.cpp
-@@ -0,0 +1,257 @@
+@@ -0,0 +1,267 @@
 +// [android] On-screen touch controls: a floating left stick, the D-pad, the four face buttons, L1/L2/R1/R2, L3/R3,
 +// Select/Start and a menu button (the settings overlay). Fingers arrive as SDL touch events (an event watch, so nothing
 +// is consumed); pad_config's poll() ORs the result into player 1's packet; the settings overlay draws the layout with
@@ -687,6 +687,8 @@
 +extern "C" bool ps2xTouchTakeMenu() { return g_menuEdge.exchange(false); }
 +
 +// Inside an ImGui frame: the layout on the foreground draw list, pressed buttons brighter.
++extern "C" uint32_t ps2xHostPadPresses();   // [touchhide] ps2_host_pad.cpp
++extern "C" int ps2xHostPadOpen();
 +extern "C" void ps2xTouchDraw()
 +{
 +    if (!g_watching)
@@ -696,6 +698,14 @@
 +        // a controller connected before the game started sent its "added" event before this watch existed: hide now
 +        for (int i = 0; i < SDL_NumJoysticks(); ++i)
 +            if (SDL_IsGameController(i)) { g_visible = false; break; }
++    }
++    {   // [touchhide] the last input wins: a pad that appears, or any press on a pad, hides the buttons again after a
++        // touch showed them. Polled from the pad backend (ps2_host_pad.cpp), which reads with SDL's controller events
++        // off: SDL_CONTROLLERDEVICEADDED above only arrives from other backends.
++        static uint32_t s_presses = 0; static int s_open = 0;
++        const uint32_t presses = ps2xHostPadPresses(); const int open = ps2xHostPadOpen();
++        if (presses != s_presses || open > s_open) g_visible = false;
++        s_presses = presses; s_open = open;
 +    }
 +    const ImVec2 ds = ImGui::GetIO().DisplaySize;
 +    const float fbx = ImGui::GetIO().DisplayFramebufferScale.x > 0 ? ImGui::GetIO().DisplayFramebufferScale.x : 1.0f;
@@ -5617,3 +5627,197 @@
  
  ## Bundled assets
  
+--- a/ps2xRuntime/include/ps2x_isofd.h
++++ b/ps2xRuntime/include/ps2x_isofd.h
+@@ -0,0 +1,65 @@
++#pragma once
++// [isofd] On Android the ISO is the document the player picked (content://), which GameActivity opens and hands to the
++// runtime as an inherited descriptor: PS2X_CD_IMAGE=/proc/self/fd/<n>. Opening that path again goes back through the
++// storage daemon, which refuses this app a file another app put in Downloads ("Permission to access file ... is
++// denied", the game then boots to a black screen): the readers below use the descriptor itself, with pread (no shared
++// file offset between threads) and fstat.
++#include <cstddef>
++#include <cstdint>
++#include <cstdlib>
++#include <string>
++#if !defined(_WIN32)
++#include <sys/stat.h>
++#include <unistd.h>
++#endif
++
++// the descriptor behind a /proc/self/fd/<n> path, or -1 for any other path
++inline int ps2xInheritedFd(const std::string &path)
++{
++#if defined(_WIN32)
++    (void)path;
++    return -1;
++#else
++    static const char kPrefix[] = "/proc/self/fd/";
++    if (path.compare(0, sizeof(kPrefix) - 1, kPrefix) != 0)
++        return -1;
++    char *end = nullptr;
++    const long fd = std::strtol(path.c_str() + sizeof(kPrefix) - 1, &end, 10);
++    return (end && *end == '\0' && fd >= 0) ? int(fd) : -1;
++#endif
++}
++
++// reads up to n bytes at off; returns the bytes read (short at the end of the file), -1 on error
++inline long long ps2xFdRead(int fd, void *dst, size_t n, uint64_t off)
++{
++#if defined(_WIN32)
++    (void)fd; (void)dst; (void)n; (void)off;
++    return -1;
++#else
++    size_t done = 0;
++    while (done < n)
++    {
++        const ssize_t r = ::pread(fd, static_cast<char *>(dst) + done, n - done, off_t(off + done));
++        if (r < 0)
++            return -1;
++        if (r == 0)
++            break;
++        done += size_t(r);
++    }
++    return (long long)done;
++#endif
++}
++
++inline bool ps2xFdSize(int fd, uint64_t &out)
++{
++#if defined(_WIN32)
++    (void)fd; (void)out;
++    return false;
++#else
++    struct stat st;
++    if (::fstat(fd, &st) != 0)
++        return false;
++    out = uint64_t(st.st_size);
++    return true;
++#endif
++}
+--- a/ps2xRuntime/src/lib/ps2_host_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_host_pad.cpp
+@@ -17,6 +17,15 @@
+ #include <cstring>
+ #include <set>
+ #include <string>
++#include <atomic>
++
++// [touchhide] How many times any pad went from idle to pressed, and how many pads are open: the Android touch buttons
++// (android/touch_pad.cpp) hide on either. This backend reads the pads by polling with SDL's controller events off
++// (SDL_IGNORE below), so an event watch never sees a controller button or a controller being added.
++static std::atomic<uint32_t> g_hostPadPresses{0};
++static std::atomic<int> g_hostPadOpen{0};
++extern "C" uint32_t ps2xHostPadPresses() { return g_hostPadPresses.load(std::memory_order_relaxed); }
++extern "C" int ps2xHostPadOpen() { return g_hostPadOpen.load(std::memory_order_relaxed); }
+ 
+ namespace ps2x_pad
+ {
+@@ -302,13 +311,24 @@
+                 // SetWindowSize/fullscreen toggle posts synchronously.
+                 SDL_FlushEvents(SDL_JOYAXISMOTION, SDL_FINGERDOWN - 1);
+                 scanHotplug();
++                int open = 0; bool active = false;
+                 for (Slot &s : s_slots)
+                 {
+                     if (!s.js) continue;
+                     if (s.gc) readMapped(s); else readRaw(s);
+                     s.btn[kBtnLT] = s.ax[kAxLT] > 0.1f ? 1 : 0;   // raylib's trigger-as-button rule
+                     s.btn[kBtnRT] = s.ax[kAxRT] > 0.1f ? 1 : 0;
++                    if (!s.controller) continue;   // a joystick that is not a gamepad (a sensor some phones list) never hides them
++                    ++open;
++                    for (uint8_t b : s.btn) active |= b != 0;
++                    active |= s.ax[kAxLX] > 0.5f || s.ax[kAxLX] < -0.5f || s.ax[kAxLY] > 0.5f || s.ax[kAxLY] < -0.5f;
+                 }
++                {   // [touchhide]
++                    static bool s_wasActive = false;
++                    if (active && !s_wasActive) g_hostPadPresses.fetch_add(1, std::memory_order_relaxed);
++                    s_wasActive = active;
++                    g_hostPadOpen.store(open, std::memory_order_relaxed);
++                }
+             }
+ 
+             const Slot *slot(int i)
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+@@ -1,4 +1,5 @@
+ #include "ps2_waitprof.h"   // [waitprof]
++#include "ps2x_isofd.h"     // [isofd]
+ #include "runtime/ps2_gs_pgs.h"   // [s1fence] streamPriv
+ #include "runtime/ps2_gs_live.h"   // [gslive]
+ #include <algorithm>
+@@ -252,9 +253,14 @@
+         if (!g_cdImageSizeValid || g_cdImageSizePath != imagePath)
+         {
+             std::error_code ec;
+-            g_cdImageSizeBytes = static_cast<uint64_t>(std::filesystem::file_size(imagePath, ec));
+             g_cdImageSizePath = imagePath;
+-            g_cdImageSizeValid = !ec;
++            if (const int fd = ps2xInheritedFd(imagePath.string()); fd >= 0)   // [isofd]
++                g_cdImageSizeValid = ps2xFdSize(fd, g_cdImageSizeBytes);
++            else
++            {
++                g_cdImageSizeBytes = static_cast<uint64_t>(std::filesystem::file_size(imagePath, ec));
++                g_cdImageSizeValid = !ec;
++            }
+         }
+         if (!g_cdImageSizeValid)
+         {
+@@ -776,6 +782,12 @@
+         }
+ 
+         std::memset(dst, 0, byteCount);
++        if (const int fd = ps2xInheritedFd(path.string()); fd >= 0)   // [isofd]
++        {
++            const bool ok = ps2xFdRead(fd, dst, byteCount, offsetBytes) >= 0;
++            g_lastCdError = ok ? 0 : -1;
++            return ok;
++        }
+         std::ifstream file(path, std::ios::binary);
+         if (!file.is_open())
+         {
+--- a/ps2xRuntime/src/lib/ps2_iop.cpp
++++ b/ps2xRuntime/src/lib/ps2_iop.cpp
+@@ -6,6 +6,7 @@
+ #include "runtime/ps2_iop_sdrdrv.h"
+ #include "runtime/ps2_memory.h"
+ #include "ps2_runtime.h"
++#include "ps2x_isofd.h"   // [isofd]
+ #include "Kernel/Syscalls/RPC.h"
+ #include "Kernel/Stubs/CD.h"
+ #include <fstream>
+@@ -28,10 +29,12 @@
+     bool iso9660Resolve(const std::string &imagePath, const std::string &guestPath,
+                         uint32_t &lbnOut, uint32_t &sizeOut)
+     {
+-        std::ifstream f(imagePath, std::ios::binary);
+-        if (!f.is_open()) return false;
++        const int inheritedFd = ps2xInheritedFd(imagePath);   // [isofd]
++        std::ifstream f;
++        if (inheritedFd < 0) { f.open(imagePath, std::ios::binary); if (!f.is_open()) return false; }
+         auto readSector = [&](uint32_t lbn, std::vector<uint8_t> &buf) -> bool {
+             buf.resize(2048);
++            if (inheritedFd >= 0) return ps2xFdRead(inheritedFd, buf.data(), 2048, uint64_t(lbn) * 2048u) > 0;
+             f.seekg(static_cast<std::streamoff>(lbn) * 2048);
+             f.read(reinterpret_cast<char *>(buf.data()), 2048);
+             return f.good() || f.gcount() > 0;
+--- a/ps2xRuntime/src/lib/ps2_iop_sdrdrv.cpp
++++ b/ps2xRuntime/src/lib/ps2_iop_sdrdrv.cpp
+@@ -2,6 +2,7 @@
+ #include "runtime/ps2_iop.h"
+ #include "runtime/ps2_memory.h"
+ #include "ps2_runtime.h"
++#include "ps2x_isofd.h"   // [isofd]
+ 
+ #include <algorithm>
+ #include <array>
+@@ -75,6 +76,9 @@
+         }
+ 
+         std::memset(dst, 0, byteCount);
++
++        if (const int fd = ps2xInheritedFd(path.string()); fd >= 0)   // [isofd]
++            return ps2xFdRead(fd, dst, byteCount, offsetBytes) >= 0;
+ 
+         std::ifstream file(path, std::ios::binary);
+         if (!file.is_open())

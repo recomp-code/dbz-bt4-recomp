@@ -41,7 +41,7 @@ Zamas, Jiren, Hit, Caulifla, Kale...) and stages (Tournament of Power, Champa's 
 
 | Windows 10/11 (64-bit, GPU with Vulkan) | Mac (Apple Silicon, macOS 14+) | Android 12+ (arm64, Vulkan 2022+) |
 | --- | --- | --- |
-| **[⬇ DBZ_BT4_Windows.zip](https://github.com/recomp-code/dbz-bt4-recomp/releases/latest/download/DBZ_BT4_Windows.zip)** | **[⬇ DBZ_BT4_Mac.zip](https://github.com/recomp-code/dbz-bt4-recomp/releases/latest/download/DBZ_BT4_Mac.zip)** | **[⬇ DBZ_BT4_Android.apk](https://github.com/recomp-code/dbz-bt4-recomp/releases/download/android-v3.4.6/DBZ_BT4_Android.apk)** |
+| **[⬇ DBZ_BT4_Windows.zip](https://github.com/recomp-code/dbz-bt4-recomp/releases/latest/download/DBZ_BT4_Windows.zip)** | **[⬇ DBZ_BT4_Mac.zip](https://github.com/recomp-code/dbz-bt4-recomp/releases/latest/download/DBZ_BT4_Mac.zip)** | **[⬇ DBZ_BT4_Android.apk](https://github.com/recomp-code/dbz-bt4-recomp/releases/download/android-v3.4.7/DBZ_BT4_Android.apk)** |
 
 1. **Unzip it.**
    - Windows: into a folder you can write to (Desktop, Documents; not Program Files).

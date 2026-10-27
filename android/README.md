@@ -15,7 +15,7 @@ picks their ISO with the system's document picker; it is read in place (a file d
 The launcher in portrait (Biblioteca, En línea, Ajustes) and a fight on a POCO F8 Ultra. A real player's name in the
 lobby capture is blurred.
 
-**Download:** the signed APK is in the [Recomp for Android release](https://github.com/recomp-code/recomp-online/releases/tag/android-v3.4.6)
+**Download:** the signed APK is in the [Recomp for Android release](https://github.com/recomp-code/recomp-online/releases/tag/android-v3.4.7)
 of recomp-online. Install it, open it, pick your ISO (SLUS-21978, DBZ BT4 Beta 14 Rev2) and play. Android 12 or later,
 arm64, a 2022+ Vulkan driver.
 

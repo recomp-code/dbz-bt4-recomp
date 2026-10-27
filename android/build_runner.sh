@@ -1,5 +1,5 @@
 #!/bin/bash
-# build_runner.sh [plain|gen|use]: the recompiled game as libmain.so for android-arm64, from BT3MOD (default
+# build_runner.sh [plain|gen|use|lto]: the recompiled game as libmain.so for android-arm64, from BT3MOD (default
 # ~/NBAStreetRecomp/bt3mod-android: the Mac native tree -- see macos/build_runner.sh for its patch chain -- plus
 # patches/bt3recomp-bt4mod-android.patch). SDL's Java activity loads it and calls SDL_main (android_main.cpp).
 #   plain -> build-android       no profile
@@ -22,7 +22,10 @@ plain) B=build-android; F="$ARCH" ;;
 gen)   B=build-android-gen; F="$ARCH -fprofile-instr-generate -DPS2X_PGO_GEN"; L="$L -fprofile-instr-generate" ;;
 use)   B=build-android-pgo; $TC/llvm-profdata merge -o "$WORK/pgo/runner.profdata" "$WORK"/pgo/*.profraw
        F="$ARCH -fprofile-instr-use=$WORK/pgo/runner.profdata -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date -Wno-backend-plugin" ;;
-*) echo "usage: build_runner.sh plain|gen|use" >&2; exit 9 ;;
+lto)   B=build-android-lto; $TC/llvm-profdata merge -o "$WORK/pgo/runner.profdata" "$WORK"/pgo/*.profraw   # use + ThinLTO
+       F="$ARCH -flto=thin -fprofile-instr-use=$WORK/pgo/runner.profdata -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date -Wno-backend-plugin"
+       L="$L -flto=thin -Wl,--thinlto-jobs=10 -Wl,--thinlto-cache-dir=$WORK/thinlto-cache" ;;
+*) echo "usage: build_runner.sh plain|gen|use|lto" >&2; exit 9 ;;
 esac
 PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR="$WORK/ffmpeg/lib/pkgconfig" cmake -S . -B $B -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=31 \

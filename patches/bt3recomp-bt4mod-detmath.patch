@@ -1,6 +1,6 @@
 --- a/ps2xRuntime/include/ps2x_detmath.h
 +++ b/ps2xRuntime/include/ps2x_detmath.h
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,76 @@
 +#pragma once
 +// ps2xDetAcosf: acosf from musl (MIT; derived from FreeBSD msun, Sun Microsystems 1993), float arithmetic and an
 +// IEEE sqrtf only, so it is bit-identical on every platform built with -ffp-contract=off (the host libms are not:
@@ -45,6 +45,64 @@
 +    const float w = ps2xDetAcosfR(z) * s + c;
 +    return 2.0f * (df + w);
 +}
++
++// ps2xDetKernelSinf / ps2xDetKernelCosf: the float kernels of fdlibm (Sun Microsystems 1993, "Permission to use, copy,
++// modify, and distribute this software is freely granted, provided that this notice is preserved"; newlib's k_sinf.c /
++// k_cosf.c, which the game itself linked). The recompiler stubs the game's __kernel_sinf / __kernel_cosf with host
++// code; ::sinf / ::cosf there gave Apple and bionic results a bit apart, and every rotation the game builds goes
++// through them (online fights drifted apart, Mac vs Android). Float arithmetic only: bit-identical everywhere.
++static inline float ps2xDetKernelSinf(float x, float y, int iy)
++{
++    const float half = 5.0000000000e-01f, S1 = -1.6666667163e-01f, S2 = 8.3333337680e-03f, S3 = -1.9841270114e-04f,
++                S4 = 2.7557314297e-06f, S5 = -2.5050759689e-08f, S6 = 1.5896910177e-10f;
++    uint32_t ix; std::memcpy(&ix, &x, 4); ix &= 0x7fffffffu;
++    if (ix < 0x32000000u && static_cast<int>(x) == 0) return x;   // |x| < 2**-27
++    const float z = x * x, v = z * x;
++    const float r = S2 + z * (S3 + z * (S4 + z * (S5 + z * S6)));
++    if (iy == 0) return x + v * (S1 + z * r);
++    return x - ((z * (half * y - v * r) - y) - v * S1);
++}
++static inline float ps2xDetKernelCosf(float x, float y)
++{
++    const float one = 1.0f, C1 = 4.1666667908e-02f, C2 = -1.3888889225e-03f, C3 = 2.4801587642e-05f,
++                C4 = -2.7557314297e-07f, C5 = 2.0875723372e-09f, C6 = -1.1359647598e-11f;
++    uint32_t ix; std::memcpy(&ix, &x, 4); ix &= 0x7fffffffu;
++    if (ix < 0x32000000u && static_cast<int>(x) == 0) return one;   // |x| < 2**-27
++    const float z = x * x;
++    const float r = z * (C1 + z * (C2 + z * (C3 + z * (C4 + z * (C5 + z * C6)))));
++    if (ix < 0x3e99999au) return one - (0.5f * z - (z * r - x * y));   // |x| < 0.3
++    float qx;
++    if (ix > 0x3f480000u) qx = 0.28125f;   // |x| > 0.78125
++    else { const uint32_t q = ix - 0x01000000u; std::memcpy(&qx, &q, 4); }   // x/4
++    const float hz = 0.5f * z - qx, a = one - qx;
++    return a - (hz - (z * r - x * y));
++}
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
+@@ -1,4 +1,5 @@
+ #include "Common.h"
++#include "ps2x_detmath.h"   // [detmath]
+ #include <atomic>
+ extern std::atomic<uint64_t> g_bt3FrameCount;   // [randlog] defined in game_overrides.cpp (global namespace)
+ #include "LibC.h"
+@@ -957,7 +958,7 @@
+         const float x = ctx->f[12];
+         const float y = ctx->f[13];
+         const int32_t iy = static_cast<int32_t>(getRegU32(ctx, 4));
+-        ctx->f[0] = ::sinf(x + (iy != 0 ? y : 0.0f));
++        ctx->f[0] = ps2xDetKernelSinf(x, y, iy);   // [detmath] not ::sinf: the host libms differ in the last bit
+     }
+ 
+     void cos(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+@@ -970,7 +971,7 @@
+     {
+         const float x = ctx->f[12];
+         const float y = ctx->f[13];
+-        ctx->f[0] = ::cosf(x + y);
++        ctx->f[0] = ps2xDetKernelCosf(x, y);   // [detmath] not ::cosf: the host libms differ in the last bit
+     }
+ 
+     void __ieee754_rem_pio2f(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 --- a/ps2xRuntime/src/lib/game_overrides.cpp
 +++ b/ps2xRuntime/src/lib/game_overrides.cpp
 @@ -109,6 +109,7 @@
@@ -55,7 +113,7 @@
  #include "runtime/ps2_gs_gpu_renderer.h"
  #include <algorithm>
  #include <array>
-@@ -4301,7 +4302,9 @@
+@@ -4301,8 +4302,33 @@
          (void)rdram; (void)runtime;
          const float in = ctx->f[12];
          const float c = (in > 1.0f) ? 1.0f : ((in < -1.0f) ? -1.0f : (std::isnan(in) ? 1.0f : in));
@@ -64,5 +122,68 @@
 +        // hair physics fed by this drifted two online players apart within a fight (Mac vs Android, measured)
 +        ctx->f[0] = ps2xDetAcosf(c);
          ctx->pc = getRegU32(ctx, 31); // jr $ra
++    }
++
++    // [fntrace] PS2X_FNTRACE=<hex addr>[,<addr>..] + PS2X_FNTRACE_FROM/_TO=<frame>: wrap those guest functions and log
++    // every call's float/int arguments and results in hex -- two machines' logs diffed name the first call whose
++    // result differs for the same input (determinism hunts). One wrapper for all: ctx->pc is the target on entry.
++    std::unordered_map<uint32_t, PS2Runtime::RecompiledFunction> g_fnTraceOrig;
++    void ps2xFnTrace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        const uint32_t fn = ctx->pc;
++        const auto it = g_fnTraceOrig.find(fn);
++        if (it == g_fnTraceOrig.end() || !it->second) return;
++        static const unsigned long long s_from = [](){ const char *v = std::getenv("PS2X_FNTRACE_FROM"); return v ? std::strtoull(v, nullptr, 10) : 0ull; }();
++        static const unsigned long long s_to = [](){ const char *v = std::getenv("PS2X_FNTRACE_TO"); return v ? std::strtoull(v, nullptr, 10) : ~0ull; }();
++        const unsigned long long fr = g_bt3FrameCount.load(std::memory_order_relaxed);
++        uint32_t i12, i13, a0 = getRegU32(ctx, 4), a1 = getRegU32(ctx, 5);
++        std::memcpy(&i12, &ctx->f[12], 4); std::memcpy(&i13, &ctx->f[13], 4);
++        it->second(rdram, ctx, runtime);
++        if (fr >= s_from && fr <= s_to)
++        {
++            uint32_t o0; std::memcpy(&o0, &ctx->f[0], 4);
++            std::fprintf(stderr, "[fntrace] f=%llu fn=0x%x f12=%08x f13=%08x a0=%08x a1=%08x -> f0=%08x v0=%08x\n",
++                         fr, fn, i12, i13, a0, a1, o0, getRegU32(ctx, 2));
++        }
      }
  
+     PS2Runtime::RecompiledFunction g_orig2316d0 = nullptr;
+@@ -8107,6 +8133,16 @@
+         // Demo scene-tree recursion-depth guard: default ON (prevents the cyclic-tree stack
+         // overflow crash). Disable with PS2X_NO_DEMO_GUARD. The PS2X_DEMOPROBE dump rides on it.
+         if (const char *sc = std::getenv("PS2X_STEPCENSUS"); sc && sc[0]) ps2StepCensusEnable(sc);   // [stepcensus]
++        if (const char *ft = std::getenv("PS2X_FNTRACE"); ft && ft[0])   // [fntrace]
++        {
++            for (const char *q = ft; *q;)
++            {
++                char *end = nullptr; const uint32_t a = (uint32_t)std::strtoul(q, &end, 16);
++                if (a && !g_fnTraceOrig.count(a)) { g_fnTraceOrig[a] = runtime.lookupFunction(a); runtime.replaceFunction(a, &ps2xFnTrace); }
++                if (!end || !*end) break; q = end + 1;
++            }
++            std::fprintf(stderr, "[fntrace] %zu function(s) wrapped\n", g_fnTraceOrig.size());
++        }
+         if (const char *aw = std::getenv("PS2X_ADDRWATCH"); aw && aw[0]) ps2AddrWatchEnable(aw);   // [addrwatch]
+         if (const char *st = std::getenv("PS2X_STORETRACE"); st && st[0]) ps2StoreTraceEnable(st);   // [storetrace]
+         if (const char *hs = std::getenv("PS2X_HALFSTEP"); hs && hs[0]) ps2HalfStepEnable(hs);        // [halfstep]
+--- a/ps2xRuntime/src/lib/ps2_stepcensus.cpp
++++ b/ps2xRuntime/src/lib/ps2_stepcensus.cpp
+@@ -149,7 +149,9 @@
+         // gate makes the watch silent for exactly the window under study.
+         static const bool s_all = [](){ const char *v = std::getenv("PS2X_ADDRWATCH_ALL");
+                                         return v && v[0] && v[0] != '0'; }();
+-        const bool active = s_all || ps2HalfStepFightActive();
++        // PS2X_ADDRWATCH_FROM=<frame>: and only from that frame on (a stack slot sees hundreds of stores a frame)
++        static const unsigned long long s_from = [](){ const char *v = std::getenv("PS2X_ADDRWATCH_FROM"); return v && v[0] ? std::strtoull(v, nullptr, 10) : 0ull; }();
++        const bool active = (s_all || ps2HalfStepFightActive()) && g_bt3FrameCount.load(std::memory_order_relaxed) >= s_from;
+         static bool s_trig = (g_awTrigAddr == 0); static bool s_haveBase = false; static float s_base[2] = {0.f, 0.f};
+         if (!s_trig && active)
+         {
+@@ -201,7 +203,7 @@
+             const uint32_t a0 = (uint32_t)ctx->r[4][0], a1 = (uint32_t)ctx->r[5][0], a2 = (uint32_t)ctx->r[6][0];
+             const bool changing = oldv != nv;   // (a float tolerance here hid integer slots whose bits are float denormals: the ki 98400 -> 96800)
+             if (changing && s_n[k]++ < 500u)
+-                std::fprintf(stderr, "[addrwatch%d] slot=0x%x pc=0x%06x ra=0x%06x size=%u old=%g new=%g a0=0x%x a1=0x%x a2=0x%x frame=%llu\n", k, w, ctx->pc, (uint32_t)ctx->r[31][0], size, fo, fn, a0, a1, a2, (unsigned long long)g_bt3FrameCount.load());
++                std::fprintf(stderr, "[addrwatch%d] slot=0x%x pc=0x%06x ra=0x%06x size=%u old=%g(%08x) new=%g(%08x) a0=0x%x a1=0x%x a2=0x%x frame=%llu\n", k, w, ctx->pc, (uint32_t)ctx->r[31][0], size, fo, oldv, fn, nv, a0, a1, a2, (unsigned long long)g_bt3FrameCount.load());
+             if (size == 16 && ctx->pc >= 0x120000u && ctx->pc < 0x122400u && (a0 & 0x1FFFFFFFu) == a && s_cnt < 6 && k < g_addrWatchCnt)
+             {   // follow $a1 (the source) of a vector helper, one level below the requested slots only
+                 const uint32_t srcs[1] = { ((a1 & 0x1FFFFFFFu) + off) & 0x1FFFFFFFu };

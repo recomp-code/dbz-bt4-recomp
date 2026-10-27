@@ -33,8 +33,8 @@ lobby capture is blurred.
     attract demo, hits no later than before
   - `ps2_runtime.cpp` - [pinthreads] the guest thread on the fastest core cluster, the GL thread off the slowest
   - `android/perf_hint.cpp` - [thermal] the phone's thermal headroom caps the upscaler before the system throttles
-- `../patches/bt3recomp-bt4mod-detmath.patch` - shared (every platform): the game's `acosf` from a portable
-  implementation; the host libms disagree in the last bit and online fights drifted apart
+- `../patches/bt3recomp-bt4mod-detmath.patch` - shared (every platform): the game's sin/cos kernels and `acosf` from
+  portable code; the host libms disagree in the last bit and online fights drifted apart
 - `project/` - the app: `LauncherActivity` (WebView + `RecompBridge`, JNI into liblauncher.so), `GameActivity` (SDL's
   activity around libmain.so, process `:game`), `GameService` (keeps the online session alive while playing)
 - `android_bridge.js` / `android.css` - the frontend's Wails runtime and its phone layout
@@ -83,11 +83,13 @@ way.
 ## Online
 
 Android plays online through the same server and lobby as the PC and Mac versions (`GameService` keeps the session
-alive). Lockstep needs two identical simulations: two Macs stay bit-identical through a whole fight, and the Android
-build matched the Mac's through the menus and the start of a fight once the game's environment was set before
-`libmain.so` loads (the runtime reads it in static initializers) and `acosf` came from `detmath`. Android against a PC or
-Mac still drifts apart later in a long fight (a 1-ulp difference in bone matrices, still being traced), so crossplay with
-Android is not finished; Android against Android runs the same binary.
+alive). Lockstep needs two identical simulations, and they are: replaying the same recorded inputs (`PS2X_INREC` on one
+machine, `PS2X_INPLAY` on both), a POCO F8 Ultra (-O2 + PGO) and a Mac (-O1 + PGO) stay bit-identical through 19840
+frames with fights (1972 of 1972 state hashes). It took three fixes: the game's environment set before `libmain.so`
+loads (the runtime reads it in static initializers; Android ran online without frame stepping), and the `detmath` layer:
+the recompiler had handed the game's `__kernel_sinf` / `__kernel_cosf` (and the HLE'd `acosf`) to the host's libm, whose
+results differ in the last bit between Apple, bionic and MSVC. The PC and Mac builds must carry `detmath` too before
+Android can play against them; Android against Android already runs the same code.
 
 ## Other knobs
 

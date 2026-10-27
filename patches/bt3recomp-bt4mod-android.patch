@@ -907,7 +907,7 @@
                  {
                      // The target IS this stream's whole cushion -- nothing more is produced until
                      // the device drains some -- so tell the backend to start with it. Without this
-@@ -7363,12 +7375,18 @@
+@@ -7386,12 +7398,18 @@
                  // Bounded: never wait more than ~50 ms, so a stalled vblank worker cannot hang
                  // the guest (the failure mode I wrongly suspected of [asyncpace] earlier tonight).
                  Ps2xWaitScope wgate(WP_FRAMEGATE);   // [waitprof]
@@ -926,7 +926,7 @@
                  s_lastTick = ps2_syscalls::GetCurrentVSyncTick();
              }
          }
-@@ -7383,6 +7401,10 @@
+@@ -7406,6 +7424,10 @@
              g_guestThreadCpuNs.store((uint64_t)tg.tv_sec * 1000000000ull + (uint64_t)tg.tv_nsec,
                                       std::memory_order_relaxed);
  #endif

@@ -919,12 +919,18 @@
  
 --- a/ps2xRuntime/src/lib/ps2_audio.cpp
 +++ b/ps2xRuntime/src/lib/ps2_audio.cpp
-@@ -47,8 +47,21 @@
+@@ -47,8 +47,27 @@
      return ps2x_audio::supportsDepth() ? 512u : static_cast<uint32_t>(kStreamChunkFrames);
  }
  static uint32_t monoDepth()
 +{
++#if defined(__ANDROID__)
++    // [android] eight deep (~180 ms at 22-24 kHz): in the attract demo the SE mix refills in ~120 ms bursts and four
++    // (~90 ms) ran dry before every refill -- a crackle about eight times a second
++    return ps2x_audio::supportsDepth() ? 8u : 2u;
++#else
 +    return ps2x_audio::supportsDepth() ? 4u : 2u;
++#endif
 +}
 +
 +// The music pair: two 2048-frame sub-buffers (~85 ms) on the desktop. [android] Four on a phone: the menus feed it every
@@ -941,7 +947,7 @@
  }
  
  struct PS2AudioBackend::Impl
-@@ -593,10 +606,11 @@
+@@ -593,10 +612,11 @@
          }
          if (m_impl->streams.find(kPairKey) == m_impl->streams.end())
          {

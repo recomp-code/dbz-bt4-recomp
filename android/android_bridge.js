@@ -90,10 +90,11 @@
       for (const e of [play, iso]) new MutationObserver(mark).observe(e, watch);
       mark();
     }
-    // the ISO is a content:// URI from the system's picker: show the file's name, not the URI
+    // the ISO is a content:// URI from the system's picker (or a path): show the file's name, not the URI
     if (line) {
       const tidy = () => {
         const t = line.textContent;
+        if (t.startsWith("/") && t.length > 1) { line.textContent = t.split("/").pop(); line.title = t; return; }
         if (!t.startsWith("content://")) return;
         let name = "";
         try { name = decodeURIComponent(t.split("/").pop() || ""); } catch (e) { name = ""; }

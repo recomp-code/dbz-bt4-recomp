@@ -1,7 +1,7 @@
 # DBZ Budokai Tenkaichi 4 — PS2Recomp
 
 *Dragon Ball Z: Budokai Tenkaichi 4*, the [Team BT4](https://teambt4.wixsite.com/teambt4projects) fan mod of BT3
-(disc `SLUS-219.78`, "Beta 14 Rev2"), statically recompiled to run natively on **Windows** and **Mac**, with online play.
+(disc `SLUS-219.78`, "Beta 14 Rev2"), statically recompiled to run natively on **Windows**, **Mac** and **Android**, with online play.
 
 | | |
 | --- | --- |
@@ -20,7 +20,11 @@ Zamas, Jiren, Hit, Caulifla, Kale...) and stages (Tournament of Power, Champa's 
 
 ## Features
 
-- **Native on Windows and Mac (Apple Silicon)**: ready-to-play zips with a launcher. No emulator to set up.
+- **Native on Windows, Mac (Apple Silicon) and Android**: ready-to-play zips and an APK, each with the launcher. No
+  emulator to set up.
+- **Android**: the same game and launcher on a phone, in portrait, with touch controls (or a Bluetooth controller).
+  Snapdragon GSR 2 upscaling on Adreno GPUs (FSR 2 on the others), 60 fps fights on high-end phones (POCO F8 Ultra:
+  60 fps, 17.6 ms p95), resolution that adapts to load and heat. Android 12+, arm64, a 2022+ Vulkan driver.
 - **Sharp graphics**: the game's own native renderer (Vulkan), with the game's real depth and motion fed
   to the upscaler: NVIDIA DLSS or AMD FSR 2 on Windows, Apple MetalFX on Mac at the screen's full (Retina) resolution.
   On Mac the shaders are prepared while the game starts, so effects don't stutter the first time they appear.
@@ -35,9 +39,9 @@ Zamas, Jiren, Hit, Caulifla, Kale...) and stages (Tournament of Power, Champa's 
 
 ## Download and play
 
-| Windows 10/11 (64-bit, GPU with Vulkan) | Mac (Apple Silicon, macOS 14+) |
-| --- | --- |
-| **[⬇ DBZ_BT4_Windows.zip](https://github.com/recomp-code/dbz-bt4-recomp/releases/latest/download/DBZ_BT4_Windows.zip)** | **[⬇ DBZ_BT4_Mac.zip](https://github.com/recomp-code/dbz-bt4-recomp/releases/latest/download/DBZ_BT4_Mac.zip)** |
+| Windows 10/11 (64-bit, GPU with Vulkan) | Mac (Apple Silicon, macOS 14+) | Android 12+ (arm64, Vulkan 2022+) |
+| --- | --- | --- |
+| **[⬇ DBZ_BT4_Windows.zip](https://github.com/recomp-code/dbz-bt4-recomp/releases/latest/download/DBZ_BT4_Windows.zip)** | **[⬇ DBZ_BT4_Mac.zip](https://github.com/recomp-code/dbz-bt4-recomp/releases/latest/download/DBZ_BT4_Mac.zip)** | **[⬇ DBZ_BT4_Android.apk](https://github.com/recomp-code/dbz-bt4-recomp/releases/download/android-v3.4.6/DBZ_BT4_Android.apk)** |
 
 1. **Unzip it.**
    - Windows: into a folder you can write to (Desktop, Documents; not Program Files).
@@ -53,6 +57,19 @@ Zamas, Jiren, Hit, Caulifla, Kale...) and stages (Tournament of Power, Champa's 
 | | |
 | --- | --- |
 | ![The launcher](docs/screenshots/launcher_library.jpg) | ![Online in the launcher](docs/screenshots/launcher_online.jpg) |
+
+**Android**: install the APK (allow installs from that source when Android asks), open it, **Seleccionar ISO** (your
+image is read in place, never copied) and **JUGAR**. On-screen touch controls; a Bluetooth controller hides them. The
+whole game in landscape, the launcher in portrait:
+
+<p>
+<img src="docs/screenshots/android_biblioteca.jpg" width="200" alt="Android: Biblioteca">
+<img src="docs/screenshots/android_enlinea.jpg" width="200" alt="Android: En línea">
+<img src="docs/screenshots/android_ajustes.jpg" width="200" alt="Android: Ajustes">
+</p>
+<img src="docs/screenshots/android_online_fight.jpg" width="620" alt="A fight on a POCO F8 Ultra">
+
+More in [android/README.md](android/README.md).
 
 The zips have **no game data**: the launcher reads what it needs from your ISO. Get the mod and its updates from
 **[Team BT4's download page](https://teambt4.wixsite.com/teambt4projects/descarga)**.
@@ -74,7 +91,8 @@ The zips have **no game data**: the launcher reads what it needs from your ISO. 
 5. **Estadísticas** (top of EN LÍNEA) shows your wins, losses, win rate, time played and place, and the table of the
    best players. A fight only counts when both players' games saw the same result.
 
-Both players need the same release (the launcher tells you otherwise). If the fight stutters because you're far
+Both players need the same release (the launcher tells you otherwise). **Android** plays online with Android now, and
+with Windows and Mac from their next release (they need the same deterministic math, online protocol `net3`). If the fight stutters because you're far
 apart, raise **Retraso de controles** in AJUSTES.
 
 | | |

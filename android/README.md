@@ -15,6 +15,10 @@ picks their ISO with the system's document picker; it is read in place (a file d
 The launcher in portrait (Biblioteca, En línea, Ajustes) and a fight on a POCO F8 Ultra. A real player's name in the
 lobby capture is blurred.
 
+**Download:** the signed APK is in the [Recomp for Android release](https://github.com/recomp-code/recomp-online/releases/tag/android-v3.4.6)
+of recomp-online. Install it, open it, pick your ISO (SLUS-21978, DBZ BT4 Beta 14 Rev2) and play. Android 12 or later,
+arm64, a 2022+ Vulkan driver.
+
 ## What is in it
 
 - `../patches/bt3recomp-bt4mod-android.patch` - the runtime layer, on top of the Mac native tree (macos/build_runner.sh):
@@ -88,8 +92,11 @@ machine, `PS2X_INPLAY` on both), a POCO F8 Ultra (-O2 + PGO) and a Mac (-O1 + PG
 frames with fights (1972 of 1972 state hashes). It took three fixes: the game's environment set before `libmain.so`
 loads (the runtime reads it in static initializers; Android ran online without frame stepping), and the `detmath` layer:
 the recompiler had handed the game's `__kernel_sinf` / `__kernel_cosf` (and the HLE'd `acosf`) to the host's libm, whose
-results differ in the last bit between Apple, bionic and MSVC. The PC and Mac builds must carry `detmath` too before
-Android can play against them; Android against Android already runs the same code.
+results differ in the last bit between Apple, bionic and MSVC. Confirmed live: a POCO
+against a Mac (both with `detmath`) fought online for 19680 frames, 0 desyncs, 328 of 328 hashes equal. The launcher's
+online protocol is `net3` for builds with `detmath`: the PC and Mac releases join Android once they carry it; until then
+the lobby shows them as another version of the game. Online the effects keep a 23-92 ms lead over the device (stepped
+mode mixes exactly what each frame is due; with no lead any late frame cut the sound).
 
 ## Other knobs
 

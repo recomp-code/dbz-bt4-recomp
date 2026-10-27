@@ -45,6 +45,21 @@ public class GameActivity extends SDLActivity {
                 }
             }
         }
+        if ((getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0) {
+            // debug builds: KEY=VALUE lines from <external files>/env.txt on top (diagnostics: PS2X_DETDUMP, ...)
+            java.io.File f = new java.io.File(getExternalFilesDir(null), "env.txt");
+            if (f.canRead()) {
+                try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(f))) {
+                    for (String line; (line = r.readLine()) != null; ) {
+                        int eq = line.indexOf('=');
+                        if (eq <= 0 || line.startsWith("#")) continue;
+                        Os.setenv(line.substring(0, eq).trim(), line.substring(eq + 1).trim(), true);
+                    }
+                } catch (Exception e) {
+                    android.util.Log.e("recomp", "env.txt", e);
+                }
+            }
+        }
         super.onCreate(state);   // loads libmain.so
         if (mBrokenLibraries) return;
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);

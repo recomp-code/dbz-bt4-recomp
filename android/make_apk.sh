@@ -35,6 +35,8 @@ cp -R $B/ps2xRuntime/assets $AS/runtime/assets
 cp $HERE/../macos/seamvk_pipelines.bin $AS/runtime/assets/seamvk_pipelines.bin
 cp $B/ps2xRuntime/fps60_sites.txt $AS/runtime/
 cp $HERE/settings.toml $AS/runtime/settings.toml
+# third-party notices (BSD-3 and the like ask for them in binary distributions)
+mkdir -p $AS/licenses && SRC=${BT3MOD:-$R/bt3mod-android}; cp $SRC/THIRD-PARTY-NOTICES.md $SRC/ps2xRuntime/src/lib/seamvk/SGSR2-LICENSE.txt $AS/licenses/
 # the launcher icon from the runtime's icon.png (generated like the Mac app's: the art is not in the repository)
 python3 -I $HERE/make_icons.py $B/ps2xRuntime/assets/icon.png $APP/src/main/res
 cd $HERE/project

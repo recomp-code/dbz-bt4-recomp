@@ -1,0 +1,22 @@
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -264,6 +264,10 @@
+                 m_codecCtx->thread_count = 1;
+                 m_codecCtx->skip_frame = AVDISCARD_NONKEY;
+                 m_codecCtx->err_recognition = 0;
++                // [detmath] FFmpeg's reference (arch-independent) paths: the IDCT and friends otherwise pick x86 SSE
++                // or ARM NEON code that rounds differently, and the movie's pictures (which the game copies into its
++                // own RAM) differed between Windows and the ARM ports
++                m_codecCtx->flags |= AV_CODEC_FLAG_BITEXACT;
+                 const int ret = avcodec_open2(m_codecCtx, codec, nullptr);
+                 if (ret < 0)
+                 {
+@@ -383,7 +387,7 @@
+                         width,
+                         height,
+                         AV_PIX_FMT_RGBA,
+-                        SWS_BILINEAR,
++                        SWS_BILINEAR | SWS_BITEXACT | SWS_ACCURATE_RND,   // [detmath] the same pixels on every arch
+                         nullptr,
+                         nullptr,
+                         nullptr);

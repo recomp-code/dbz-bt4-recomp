@@ -1,6 +1,14 @@
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
-@@ -2618,9 +2618,13 @@
+@@ -393,6 +393,7 @@
+ #include <atomic>
+ #include <thread>
+ #include <unordered_map>
++#include <map>
+ #include <unordered_set>
+ #include <mutex>
+ #include <sstream>
+@@ -2617,9 +2618,13 @@
          uint32_t waitId = 0;         // sema/event id it waits on
          int waitKind = 0;            // 3 = sema, 4 = event flag, 1 = delay/sleep
      };

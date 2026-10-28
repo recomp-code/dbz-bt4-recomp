@@ -1,0 +1,18 @@
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -2618,9 +2618,13 @@
+         uint32_t waitId = 0;         // sema/event id it waits on
+         int waitKind = 0;            // 3 = sema, 4 = event flag, 1 = delay/sleep
+     };
+-    std::unordered_map<uint32_t, IopThreadState> &iopThreads()
++    // [detmath] ORDERED by thread id: the cooperative IOP loop runs the first runnable thread it finds, and an
++    // unordered_map iterates in a different order under MSVC's STL and libc++, so with two IOP threads runnable
++    // Windows ran the other one first (schedtrace: RotateThreadReadyQueue tid 1 then 6 vs 6 then 1, frame 1268),
++    // the sound-stream RPC completed at another frame and the fight stream's decode started ~2500 frames apart.
++    std::map<uint32_t, IopThreadState> &iopThreads()
+     {
+-        static std::unordered_map<uint32_t, IopThreadState> t;
++        static std::map<uint32_t, IopThreadState> t;
+         return t;
+     }
+     uint32_t g_iopNextThread = 1;

@@ -1,0 +1,41 @@
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -1,5 +1,6 @@
+ #include "Common.h"
+ #include "MPEG.h"
++#include <cstdlib>
+ 
+ extern "C"
+ {
+@@ -1984,6 +1985,13 @@
+         setReturnS32(ctx, static_cast<int32_t>(consumed));
+     }
+ 
++    // [detmath] PS2X_MPEGTRACE_ALL=1: every DemuxPssRing / GetPicture result with the vsync tick, uncapped, so two
++    // platforms' runs can be diffed call by call (the capped [mpegtrace] lines hide where they part)
++    static bool mpegTraceAll()
++    {
++        static const bool on = [](){ const char *v = std::getenv("PS2X_MPEGTRACE_ALL"); return v && v[0] == '1'; }();
++        return on;
++    }
+     void sceMpegDemuxPssRing(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         static std::atomic<uint32_t> s_demuxRingEntryCount{0u};
+@@ -2032,7 +2040,7 @@
+         {
+             static std::atomic<uint32_t> n{0};
+             const uint32_t nd = n.fetch_add(1);
+-            if (nd < 12u || (nd % 30u) == 0u)
++            if (nd < 12u || (nd % 30u) == 0u || mpegTraceAll())
+                 std::fprintf(stderr,
+                              "[mpegtrace] DemuxPssRing avail=%u consumed=%zu decoded=%zu"
+                              " data=0x%x ring=0x%x ringSize=%u\n",
+@@ -2294,7 +2302,7 @@
+         {
+             static std::atomic<uint32_t> n{0};
+             const uint32_t nn = n.fetch_add(1);
+-            if (nn < 12u || (nn % 30u) == 0u)
++            if (nn < 12u || (nn % 30u) == 0u || mpegTraceAll())
+                 std::fprintf(stderr, "[mpegtrace] GetPicture haveFrame=%d %ux%u frame=%u image=0x%x\n",
+                              haveFrame ? 1 : 0, width, height, frameCount, imageAddr);
+         }
